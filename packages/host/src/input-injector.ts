@@ -16,6 +16,12 @@
  */
 
 import type { InputEvent } from '@stream-screen/core';
+import { execFile } from 'node:child_process';
+import {
+  normalizedToVirtualPixels,
+  type DisplayGeometry,
+  type VirtualPoint,
+} from './monitor.js';
 
 /* -------------------------------------------------------------------------- */
 /*  Pure, side-effect-free mapping helpers (unit-tested on Linux)              */
@@ -115,12 +121,50 @@ export function modifierKeyNames(mods: number): string[] {
 }
 
 /**
- * Translate a DOM `KeyboardEvent.code` (e.g. "KeyA", "Digit1", "ArrowLeft",
- * "Enter", "F5") into the corresponding nut.js `Key` enum member NAME. The name
- * is resolved against the real `Key` enum (`Key[name]`) at injection time, so
- * this function never touches the native library.
+ * Decide whether an ordered {@link InputEvent} sequence is the Ctrl+Alt+Del
+ * chord, so the host can route it to the real Windows Secure Attention Sequence
+ * (SAS) API rather than replaying synthetic key presses (which the kernel
+ * ignores for the SAS on a default Windows install).
  *
- * Returns `null` for codes we can't map; the caller logs and skips those.
+ * The match is intentionally loose: any combo whose key-down events include a
+ * Delete press while BOTH Ctrl and Alt are held (per the `mods` bitfield)
+ * qualifies. This matches {@link CTRL_ALT_DEL}/`buildKeyCombo(['ctrl','alt',
+ * 'delete'])` regardless of event ordering, and ignores trailing `k-up`s.
+ *
+ * Pure and side-effect-free — unit-tested on Linux without the native libs.
+ */
+export function isCtrlAltDelCombo(events: InputEvent[]): boolean {
+  for (const ev of events) {
+    if (ev.t !== 'k-down') continue;
+    const isDelete = ev.code === 'Delete' || ev.code === 'NumpadDecimal';
+    if (!isDelete) continue;
+    const m = decodeModifiers(ev.mods);
+    if (m.ctrl && m.alt) return true;
+  }
+  return false;
+}
+
+/**
+ * Translate a key identifier into the corresponding nut.js `Key` enum member
+ * NAME. The name is resolved against the real `Key` enum (`Key[name]`) at
+ * injection time, so this function never touches the native library.
+ *
+ * Two input vocabularies are accepted so the host agrees with the contract the
+ * AI/viewer layers advertise:
+ *
+ *   1. DOM `KeyboardEvent.code` strings — "KeyA", "Digit1", "Numpad5",
+ *      "ArrowLeft", "Enter", "F5". This is what the viewer's real keyboard
+ *      capture emits.
+ *   2. Single-character / bare names — "a", "A", "1", "!", "Enter", "Tab". This
+ *      is what the AI `press_key` tool schema documents and produces (its
+ *      examples include `'a'`), so a bare letter or digit MUST map. Single
+ *      letters fold to their uppercase `Key` name ("a"/"A" -> "A") and single
+ *      top-row digits map to "Num0".."Num9". Common shifted punctuation maps to
+ *      the unshifted physical key (the caller is responsible for any Shift
+ *      modifier); we deliberately do NOT try to inject the shift here because
+ *      that would change the established modifier contract.
+ *
+ * Returns `null` for identifiers we can't map; the caller logs and skips those.
  */
 export function mapKeyCode(code: string): string | null {
   // Letters: "KeyA".."KeyZ" -> "A".."Z"
@@ -137,8 +181,63 @@ export function mapKeyCode(code: string): string | null {
   // Function keys: "F1".."F24"
   if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
 
-  return KEY_CODE_MAP[code] ?? null;
+  const named = KEY_CODE_MAP[code];
+  if (named) return named;
+
+  // Bare single-character names (the AI `press_key` vocabulary). Letters fold to
+  // their uppercase `Key` member; top-row digits map to "Num0".."Num9".
+  if (code.length === 1) {
+    if (/^[A-Za-z]$/.test(code)) return code.toUpperCase();
+    if (/^[0-9]$/.test(code)) return `Num${code}`;
+    const punct = PUNCT_CHAR_MAP[code];
+    if (punct) return punct;
+  }
+
+  return null;
 }
+
+/**
+ * Single punctuation characters -> the physical nut.js `Key` they live on. Both
+ * the unshifted and the shifted glyph of a US-layout key map to the same
+ * physical key (e.g. "1" and "!" both -> Num1, "/" and "?" both -> Slash); the
+ * caller decides whether Shift is held. This lets `press_key key='/'` or
+ * `press_key key=';'` produce a keystroke instead of silently no-opping.
+ */
+const PUNCT_CHAR_MAP: Record<string, string> = {
+  ' ': 'Space',
+  '-': 'Minus',
+  _: 'Minus',
+  '=': 'Equal',
+  '+': 'Equal',
+  '[': 'LeftBracket',
+  '{': 'LeftBracket',
+  ']': 'RightBracket',
+  '}': 'RightBracket',
+  '\\': 'Backslash',
+  '|': 'Backslash',
+  ';': 'Semicolon',
+  ':': 'Semicolon',
+  "'": 'Quote',
+  '"': 'Quote',
+  '`': 'Grave',
+  '~': 'Grave',
+  ',': 'Comma',
+  '<': 'Comma',
+  '.': 'Period',
+  '>': 'Period',
+  '/': 'Slash',
+  '?': 'Slash',
+  '!': 'Num1',
+  '@': 'Num2',
+  '#': 'Num3',
+  $: 'Num4',
+  '%': 'Num5',
+  '^': 'Num6',
+  '&': 'Num7',
+  '*': 'Num8',
+  '(': 'Num9',
+  ')': 'Num0',
+};
 
 /** Static map for non-pattern DOM codes -> nut.js Key enum member names. */
 const KEY_CODE_MAP: Record<string, string> = {
@@ -201,7 +300,15 @@ export class InputInjector {
   private nut: NutModule | null = null;
   private loadAttempted = false;
   private warned = false;
+  private sasWarned = false;
   private screenSize: ScreenSize | null = null;
+  /**
+   * Geometry (bounds + scaleFactor) of the display currently being SHARED. When
+   * set, normalized pointer coords are translated into that display's
+   * virtual-desktop pixel space — fixing aim on secondary/HiDPI monitors. When
+   * null we fall back to primary-display pixel mapping via {@link screenSize}.
+   */
+  private displayGeometry: DisplayGeometry | null = null;
 
   /**
    * Attempt to load the native library. Idempotent and never throws. Returns
@@ -246,6 +353,35 @@ export class InputInjector {
     };
   }
 
+  /**
+   * Set (or clear) the geometry of the display currently being shared. Called by
+   * the main process whenever the host picks/switches a monitor, so subsequent
+   * pointer events land on the RIGHT display in the right pixel space (the
+   * multi-monitor / HiDPI fix). Pass `null` to revert to primary-display mapping.
+   */
+  setDisplayGeometry(geom: DisplayGeometry | null): void {
+    this.displayGeometry = geom;
+  }
+
+  /** Whether a per-display geometry is currently configured. */
+  get hasDisplayGeometry(): boolean {
+    return this.displayGeometry !== null;
+  }
+
+  /**
+   * Resolve a normalized (0..1) pointer coord to an absolute virtual-desktop
+   * pixel point. Prefers the per-display geometry (correct for any
+   * monitor/scale); falls back to primary-display pixels when no geometry is
+   * set (e.g. a captured window, or before the main process plumbs geometry in).
+   */
+  private resolvePoint(x: number, y: number): VirtualPoint {
+    if (this.displayGeometry) {
+      return normalizedToVirtualPixels(x, y, this.displayGeometry);
+    }
+    const size = this.screenSize ?? { width: 1920, height: 1080 };
+    return normalizedToPixels(x, y, size);
+  }
+
   /** Inject a single decoded input event. Never throws. */
   async inject(e: InputEvent): Promise<void> {
     if (!this.nut) {
@@ -253,26 +389,24 @@ export class InputInjector {
       return;
     }
     const nut = this.nut;
-    const size = this.screenSize ?? { width: 1920, height: 1080 };
     try {
       switch (e.t) {
         case 'm-move': {
-          const p = normalizedToPixels(e.x, e.y, size);
-          await nut.mouse.setPosition(p);
+          await nut.mouse.setPosition(this.resolvePoint(e.x, e.y));
           break;
         }
         case 'm-down': {
-          await nut.mouse.setPosition(normalizedToPixels(e.x, e.y, size));
+          await nut.mouse.setPosition(this.resolvePoint(e.x, e.y));
           await nut.mouse.pressButton(mapButton(e.button) as unknown as NutButtonEnum);
           break;
         }
         case 'm-up': {
-          await nut.mouse.setPosition(normalizedToPixels(e.x, e.y, size));
+          await nut.mouse.setPosition(this.resolvePoint(e.x, e.y));
           await nut.mouse.releaseButton(mapButton(e.button) as unknown as NutButtonEnum);
           break;
         }
         case 'm-wheel': {
-          await nut.mouse.setPosition(normalizedToPixels(e.x, e.y, size));
+          await nut.mouse.setPosition(this.resolvePoint(e.x, e.y));
           if (e.dy > 0) await nut.mouse.scrollDown(Math.abs(Math.round(e.dy)));
           else if (e.dy < 0) await nut.mouse.scrollUp(Math.abs(Math.round(e.dy)));
           if (e.dx > 0) await nut.mouse.scrollRight(Math.abs(Math.round(e.dx)));
@@ -298,14 +432,116 @@ export class InputInjector {
           break;
         }
         case 'clipboard': {
-          // Clipboard sync is handled in the main process (Electron clipboard);
-          // see main.ts. Nothing to inject at the OS-automation layer.
+          // The text is written into Electron's clipboard in the main process,
+          // which then calls paste() to inject Ctrl+V (see main.ts). Nothing to
+          // do here at the per-event OS-automation layer.
           break;
         }
       }
     } catch (err) {
       this.warnOnce(err);
     }
+  }
+
+  /**
+   * Paste the current system clipboard into the focused application by
+   * synthesizing the Ctrl+V chord. Called by the main process AFTER it has
+   * written the text into Electron's clipboard for a `clipboard` input event
+   * (the AI `type_text` tool). Without this, type_text would only replace the
+   * clipboard and type nothing into the focused field. Safe no-op if the native
+   * lib is unavailable. Never throws.
+   *
+   * Ctrl+V is the universal Windows/X11 paste shortcut for normal text fields;
+   * terminals (Ctrl+Shift+V) are the known exception, but Ctrl+V is the correct
+   * default for the overwhelming majority of GUI apps the AI drives.
+   */
+  async paste(): Promise<void> {
+    if (!this.nut) {
+      this.warnOnce();
+      return;
+    }
+    const nut = this.nut;
+    try {
+      const ctrl = nut.Key.LeftControl;
+      const v = nut.Key.V;
+      if (ctrl === undefined || v === undefined) return;
+      await nut.keyboard.pressKey(ctrl);
+      await nut.keyboard.pressKey(v);
+      await nut.keyboard.releaseKey(v);
+      await nut.keyboard.releaseKey(ctrl);
+    } catch (err) {
+      this.warnOnce(err);
+    }
+  }
+
+  /**
+   * Inject an ordered sequence of {@link InputEvent}s atomically-ish (each is
+   * awaited in turn). Used for special-key chords such as Ctrl+Alt+Del, Win+R,
+   * Alt+Tab — the viewer sends the chord as a pre-built event list (see core
+   * {@link SPECIAL_KEYS}/{@link buildKeyCombo}) and the host replays it here.
+   *
+   * Ctrl+Alt+Del is special-cased: synthetic key presses (nut.js or any other
+   * user-space SendInput) CANNOT trigger the Windows Secure Attention Sequence
+   * (SAS) — the kernel only honors SAS from a hardware interrupt or the
+   * `SendSAS` API gated by the "SoftwareSASGeneration" policy. We therefore try
+   * the real {@link sendSAS} path first; only if it is unavailable/fails do we
+   * fall back to replaying the synthetic chord (still useful for in-app
+   * shortcuts and for relaxed/kiosk Windows configs).
+   */
+  async injectCombo(events: InputEvent[]): Promise<void> {
+    if (isCtrlAltDelCombo(events)) {
+      const sent = await this.sendSAS();
+      if (sent) return;
+      // Fall through to the synthetic replay below as a best-effort fallback.
+    }
+    for (const ev of events) {
+      await this.inject(ev);
+    }
+  }
+
+  /**
+   * Invoke the real Windows Secure Attention Sequence (Ctrl+Alt+Del) via the
+   * documented `SendSAS` API in `sas.dll`. This is the only user-space way to
+   * reach the secure desktop / logon UI; a plain key chord is ignored by the
+   * kernel for the SAS.
+   *
+   * Requirements on the host: the "SoftwareSASGeneration" group policy
+   * (Computer Configuration → Administrative Templates → Windows Components →
+   * Windows Logon Options) must permit software-generated SAS — otherwise
+   * `SendSAS` no-ops. We call it through PowerShell's Add-Type P/Invoke so the
+   * host needs no extra native dependency.
+   *
+   * Returns `true` if the SAS was dispatched, `false` if unavailable (non-
+   * Windows, PowerShell missing, policy disabled, or any error). Never throws.
+   */
+  async sendSAS(): Promise<boolean> {
+    if (process.platform !== 'win32') return false;
+    // P/Invoke SendSAS(bool AsUser). Passing $false requests the secure
+    // (winlogon) SAS — the genuine Ctrl+Alt+Del experience.
+    const script = [
+      '$sig = @"',
+      '[System.Runtime.InteropServices.DllImport("sas.dll", SetLastError=true)]',
+      'public static extern void SendSAS(bool AsUser);',
+      '"@',
+      'Add-Type -MemberDefinition $sig -Namespace StreamScreen -Name Sas -PassThru | Out-Null',
+      '[StreamScreen.Sas]::SendSAS($false)',
+    ].join('\n');
+    return await new Promise<boolean>((resolve) => {
+      try {
+        execFile(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+          { windowsHide: true, timeout: 5000 },
+          (err) => {
+            if (err) this.warnSASOnce(err);
+            resolve(!err);
+          },
+        );
+      } catch (err) {
+        this.warnSASOnce(err);
+        resolve(false);
+      }
+    });
   }
 
   private async holdModifiers(nut: NutModule, mods: number, press: boolean): Promise<void> {
@@ -315,6 +551,18 @@ export class InputInjector {
       if (press) await nut.keyboard.pressKey(k);
       else await nut.keyboard.releaseKey(k);
     }
+  }
+
+  private warnSASOnce(err?: unknown): void {
+    if (this.sasWarned) return;
+    this.sasWarned = true;
+    const detail = err instanceof Error ? `: ${err.message}` : '';
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[input-injector] could not invoke the Windows Secure Attention Sequence (SendSAS)${detail}. ` +
+        'Ctrl+Alt+Del fell back to a synthetic key chord, which the kernel ignores for the secure ' +
+        'desktop. Enable the "SoftwareSASGeneration" policy on the host to allow remote Ctrl+Alt+Del.',
+    );
   }
 
   private warnOnce(err?: unknown): void {

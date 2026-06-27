@@ -180,6 +180,166 @@ describe('SignalingServer', () => {
     host.close();
   });
 
+  it('rejects a second host on a code that already has a host (host-exists)', async () => {
+    const host = await connect(port);
+    send(host, { type: 'join', role: 'host', name: 'Real Host', code: '321321' });
+    await nextMessage(host, 'joined');
+
+    const rogue = await connect(port);
+    send(rogue, { type: 'join', role: 'host', name: 'Rogue', code: '321321' });
+    const err = await nextMessage(rogue, 'error');
+    expect(err.message).toBe('host-exists');
+
+    // The advertised host name must NOT have been overwritten by the rogue.
+    const session = server.listSessions().find((s) => s.code === '321321');
+    expect(session!.hostName).toBe('Real Host');
+
+    host.close();
+    rogue.close();
+  });
+
+  it('lets a new host reclaim a code once the previous host has left', async () => {
+    const host1 = await connect(port);
+    send(host1, { type: 'join', role: 'host', name: 'First', code: '555111' });
+    await nextMessage(host1, 'joined');
+    host1.close();
+    // Give the close handler a tick to reap the empty room.
+    await new Promise((r) => setTimeout(r, 50));
+
+    const host2 = await connect(port);
+    send(host2, { type: 'join', role: 'host', name: 'Second', code: '555111' });
+    const joined = await nextMessage(host2, 'joined');
+    expect(joined.role).toBe('host');
+    host2.close();
+  });
+
+  it('rejects a viewer joining a room that has no host yet', async () => {
+    // Two viewers race a code with no host: first viewer creates a hostless room
+    // implicitly only if allowed — here we ensure a viewer on a never-hosted
+    // code is rejected as no-such-session.
+    const viewer = await connect(port);
+    send(viewer, { type: 'join', role: 'viewer', code: '424242' });
+    const err = await nextMessage(viewer, 'error');
+    expect(err.message).toBe('no-such-session');
+    viewer.close();
+  });
+
+  it('caps simultaneous viewers per room (room-full)', async () => {
+    const small = new SignalingServer({ port: 0, heartbeatMs: 0, maxViewersPerRoom: 1 });
+    try {
+      const p = small.port;
+      const host = await connect(p);
+      send(host, { type: 'join', role: 'host', code: '909090' });
+      await nextMessage(host, 'joined');
+
+      const v1 = await connect(p);
+      send(v1, { type: 'join', role: 'viewer', code: '909090' });
+      await nextMessage(v1, 'joined');
+
+      const v2 = await connect(p);
+      send(v2, { type: 'join', role: 'viewer', code: '909090' });
+      const err = await nextMessage(v2, 'error');
+      expect(err.message).toBe('room-full');
+
+      host.close();
+      v1.close();
+      v2.close();
+    } finally {
+      await small.close();
+    }
+  });
+
+  it('throttles repeated failed viewer joins (too-many-attempts)', async () => {
+    const strict = new SignalingServer({
+      port: 0,
+      heartbeatMs: 0,
+      maxJoinFailures: 3,
+      joinFailWindowMs: 60_000,
+    });
+    try {
+      const p = strict.port;
+      const ws = await connect(p);
+      // 3 wrong-code attempts are answered with no-such-session...
+      for (let i = 0; i < 3; i++) {
+        send(ws, { type: 'join', role: 'viewer', code: '000001' });
+        const err = await nextMessage(ws, 'error');
+        // a fresh socket each time would be needed for distinct peers, but the
+        // server rejects join before registering a peer, so reuse is fine.
+        expect(['no-such-session', 'too-many-attempts']).toContain(err.message);
+      }
+      // ...the next attempt is throttled.
+      send(ws, { type: 'join', role: 'viewer', code: '000001' });
+      const err = await nextMessage(ws, 'error');
+      expect(err.message).toBe('too-many-attempts');
+      ws.close();
+    } finally {
+      await strict.close();
+    }
+  });
+
+  it('rejects browser-origin WS handshakes unless allowlisted', async () => {
+    const guarded = new SignalingServer({ port: 0, heartbeatMs: 0 });
+    try {
+      const p = guarded.port;
+      // A handshake carrying a (non-allowlisted) Origin must be refused.
+      const rejected = new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${p}`, {
+          headers: { origin: 'http://evil.example' },
+        });
+        ws.once('open', () => reject(new Error('expected handshake to be rejected')));
+        ws.once('error', () => resolve());
+        ws.once('unexpected-response', () => resolve());
+      });
+      await rejected;
+
+      // A non-browser client (no Origin) still connects fine.
+      const ok = await connect(p);
+      send(ok, { type: 'join', role: 'host', code: '787878' });
+      await nextMessage(ok, 'joined');
+      ok.close();
+    } finally {
+      await guarded.close();
+    }
+  });
+
+  it('allows a same-origin browser handshake by default', async () => {
+    // Origin host:port matches the Host header (127.0.0.1:<port>) the browser
+    // connects to — the legitimate "viewer served from the signaling host" case.
+    const ws = await new Promise<WebSocket>((resolve, reject) => {
+      const s = new WebSocket(`ws://127.0.0.1:${port}`, {
+        headers: { origin: `http://127.0.0.1:${port}` },
+      });
+      s.once('open', () => resolve(s));
+      s.once('error', reject);
+    });
+    send(ws, { type: 'join', role: 'host', code: '343434' });
+    await nextMessage(ws, 'joined');
+    ws.close();
+  });
+
+  it('allows an explicitly allowlisted browser Origin', async () => {
+    const allow = new SignalingServer({
+      port: 0,
+      heartbeatMs: 0,
+      allowedOrigins: ['http://localhost:5173'],
+    });
+    try {
+      const p = allow.port;
+      const ws = await new Promise<WebSocket>((resolve, reject) => {
+        const s = new WebSocket(`ws://127.0.0.1:${p}`, {
+          headers: { origin: 'http://localhost:5173' },
+        });
+        s.once('open', () => resolve(s));
+        s.once('error', reject);
+      });
+      send(ws, { type: 'join', role: 'host', code: '232323' });
+      await nextMessage(ws, 'joined');
+      ws.close();
+    } finally {
+      await allow.close();
+    }
+  });
+
   it('lists active sessions with live viewer counts', async () => {
     const host = await connect(port);
     send(host, { type: 'join', role: 'host', name: 'Listed', code: '111000' });

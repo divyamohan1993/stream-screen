@@ -99,10 +99,15 @@ export class SignalingClient {
 
       ws.onopen = () => {
         this.reconnectAttempt = 0;
-        // Flush anything queued while offline (join is replayed first).
+        // The server drops any relayable frame (offer/answer/ice) from a peer
+        // that has not yet joined a room. On a reconnect the socket is a brand
+        // new, unjoined peer, so the remembered join MUST be the first frame on
+        // the wire — ahead of any offer/ice queued during the outage. Prepend it
+        // before draining the outbox.
         const pending = this.outbox;
         this.outbox = [];
-        for (const raw of pending) {
+        const frames = this.lastJoin ? [JSON.stringify(this.lastJoin), ...pending] : pending;
+        for (const raw of frames) {
           try {
             ws.send(raw);
           } catch {
@@ -145,14 +150,11 @@ export class SignalingClient {
     this.reconnectAttempt += 1;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      void this.openSocket()
-        .then(() => {
-          // Re-announce presence after a transparent reconnect.
-          if (this.lastJoin) this.send(this.lastJoin);
-        })
-        .catch(() => {
-          this.scheduleReconnect();
-        });
+      // openSocket()'s onopen re-announces presence by sending lastJoin as the
+      // first frame, so no explicit rejoin is needed here.
+      void this.openSocket().catch(() => {
+        this.scheduleReconnect();
+      });
     }, delay);
   }
 

@@ -3,10 +3,10 @@ import { test, expect, type Page } from '@playwright/test';
 /**
  * Real WebRTC session end to end: two Chromium contexts (host + viewer) connect
  * through the live signaling server and establish a peer-to-peer media + data
- * session. We assert the viewer actually receives decoded video frames (the
- * canvas captureStream on the host arrives with non-zero dimensions and the
- * host's frame counter keeps advancing) and that the input data channel opens
- * on both ends.
+ * session. We assert the viewer actually receives *live, changing* decoded
+ * video frames (the canvas captureStream on the host arrives with non-zero
+ * dimensions AND the viewer's own decoded-frame counter keeps advancing on the
+ * receive side) and that the input data channel opens on both ends.
  */
 
 const code = '654321';
@@ -76,6 +76,18 @@ test('host and viewer establish a real WebRTC session with live video', async ({
     await expect
       .poll(async () => host.evaluate(() => window.__host.getFrame()))
       .toBeGreaterThan(f1);
+
+    // CRITICAL: prove live, *moving* video keeps arriving on the RECEIVE side —
+    // not just that one frame decoded, and not the host's own RAF counter. We
+    // sample the viewer's decoded-frame total (getVideoPlaybackQuality) and
+    // assert it strictly increases over time, i.e. RTP frames keep being decoded.
+    const decoded1 = await viewer.evaluate(() => window.__viewer.getDecodedFrameCount());
+    await expect
+      .poll(async () => viewer.evaluate(() => window.__viewer.getDecodedFrameCount()), {
+        message: 'viewer should keep decoding new frames over time',
+        timeout: 30_000,
+      })
+      .toBeGreaterThan(decoded1);
 
     // Data channel is open on both ends.
     await waitForOpenDataChannel(host, viewer);

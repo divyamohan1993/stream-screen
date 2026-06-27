@@ -1,17 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import type { InputEvent } from '@stream-screen/core';
+import type { AdaptiveStats, ControlMessage, InputEvent } from '@stream-screen/core';
 import { createMcpServer, dispatchTool, mcpToolList } from '../src/mcp-server.js';
-import { RemoteDesktopSession, WebRtcUnavailableError } from '../src/session.js';
+import {
+  RemoteDesktopSession,
+  WebRtcUnavailableError,
+  type SessionPeer,
+} from '../src/session.js';
 import {
   TOOL_DEFINITIONS,
   clamp,
   clampCoord,
   clickEvents,
+  comboEvents,
   getToolDefinition,
   moveMouseEvent,
   pressKeyEvents,
+  sendKeysEvents,
   toMods,
   toMouseButton,
+  toQualityPreset,
   typeTextEvents,
 } from '../src/tools.js';
 
@@ -27,7 +34,41 @@ const EXPECTED_TOOLS = [
   'type_text',
   'press_key',
   'get_stats',
+  'list_monitors',
+  'switch_monitor',
+  'send_chat',
+  'set_quality',
+  'send_keys',
+  'press_combo',
 ] as const;
+
+/**
+ * A fake {@link SessionPeer} that records every input/control message it
+ * receives, so tests can assert the session's dispatch path actually reaches the
+ * peer (no WebRTC runtime required).
+ */
+class FakePeer implements SessionPeer {
+  readonly inputs: InputEvent[] = [];
+  readonly controls: ControlMessage[] = [];
+  private controlCb: ((m: ControlMessage) => void) | null = null;
+  sendInput(e: InputEvent): void {
+    this.inputs.push(e);
+  }
+  sendControl(m: ControlMessage): void {
+    this.controls.push(m);
+  }
+  onControl(cb: (m: ControlMessage) => void): void {
+    this.controlCb = cb;
+  }
+  /** Simulate an inbound control message from the host. */
+  emit(m: ControlMessage): void {
+    this.controlCb?.(m);
+  }
+  async getStats(): Promise<AdaptiveStats> {
+    return {} as AdaptiveStats;
+  }
+  close(): void {}
+}
 
 describe('tool registry', () => {
   it('registers exactly the expected tools', () => {
@@ -45,9 +86,13 @@ describe('tool registry', () => {
       for (const req of t.inputSchema.required ?? []) {
         expect(Object.keys(t.inputSchema.properties)).toContain(req);
       }
-      // every property has a concrete primitive type.
+      // every property has a concrete type; arrays declare their item type.
       for (const prop of Object.values(t.inputSchema.properties)) {
-        expect(['string', 'number', 'integer', 'boolean']).toContain(prop.type);
+        expect(['string', 'number', 'integer', 'boolean', 'array']).toContain(prop.type);
+        if (prop.type === 'array') {
+          expect(prop.items).toBeTypeOf('object');
+          expect(['string', 'number', 'integer', 'boolean']).toContain(prop.items?.type);
+        }
       }
       // each tool maps to a REST route.
       expect(['GET', 'POST']).toContain(t.rest.method);
@@ -148,6 +193,51 @@ describe('pure helpers: tool -> InputEvent mapping', () => {
   });
 });
 
+describe('pure helpers: quality preset validation', () => {
+  it('accepts every valid preset verbatim', () => {
+    for (const p of ['auto', 'high', 'balanced', 'low'] as const) {
+      expect(toQualityPreset(p)).toBe(p);
+    }
+  });
+
+  it('rejects unknown or non-string presets', () => {
+    expect(() => toQualityPreset('ultra')).toThrow(/invalid quality preset/i);
+    expect(() => toQualityPreset('')).toThrow(/invalid quality preset/i);
+    expect(() => toQualityPreset(undefined)).toThrow(/invalid quality preset/i);
+    expect(() => toQualityPreset(2)).toThrow(/invalid quality preset/i);
+  });
+});
+
+describe('pure helpers: key combos', () => {
+  it('send_keys -> down chord then reverse up via buildKeyCombo', () => {
+    const events = sendKeysEvents(['ctrl', 'alt', 'delete']);
+    expect(events.map((e) => e.t)).toEqual(['k-down', 'k-down', 'k-down', 'k-up', 'k-up', 'k-up']);
+  });
+
+  it('send_keys rejects empty or non-string input', () => {
+    expect(() => sendKeysEvents([])).toThrow(/keys/i);
+    expect(() => sendKeysEvents('ctrl')).toThrow(/keys/i);
+    expect(() => sendKeysEvents([1, 2])).toThrow(/keys/i);
+  });
+
+  it('press_combo maps named combos to InputEvent sequences', () => {
+    const cad = comboEvents('ctrl+alt+del');
+    expect(cad.length).toBeGreaterThan(0);
+    expect(cad.every((e) => e.t === 'k-down' || e.t === 'k-up')).toBe(true);
+    // case-insensitive and returns a fresh array (mutation-safe).
+    const a = comboEvents('ALT+TAB');
+    const b = comboEvents('alt+tab');
+    expect(a).not.toBe(b);
+    expect(a).toEqual(b);
+    expect(comboEvents('escape').length).toBeGreaterThan(0);
+  });
+
+  it('press_combo rejects unknown combo names', () => {
+    expect(() => comboEvents('mash+everything')).toThrow(/unknown combo/i);
+    expect(() => comboEvents(undefined)).toThrow(/unknown combo/i);
+  });
+});
+
 describe('dispatchTool (no native webrtc)', () => {
   it('returns a clear error for unknown tools', async () => {
     const session = new RemoteDesktopSession();
@@ -187,6 +277,22 @@ describe('dispatchTool (no native webrtc)', () => {
     expect(res.isError).toBeFalsy();
     expect((res.content[0] as { text: string }).text).toBe('Disconnected.');
   });
+
+  it('new control tools fail clearly before a connection exists', async () => {
+    const session = new RemoteDesktopSession();
+    for (const [name, args] of [
+      ['list_monitors', {}],
+      ['switch_monitor', { id: 'm1' }],
+      ['send_chat', { text: 'x' }],
+      ['set_quality', { preset: 'high' }],
+      ['send_keys', { keys: ['ctrl', 'c'] }],
+      ['press_combo', { combo: 'ctrl+alt+del' }],
+    ] as const) {
+      const res = await dispatchTool(session, name, args);
+      expect(res.isError, `${name} should error when not connected`).toBe(true);
+      expect((res.content[0] as { text: string }).text).toMatch(/not connected/i);
+    }
+  });
 });
 
 describe('RemoteDesktopSession control with an injected runtime', () => {
@@ -198,18 +304,86 @@ describe('RemoteDesktopSession control with an injected runtime', () => {
     await expect(session.connect('12')).rejects.toThrow(/6.?9 digits/i);
   });
 
-  it('sends mapped InputEvents through the peer once connected', async () => {
-    const sent: InputEvent[] = [];
+  it('sends mapped InputEvents through the peer once connected', () => {
+    const peer = new FakePeer();
     const session = new RemoteDesktopSession();
-    // Bypass real WebRTC: stub the peer + connected state via pushFrame/private.
-    // We exercise the mapping by faking a connection through the public API:
-    // inject a fake peer by monkeypatching is out of scope; instead validate the
-    // pure event mapping is what would be sent.
-    sent.push(moveMouseEvent(0.1, 0.2));
-    for (const e of clickEvents(0.3, 0.4, 0)) sent.push(e);
-    for (const e of pressKeyEvents('a', 1)) sent.push(e);
-    expect(sent.map((e) => e.t)).toEqual(['m-move', 'm-down', 'm-up', 'k-down', 'k-up']);
-    expect(session.connected).toBe(false);
+    session.attachTestPeer(peer);
+    expect(session.connected).toBe(true);
+
+    session.moveMouse(0.1, 0.2);
+    session.click(0.3, 0.4, 0);
+    session.pressKey('a', 1);
+
+    // The session's own dispatch path (connected guard + peer.sendInput) is
+    // exercised: the mapped events actually reach the peer, in order.
+    expect(peer.inputs.map((e) => e.t)).toEqual(['m-move', 'm-down', 'm-up', 'k-down', 'k-up']);
+    expect(peer.inputs[0]).toEqual({ t: 'm-move', x: 0.1, y: 0.2 });
+    expect(peer.inputs[3]).toEqual({ t: 'k-down', code: 'a', key: 'a', mods: 1 });
+  });
+
+  it('sends control messages (chat, quality, switch-monitor, combos) through the peer', () => {
+    const peer = new FakePeer();
+    const session = new RemoteDesktopSession();
+    session.attachTestPeer(peer);
+
+    session.sendChat('hello host');
+    session.setQuality('high');
+    session.switchMonitor('display-2');
+    session.sendKeys(['meta', 'r']);
+    session.pressCombo('ctrl+alt+del');
+
+    const chat = peer.controls.find((m) => m.t === 'chat');
+    expect(chat).toMatchObject({ t: 'chat', text: 'hello host' });
+    expect((chat as { ts: number }).ts).toBeTypeOf('number');
+    expect(peer.controls).toContainEqual({ t: 'quality', preset: 'high' });
+    expect(peer.controls).toContainEqual({ t: 'switch-monitor', id: 'display-2' });
+    // send_keys and press_combo flow over the INPUT channel, not control.
+    expect(peer.inputs.some((e) => e.t === 'k-down')).toBe(true);
+  });
+
+  it('list_monitors sends request-monitors and resolves on the host reply', async () => {
+    const peer = new FakePeer();
+    const session = new RemoteDesktopSession();
+    session.attachTestPeer(peer);
+
+    const pending = session.listMonitors(1000);
+    expect(peer.controls).toContainEqual({ t: 'request-monitors' });
+    // Host answers asynchronously.
+    peer.emit({
+      t: 'monitors',
+      list: [{ id: 'm1', name: 'Primary', primary: true, width: 1920, height: 1080 }],
+    });
+    const monitors = await pending;
+    expect(monitors).toEqual([
+      { id: 'm1', name: 'Primary', primary: true, width: 1920, height: 1080 },
+    ]);
+  });
+
+  it('control tools dispatch end-to-end through dispatchTool with a peer present', async () => {
+    const peer = new FakePeer();
+    const session = new RemoteDesktopSession();
+    session.attachTestPeer(peer);
+
+    expect((await dispatchTool(session, 'send_chat', { text: 'hi' })).isError).toBeFalsy();
+    const quality = await dispatchTool(session, 'set_quality', { preset: 'low' });
+    expect(quality.isError).toBeFalsy();
+    expect((quality.content[0] as { text: string }).text).toContain('low');
+    expect((await dispatchTool(session, 'press_combo', { combo: 'win' })).isError).toBeFalsy();
+    expect((await dispatchTool(session, 'send_keys', { keys: ['ctrl', 'c'] })).isError).toBeFalsy();
+    expect((await dispatchTool(session, 'switch_monitor', { id: 'm2' })).isError).toBeFalsy();
+
+    expect(peer.controls).toContainEqual({ t: 'quality', preset: 'low' });
+    expect(peer.controls).toContainEqual({ t: 'switch-monitor', id: 'm2' });
+    expect(peer.inputs.some((e) => e.t === 'k-down')).toBe(true);
+  });
+
+  it('set_quality rejects an invalid preset via dispatchTool', async () => {
+    const peer = new FakePeer();
+    const session = new RemoteDesktopSession();
+    session.attachTestPeer(peer);
+    const res = await dispatchTool(session, 'set_quality', { preset: 'ludicrous' });
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/invalid quality preset/i);
   });
 });
 

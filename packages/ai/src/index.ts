@@ -10,6 +10,8 @@
  *   STREAMSCREEN_AI_MODE        'rest' to run the REST API; anything else = MCP.
  *   STREAMSCREEN_SIGNALING_URL  signaling server URL (default ws://127.0.0.1:8787).
  *   STREAMSCREEN_AI_PORT        REST port (default 8788).
+ *   STREAMSCREEN_AI_TOKEN       bearer token for REST /api/* (auto-generated if unset).
+ *   STREAMSCREEN_AI_ALLOWED_ORIGINS  comma-separated CORS allowlist (default none).
  *
  * Always free, no time limits, no bitrate caps.
  */
@@ -29,7 +31,10 @@ export async function main(): Promise<void> {
   if (mode === 'rest') {
     const { port } = await startRestApi();
     // eslint-disable-next-line no-console
-    console.error(`[streamscreen-ai] REST API listening on http://0.0.0.0:${port}`);
+    console.error(
+      `[streamscreen-ai] REST API listening on http://0.0.0.0:${port} ` +
+        `(bearer-token auth required on /api/*)`,
+    );
   } else {
     await startMcpServer();
     // MCP uses stdout for protocol traffic; log to stderr only.

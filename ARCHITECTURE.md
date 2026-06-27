@@ -13,6 +13,7 @@ that **there are no time limits or usage caps anywhere in the system.**
 - [LAN discovery (mDNS)](#lan-discovery-mdns)
 - [The adaptive control loop](#the-adaptive-control-loop)
 - [The input pipeline](#the-input-pipeline)
+- [Session features over the control & file channels](#session-features-over-the-control--file-channels)
 - [AI control layer (MCP + REST)](#ai-control-layer-mcp--rest)
 - [Security model](#security-model)
 - [No-limits guarantee](#no-limits-guarantee)
@@ -29,10 +30,10 @@ runs identically in a browser and in node.
 |---|---|---|
 | `@stream-screen/core` | browser + node | Protocol types + runtime building blocks: `Peer` (WebRTC), `SignalingClient`, `AdaptiveController`, input codec. |
 | `@stream-screen/signaling` | node | Zero-config LAN server: WebSocket SDP/ICE relay + rooms, mDNS discovery, tiny REST API. |
-| `@stream-screen/host` | Electron (Windows) | Captures the screen (`desktopCapturer`), runs the adaptive loop, injects remote input (`nut.js`), tray UI. |
-| `@stream-screen/viewer` | browser (Vite + React) | Renders the remote screen, captures input, shows the live stats dashboard. |
-| `@stream-screen/ai` | node | MCP (stdio) server + mirrored REST API so AI agents can drive a session. |
-| `@stream-screen/e2e` | node + Chromium | Playwright: two real browser peers run a live WebRTC session. |
+| `@stream-screen/host` | Electron (Windows) | Captures screen + system audio, enumerates/switches monitors, runs the adaptive loop, injects remote input incl. special combos (`nut.js`), saves received files, tray UI. |
+| `@stream-screen/viewer` | browser (Vite + React) | Renders the remote screen+audio, captures input, file transfer, monitor switching, recording, chat, live stats dashboard. |
+| `@stream-screen/ai` | node | MCP (stdio) server + mirrored REST API so AI agents can drive a session (incl. monitors, chat, quality, key combos). |
+| `@stream-screen/e2e` | node + Chromium | Playwright: two real browser peers run a live WebRTC session (11 specs: session/input/adaptive/audio/file/control/keys/recording). |
 
 ---
 
@@ -68,8 +69,8 @@ flowchart LR
   VS <-->|"SDP offer/answer + ICE\n(bootstrap only)"| WS
   MDNS -.->|advertise / browse| VIEW
 
-  HS ==>|"WebRTC video track (DTLS-SRTP)"| VS
-  VS ==>|"WebRTC data channel: InputEvents"| HS
+  HS ==>|"WebRTC video + audio tracks (DTLS-SRTP)"| VS
+  VS ==>|"WebRTC data channels: input / control / file"| HS
 
   classDef p2p stroke-width:3px;
   class HS,VS p2p;
@@ -235,6 +236,12 @@ flowchart LR
 - **Events.** `m-move`, `m-down`, `m-up`, `m-wheel`, `k-down`, `k-up`,
   `clipboard`. Buttons: 0=left, 1=middle, 2=right. Modifier bitflags: 1=shift,
   2=ctrl, 4=alt, 8=meta.
+- **Special key combos.** `buildKeyCombo` / `SPECIAL_KEYS` (`core/src/protocol.ts`)
+  turn a logical chord (e.g. `['ctrl','alt','delete']`) into an ordered
+  key-down/up sequence carrying the cumulative modifier bitmask, so chords the
+  browser would intercept — **Ctrl+Alt+Del**, Win, Alt+Tab, Win+R, Win+D, Alt+F4,
+  Esc — replay correctly on the host injector. These pure builders are
+  unit-tested without the native library.
 - **Wire codec** (`core/input-codec.ts`) is compact JSON with coordinates rounded
   to 4 decimals (sub-pixel on 4K) to keep pointer-move spam small; it is pure and
   round-trip safe, with an exhaustiveness guard so a new event variant fails to
@@ -246,6 +253,79 @@ flowchart LR
   **optional** dependency loaded lazily. If absent, input becomes a logged no-op
   and streaming continues. Clipboard events are handled by the Electron clipboard
   in the main process rather than synthetic keystrokes.
+
+---
+
+## Session features over the control & file channels
+
+Collaboration features beyond raw screen+input ride two additional WebRTC data
+channels next to the video/audio media — both reliable and ordered, both fully
+peer-to-peer (they never traverse the signaling server):
+
+- a text `control` channel carrying JSON `ControlMessage`s, and
+- a binary `file` channel carrying raw file bytes.
+
+The `ControlMessage` union (`core/src/protocol.ts`) is a single discriminated
+type with a strict runtime guard (`isControlMessage`) that validates each
+variant's required fields, so a malformed frame is rejected rather than partially
+trusted. Its variants:
+
+| Variant(s) | Purpose |
+|---|---|
+| `chat` | timestamped text chat, either direction |
+| `request-monitors`, `monitors`, `switch-monitor`, `monitor-switched` | multi-monitor enumeration + runtime switch |
+| `file-offer`, `file-accept`, `file-reject`, `file-progress`, `file-complete`, `file-error` | file-transfer signaling for the binary `file` channel |
+| `audio` | toggle host system-audio capture on/off |
+| `quality` | select an `auto`/`high`/`balanced`/`low` preset |
+
+```mermaid
+flowchart LR
+  subgraph V["VIEWER"]
+    VC["control sender"]
+    VF["FileTransferManager"]
+    REC["MediaRecorder -> .webm"]
+    MUTE["audio mute toggle"]
+  end
+  subgraph H["HOST"]
+    HC["control router"]
+    SWAP["replaceTrack\n(monitor switch)"]
+    SAVE["file-save (disk)"]
+    AUD["system-audio capture"]
+  end
+  VC <-->|"control channel (JSON): chat, monitors,\naudio, quality, file signaling"| HC
+  VF ==>|"file channel (binary, framed chunks)"| SAVE
+  HC --> SWAP
+  HC --> AUD
+  VS2["remote MediaStream\n(video + audio)"] --> REC
+  VS2 --> MUTE
+```
+
+- **System audio.** The host mixes desktop audio into the captured stream and
+  negotiates it as an audio track on the *same* peer connection (no second
+  connection). The viewer plays it inline; mute/unmute flips the inbound track's
+  `enabled` flag, and an `audio` control message asks the host to start/stop
+  capture.
+- **Multi-monitor switching.** The host advertises its displays as `MonitorInfo`
+  (`id, name, primary, width, height`). The viewer requests the list, picks a
+  display, and the host swaps the outbound video track **in place**
+  (`replaceTrack`) — no SDP renegotiation, no session teardown — then acks
+  `monitor-switched`.
+- **File transfer.** `FileTransferManager` (`core/src/file-transfer.ts`) is a
+  pure, DOM-free chunker/reassembler. The sender emits `file-offer`, awaits
+  `file-accept`, streams 16 KiB chunks each prefixed with an 8-byte
+  `seq`+`payloadLen` header over the binary `file` channel, then `file-complete`.
+  The receiver reassembles deterministically (the header lets it detect
+  out-of-order delivery defensively) and reports `file-progress`; the Windows host
+  persists received files via `host/src/file-save.ts`.
+- **Recording.** Purely viewer-side and local: a `MediaRecorder` over the
+  incoming remote `MediaStream` yields a downloadable `.webm`. Nothing is uploaded
+  and there is no length cap.
+- **Chat & quality.** Chat is timestamped text either direction; `quality` lets a
+  viewer (or AI agent) pin a preset that the host applies on top of the adaptive
+  loop (`auto` returns control to the AIMD engine).
+
+None of these features introduce a timer, a usage counter, or a cap — they obey
+the [No-limits guarantee](#no-limits-guarantee) like the rest of the system.
 
 ---
 
@@ -268,7 +348,11 @@ flowchart LR
 ```
 
 Tools: `list_hosts`, `connect`, `disconnect`, `screenshot`, `ocr_screen`,
-`move_mouse`, `click`, `type_text`, `press_key`, `get_stats`. The node WebRTC
+`move_mouse`, `click`, `type_text`, `press_key`, `get_stats`, plus the
+session-feature tools `list_monitors`, `switch_monitor`, `send_chat`,
+`set_quality`, `send_keys` (arbitrary chord), and `press_combo` (named combos
+incl. Ctrl+Alt+Del) — every one generated from the same `tools.ts` registry that
+drives the MCP and REST surfaces, so they cannot drift. The node WebRTC
 runtime and OCR engine are optional dynamic imports; when missing, the server and
 its schemas stay valid and only the affected calls return a clear error.
 Screenshots are produced by converting raw I420 frames to PNG with a
@@ -325,6 +409,11 @@ is enforced in code, not just by default config:
   quality whenever the link allows.
 - **Rooms disappear only when empty.** A room is reaped after the last socket
   leaves — this is cleanup, not a timeout.
+- **Every feature is unmetered.** Audio, file transfer, multi-monitor switching,
+  session recording, chat, and special key combos all run for the full life of
+  the session with no per-feature timer, byte counter, or paywall — unlike
+  AnyDesk, which gates file transfer/recording behind paid tiers and the
+  ~15-minute free cutoff.
 
 These invariants are documented at their enforcement points in
 `signaling/src/server.ts`, `host/src/host-session.ts`, `core/src/adaptive.ts`,

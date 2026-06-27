@@ -10,11 +10,15 @@
     </style>
   </head>
   <body>
-    <video id="remote" autoplay playsinline muted></video>
+    <video id="remote" autoplay playsinline></video>
     <div id="status">viewer: booting</div>
 
     <script type="module">
-      import { Peer, SignalingClient } from './core.bundle.js';
+      import {
+        Peer,
+        SignalingClient,
+        createSender,
+      } from './core.bundle.js';
 
       const params = new URLSearchParams(location.search);
       const code = params.get('code') ?? '123456';
@@ -22,22 +26,63 @@
 
       const statusEl = document.getElementById('status');
       const video = document.getElementById('remote');
+      // Muted by default so autoplay is allowed; the spec can unmute via setMuted.
+      video.muted = true;
 
       const state = {
         ready: false,
         connectionState: 'new',
         gotTrack: false,
+        gotAudioTrack: false,
         dataChannelOpen: false,
+        chats: [],
+        monitors: [],
+        monitorSwitched: null,
       };
+
+      // The most recent remote MediaStream (used for recording / track checks).
+      let remoteStream = null;
 
       const signaling = new SignalingClient(wsUrl);
       const peer = new Peer({ role: 'viewer', signaling });
 
+      // --- Recording state (MediaRecorder over the received stream). ---
+      let recorder = null;
+      let recordedBytes = 0;
+      let recordedChunks = 0;
+
       // --- Test hooks the spec reads / calls. ---
       window.__viewer = {
-        getState: () => ({ ...state }),
+        getState: () => ({
+          ...state,
+          chats: [...state.chats],
+          monitors: state.monitors.map((m) => ({ ...m })),
+        }),
         getVideoSize: () => ({ width: video.videoWidth, height: video.videoHeight }),
         isVideoPlaying: () => video.videoWidth > 0 && video.videoHeight > 0 && !video.paused,
+        // Decoded-frame counter for the receive side — strictly increases while
+        // live video keeps arriving and being decoded by this viewer.
+        getDecodedFrameCount: () => {
+          try {
+            const q = video.getVideoPlaybackQuality?.();
+            return q ? q.totalVideoFrames : 0;
+          } catch {
+            return 0;
+          }
+        },
+        getAudioTrackInfo: () => {
+          const tracks = remoteStream ? remoteStream.getAudioTracks() : [];
+          return {
+            count: tracks.length,
+            readyState: tracks[0] ? tracks[0].readyState : null,
+            enabled: tracks[0] ? tracks[0].enabled : null,
+          };
+        },
+        setMuted: (m) => {
+          video.muted = m;
+          const tracks = remoteStream ? remoteStream.getAudioTracks() : [];
+          for (const t of tracks) t.enabled = !m;
+        },
         getStats: async () => {
           try {
             return await peer.getStats();
@@ -48,6 +93,68 @@
         sendInput: (ev) => {
           peer.sendInput(ev);
         },
+        // --- Control: chat + monitors. ---
+        sendChat: (text) => {
+          peer.sendControl({ t: 'chat', text, ts: Date.now() });
+        },
+        getChats: () => [...state.chats],
+        requestMonitors: () => {
+          peer.sendControl({ t: 'request-monitors' });
+        },
+        getMonitors: () => state.monitors.map((m) => ({ ...m })),
+        switchMonitor: (id) => {
+          peer.sendControl({ t: 'switch-monitor', id });
+        },
+        getMonitorSwitched: () => state.monitorSwitched,
+        // --- File transfer (viewer -> host). ---
+        sendFile: async (id, name, mime, bytesArray) => {
+          const data = new Uint8Array(bytesArray);
+          const sender = createSender({
+            meta: { id, name, size: data.byteLength, mime },
+            data,
+            send: (m) => peer.sendControl(m),
+            sendChunk: (buf) => peer.sendFileChunk(buf),
+            drain: () => peer.drainFile(),
+          });
+          // Release the chunk stream as soon as the host's file-accept arrives.
+          peer.onControl((m) => {
+            if (m.t === 'file-accept' && m.id === id) sender.accept();
+            if ((m.t === 'file-reject' || m.t === 'file-error') && m.id === id) {
+              sender.abort(m.t);
+            }
+          });
+          await sender.start();
+          return true;
+        },
+        // --- Recording (MediaRecorder of the incoming stream). ---
+        startRecording: () => {
+          if (!remoteStream) return false;
+          recordedBytes = 0;
+          recordedChunks = 0;
+          // Record video only — robust across builds regardless of audio track.
+          const opts = {};
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported?.('video/webm')) {
+            opts.mimeType = 'video/webm';
+          }
+          recorder = new MediaRecorder(remoteStream, opts);
+          recorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) {
+              recordedBytes += e.data.size;
+              recordedChunks += 1;
+            }
+          };
+          recorder.start(100); // emit a blob every 100ms
+          return true;
+        },
+        stopRecording: () =>
+          new Promise((resolve) => {
+            if (!recorder) {
+              resolve({ bytes: 0, chunks: 0 });
+              return;
+            }
+            recorder.onstop = () => resolve({ bytes: recordedBytes, chunks: recordedChunks });
+            recorder.stop();
+          }),
       };
 
       peer.on('state', (s) => {
@@ -55,14 +162,16 @@
         statusEl.textContent = `viewer: ${s}`;
       });
 
-      peer.on('track', (_track, remoteStream) => {
+      peer.on('track', (_track, stream) => {
         state.gotTrack = true;
-        if (remoteStream) {
-          video.srcObject = remoteStream;
+        if (stream) {
+          remoteStream = stream;
         } else {
-          const ms = new MediaStream([_track]);
-          video.srcObject = ms;
+          remoteStream = remoteStream ?? new MediaStream();
+          remoteStream.addTrack(_track);
         }
+        if (remoteStream.getAudioTracks().length > 0) state.gotAudioTrack = true;
+        video.srcObject = remoteStream;
         video.play().catch(() => {});
       });
 
@@ -73,6 +182,22 @@
         if (ch.readyState === 'open') markOpen();
         ch.addEventListener?.('open', markOpen);
         ch.onopen = markOpen;
+      });
+
+      peer.onControl((m) => {
+        switch (m.t) {
+          case 'chat':
+            state.chats.push(m);
+            break;
+          case 'monitors':
+            state.monitors = m.list;
+            break;
+          case 'monitor-switched':
+            state.monitorSwitched = m.id;
+            break;
+          default:
+            break;
+        }
       });
 
       (async () => {

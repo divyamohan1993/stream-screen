@@ -18,13 +18,37 @@
 
 import { deflateSync } from 'node:zlib';
 import { Peer, SignalingClient, isValidSessionCode } from '@stream-screen/core';
-import type { AdaptiveStats, InputEvent, SessionInfo } from '@stream-screen/core';
+import type {
+  AdaptiveStats,
+  ControlMessage,
+  InputEvent,
+  MonitorInfo,
+  QualityPreset,
+  SessionInfo,
+} from '@stream-screen/core';
 import {
   clickEvents,
+  comboEvents,
   moveMouseEvent,
   pressKeyEvents,
+  sendKeysEvents,
+  toQualityPreset,
   typeTextEvents,
 } from './tools.js';
+
+/**
+ * The minimal {@link Peer} surface this session drives. Declaring it as an
+ * interface (rather than depending on the concrete class) lets tests inject a
+ * lightweight fake peer that records the events/control messages it receives —
+ * see {@link RemoteDesktopSession.attachTestPeer}.
+ */
+export interface SessionPeer {
+  sendInput(e: InputEvent): void;
+  sendControl(m: ControlMessage): void;
+  onControl(cb: (m: ControlMessage) => void): void;
+  getStats(): Promise<AdaptiveStats>;
+  close(): void;
+}
 
 /** A discoverable host returned by {@link RemoteDesktopSession.listHosts}. */
 export interface HostEntry {
@@ -114,9 +138,14 @@ export class RemoteDesktopSession {
   private readonly signalingUrl: string;
 
   private signaling: SignalingClient | null = null;
-  private peer: Peer | null = null;
+  private peer: SessionPeer | null = null;
   private rtcCtor: typeof RTCPeerConnection | null;
   private connectedCode: string | null = null;
+
+  /** Pending resolvers awaiting the host's `monitors` reply (list_monitors). */
+  private monitorWaiters: Array<(list: MonitorInfo[]) => void> = [];
+  /** Most recent monitor list reported by the host, if any. */
+  private lastMonitors: MonitorInfo[] | null = null;
 
   /** Most recent decoded video frame, kept for screenshot/OCR. */
   private lastFrame: CapturedFrame | null = null;
@@ -194,6 +223,7 @@ export class RemoteDesktopSession {
     peer.on('track', (track: unknown) => {
       this.installFrameSink(track);
     });
+    peer.onControl((m) => this.handleControl(m));
 
     await peer.start();
     signaling.join({ code, role: 'viewer', name: this.opts.viewerName ?? 'streamscreen-ai' });
@@ -216,6 +246,11 @@ export class RemoteDesktopSession {
     this.connectedCode = null;
     this.lastFrame = null;
     this.frameSink = null;
+    this.lastMonitors = null;
+    // Reject any list_monitors calls still awaiting a reply.
+    const waiters = this.monitorWaiters;
+    this.monitorWaiters = [];
+    for (const w of waiters) w([]);
   }
 
   /**
@@ -257,6 +292,86 @@ export class RemoteDesktopSession {
   async getStats(): Promise<AdaptiveStats> {
     this.assertConnected();
     return this.peer!.getStats();
+  }
+
+  /**
+   * Ask the host to enumerate its displays and return the reported list. Sends a
+   * `request-monitors` control message and resolves when the host replies with a
+   * `monitors` message (or after `timeoutMs`, with the last-known list or []).
+   */
+  async listMonitors(timeoutMs = 2000): Promise<MonitorInfo[]> {
+    this.assertConnected();
+    return await new Promise<MonitorInfo[]>((resolve) => {
+      let settled = false;
+      const done = (list: MonitorInfo[]): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(list);
+      };
+      const timer = setTimeout(() => {
+        // Drop our waiter and resolve with whatever we last knew.
+        this.monitorWaiters = this.monitorWaiters.filter((w) => w !== done);
+        done(this.lastMonitors ?? []);
+      }, timeoutMs);
+      this.monitorWaiters.push(done);
+      this.peer!.sendControl({ t: 'request-monitors' });
+    });
+  }
+
+  /** Switch the active streamed monitor to `id` (from {@link listMonitors}). */
+  switchMonitor(id: string): void {
+    this.assertConnected();
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new Error('Missing or invalid monitor id.');
+    }
+    this.peer!.sendControl({ t: 'switch-monitor', id });
+  }
+
+  /** Send a chat message to the host operator. */
+  sendChat(text: string): void {
+    this.assertConnected();
+    if (typeof text !== 'string') throw new Error('Missing or invalid chat text.');
+    this.peer!.sendControl({ t: 'chat', text, ts: Date.now() });
+  }
+
+  /** Set the streaming quality preset (validated). */
+  setQuality(preset: unknown): QualityPreset {
+    this.assertConnected();
+    const p = toQualityPreset(preset);
+    this.peer!.sendControl({ t: 'quality', preset: p });
+    return p;
+  }
+
+  /** Press an arbitrary modifier+key chord (e.g. ['ctrl','alt','delete']). */
+  sendKeys(keys: unknown): void {
+    for (const e of sendKeysEvents(keys)) this.send(e);
+  }
+
+  /** Press a named special combo (e.g. 'ctrl+alt+del'). */
+  pressCombo(combo: unknown): void {
+    for (const e of comboEvents(combo)) this.send(e);
+  }
+
+  /**
+   * Inject a fake peer and mark the session connected. FOR TESTS ONLY: lets a
+   * test exercise the real control/dispatch path (the `connected` guard plus
+   * `peer.sendInput`/`peer.sendControl`) without a WebRTC runtime or signaling.
+   */
+  attachTestPeer(peer: SessionPeer, code = '123456'): void {
+    this.peer = peer;
+    this.connectedCode = code;
+    peer.onControl((m) => this.handleControl(m));
+  }
+
+  /** Route an inbound control message (monitor replies, etc.). */
+  private handleControl(m: ControlMessage): void {
+    if (m.t === 'monitors') {
+      this.lastMonitors = m.list;
+      const waiters = this.monitorWaiters;
+      this.monitorWaiters = [];
+      for (const w of waiters) w(m.list);
+    }
   }
 
   // -------------------------------------------------------------------------

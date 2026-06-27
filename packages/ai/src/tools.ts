@@ -14,7 +14,12 @@
  * mapping, modifier parsing) carry no I/O and are unit-tested directly.
  */
 
-import type { InputEvent } from '@stream-screen/core';
+import {
+  buildKeyCombo,
+  SPECIAL_KEYS,
+  type InputEvent,
+  type QualityPreset,
+} from '@stream-screen/core';
 
 /** A JSON-Schema object describing a tool's parameters. */
 export interface JsonSchema {
@@ -26,12 +31,14 @@ export interface JsonSchema {
 
 /** A single JSON-Schema property (the subset we emit). */
 export interface JsonSchemaProperty {
-  type: 'string' | 'number' | 'integer' | 'boolean';
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'array';
   description?: string;
   minimum?: number;
   maximum?: number;
   enum?: Array<string | number>;
   default?: string | number | boolean;
+  /** For `type: 'array'`, the schema of each item. */
+  items?: { type: 'string' | 'number' | 'integer' | 'boolean' };
 }
 
 /** HTTP method a REST route uses to mirror an MCP tool. */
@@ -48,7 +55,13 @@ export type ToolName =
   | 'click'
   | 'type_text'
   | 'press_key'
-  | 'get_stats';
+  | 'get_stats'
+  | 'list_monitors'
+  | 'switch_monitor'
+  | 'send_chat'
+  | 'set_quality'
+  | 'send_keys'
+  | 'press_combo';
 
 /** A fully-described tool, used to generate both MCP and REST surfaces. */
 export interface ToolDefinition {
@@ -190,6 +203,95 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     inputSchema: emptySchema(),
     rest: { method: 'GET', path: '/api/stats' },
   },
+  {
+    name: 'list_monitors',
+    description:
+      'List the displays/monitors available on the remote host. Sends a request to the host and returns the reported MonitorInfo list (id, name, primary, width, height). Requires an active connection.',
+    inputSchema: emptySchema(),
+    rest: { method: 'GET', path: '/api/monitors' },
+  },
+  {
+    name: 'switch_monitor',
+    description:
+      'Switch the active monitor being streamed from the host to the display with the given id (as returned by list_monitors). The host swaps the video track in place (no full renegotiation).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The monitor id to switch to (from list_monitors).' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+    rest: { method: 'POST', path: '/api/monitor' },
+  },
+  {
+    name: 'send_chat',
+    description:
+      'Send a text chat message to the host operator over the session control channel.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'The chat message text to send.' },
+      },
+      required: ['text'],
+      additionalProperties: false,
+    },
+    rest: { method: 'POST', path: '/api/chat' },
+  },
+  {
+    name: 'set_quality',
+    description:
+      "Set the streaming quality preset for the session. One of 'auto', 'high', 'balanced', or 'low'. 'auto' lets the adaptive controller pick.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        preset: {
+          type: 'string',
+          enum: ['auto', 'high', 'balanced', 'low'],
+          description: "Quality preset: 'auto'|'high'|'balanced'|'low'.",
+        },
+      },
+      required: ['preset'],
+      additionalProperties: false,
+    },
+    rest: { method: 'POST', path: '/api/quality' },
+  },
+  {
+    name: 'send_keys',
+    description:
+      "Press an arbitrary modifier+key combo on the remote machine as a single chord. keys is an ordered list of logical names, e.g. ['ctrl','alt','delete'] or ['meta','r']. Modifiers (shift,ctrl,alt,meta) are held while the final key(s) are pressed, then all are released in reverse order.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        keys: {
+          type: 'array',
+          items: { type: 'string' },
+          description: "Ordered key names, e.g. ['ctrl','alt','delete'].",
+        },
+      },
+      required: ['keys'],
+      additionalProperties: false,
+    },
+    rest: { method: 'POST', path: '/api/keys' },
+  },
+  {
+    name: 'press_combo',
+    description:
+      "Press a well-known special key combo by name. One of: 'ctrl+alt+del', 'win', 'alt+tab', 'win+r', 'win+d', 'alt+f4', 'escape'. Convenience wrapper over send_keys for the common chords.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        combo: {
+          type: 'string',
+          enum: ['ctrl+alt+del', 'win', 'alt+tab', 'win+r', 'win+d', 'alt+f4', 'escape'],
+          description: 'The named special combo to press.',
+        },
+      },
+      required: ['combo'],
+      additionalProperties: false,
+    },
+    rest: { method: 'POST', path: '/api/combo' },
+  },
 ] as const;
 
 /** Look up a tool definition by name (undefined if unknown). */
@@ -275,10 +377,80 @@ export function pressKeyEvents(key: string, mods: unknown): [InputEvent, InputEv
 
 /**
  * Map a `type_text` invocation to the sequence of {@link InputEvent}s it
- * produces. A `clipboard` event carries the whole string (the host pastes it),
- * which is both faster and more reliable for arbitrary unicode than synthesizing
- * per-character key strokes.
+ * produces. A `clipboard` event carries the whole string; the host writes it to
+ * the system clipboard and then synthesizes Ctrl+V to paste it into the focused
+ * field. This is both faster and more reliable for arbitrary unicode than
+ * synthesizing per-character key strokes.
  */
 export function typeTextEvents(text: string): InputEvent[] {
   return [{ t: 'clipboard', text }];
+}
+
+/** The valid {@link QualityPreset} values, in the order the schema enumerates them. */
+export const QUALITY_PRESETS: readonly QualityPreset[] = ['auto', 'high', 'balanced', 'low'];
+
+/**
+ * Coerce/validate an arbitrary value to a {@link QualityPreset}. Throws a
+ * descriptive error for anything outside the allowed set, so the AI layer never
+ * forwards a garbage preset to the host.
+ */
+export function toQualityPreset(v: unknown): QualityPreset {
+  if (typeof v === 'string' && (QUALITY_PRESETS as readonly string[]).includes(v)) {
+    return v as QualityPreset;
+  }
+  throw new Error(
+    `Invalid quality preset "${String(v)}": expected one of ${QUALITY_PRESETS.join(', ')}.`,
+  );
+}
+
+/**
+ * Map a `send_keys` invocation to the {@link InputEvent} sequence it produces.
+ * Delegates to {@link buildKeyCombo}, which holds modifiers across the chord and
+ * releases everything in reverse. Throws if `keys` is empty or non-string.
+ */
+export function sendKeysEvents(keys: unknown): InputEvent[] {
+  if (!Array.isArray(keys) || keys.length === 0) {
+    throw new Error('Missing or empty "keys": expected a non-empty array of key names.');
+  }
+  if (!keys.every((k) => typeof k === 'string' && k.length > 0)) {
+    throw new Error('Invalid "keys": every entry must be a non-empty string.');
+  }
+  return buildKeyCombo(keys as string[]);
+}
+
+/** Canonical names of the special combos {@link comboEvents} understands. */
+export type ComboName =
+  | 'ctrl+alt+del'
+  | 'win'
+  | 'alt+tab'
+  | 'win+r'
+  | 'win+d'
+  | 'alt+f4'
+  | 'escape';
+
+/** Map a named special combo to the matching {@link SPECIAL_KEYS} entry. */
+const COMBO_TO_SPECIAL: Record<ComboName, keyof typeof SPECIAL_KEYS> = {
+  'ctrl+alt+del': 'CTRL_ALT_DEL',
+  win: 'WIN',
+  'alt+tab': 'ALT_TAB',
+  'win+r': 'WIN_R',
+  'win+d': 'WIN_D',
+  'alt+f4': 'ALT_F4',
+  escape: 'ESCAPE',
+};
+
+/**
+ * Map a `press_combo` invocation to the {@link InputEvent} sequence for the named
+ * special chord (Ctrl+Alt+Del, Win, Alt+Tab, …). Throws on an unknown combo
+ * name. Returns a fresh array so callers cannot mutate the shared SPECIAL_KEYS.
+ */
+export function comboEvents(combo: unknown): InputEvent[] {
+  const name = typeof combo === 'string' ? (combo.toLowerCase() as ComboName) : undefined;
+  const key = name && COMBO_TO_SPECIAL[name];
+  if (!key) {
+    throw new Error(
+      `Unknown combo "${String(combo)}": expected one of ${Object.keys(COMBO_TO_SPECIAL).join(', ')}.`,
+    );
+  }
+  return [...SPECIAL_KEYS[key]];
 }

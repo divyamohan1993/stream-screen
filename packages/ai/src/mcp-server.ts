@@ -3,7 +3,8 @@
  *
  * Exposes the AI control surface as Model Context Protocol tools so an agent can
  * drive a remote desktop end to end: list_hosts, connect, disconnect,
- * screenshot, ocr_screen, move_mouse, click, type_text, press_key, get_stats.
+ * screenshot, ocr_screen, move_mouse, click, type_text, press_key, get_stats,
+ * list_monitors, switch_monitor, send_chat, set_quality, send_keys, press_combo.
  *
  * Tool names + JSON Schemas come from the shared {@link TOOL_DEFINITIONS}
  * registry, so this server and the REST API never diverge. The actual work is
@@ -136,6 +137,30 @@ export async function dispatchTool(
       case 'get_stats': {
         const stats = await session.getStats();
         return text(JSON.stringify(stats, null, 2));
+      }
+      case 'list_monitors': {
+        const monitors = await session.listMonitors();
+        return text(JSON.stringify(monitors, null, 2));
+      }
+      case 'switch_monitor': {
+        session.switchMonitor(reqString(args, 'id'));
+        return text('ok');
+      }
+      case 'send_chat': {
+        session.sendChat(reqString(args, 'text'));
+        return text('ok');
+      }
+      case 'set_quality': {
+        const preset = session.setQuality(reqString(args, 'preset'));
+        return text(`quality set to ${preset}`);
+      }
+      case 'send_keys': {
+        session.sendKeys(args.keys);
+        return text('ok');
+      }
+      case 'press_combo': {
+        session.pressCombo(reqString(args, 'combo'));
+        return text('ok');
       }
       default:
         return errorResult(`Unhandled tool: ${name}`);

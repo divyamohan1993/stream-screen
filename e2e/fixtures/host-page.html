@@ -20,10 +20,15 @@
         Peer,
         SignalingClient,
         AdaptiveController,
+        createReceiver,
       } from './core.bundle.js';
 
       const params = new URLSearchParams(location.search);
       const code = params.get('code') ?? '123456';
+      // When `audio=1`, the host mixes a synthetic loopback/system-audio track
+      // (oscillator -> MediaStreamDestination) into the captured stream so the
+      // viewer can prove system-audio streaming over WebRTC.
+      const withAudio = params.get('audio') === '1';
       const wsUrl = `ws://${location.host}`;
 
       const statusEl = document.getElementById('status');
@@ -54,6 +59,37 @@
       // captureStream stands in for desktopCapturer on the real host.
       const stream = canvas.captureStream(30);
 
+      // Optionally attach a synthetic system-audio track. We use a Web Audio
+      // oscillator routed into a MediaStreamDestination — the audio analogue of
+      // the canvas captureStream — so there is a real, "live" audio track to
+      // negotiate over the peer connection.
+      if (withAudio) {
+        try {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          const audioCtx = new AC();
+          const osc = audioCtx.createOscillator();
+          osc.type = 'sine';
+          osc.frequency.value = 440;
+          const dest = audioCtx.createMediaStreamDestination();
+          osc.connect(dest);
+          osc.start();
+          for (const at of dest.stream.getAudioTracks()) stream.addTrack(at);
+          // Keep refs alive so GC doesn't stop the track mid-test.
+          window.__hostAudio = { audioCtx, osc, dest };
+        } catch (e) {
+          window.__hostError = `audio setup: ${String(e)}`;
+        }
+      }
+
+      // --- Multi-monitor: a fixed enumeration the viewer can list/switch. ---
+      // Each "monitor" is just a different canvas the host can swap the outbound
+      // video track to via replaceVideoTrack (no renegotiation).
+      const monitors = [
+        { id: 'mon-0', name: 'Display 1', primary: true, width: 640, height: 480 },
+        { id: 'mon-1', name: 'Display 2', primary: false, width: 640, height: 480 },
+      ];
+      let activeMonitor = 'mon-0';
+
       // --- Test hooks the spec reads. ---
       const state = {
         ready: false,
@@ -62,17 +98,72 @@
         receivedInputs: [],
         lastInput: null,
         adaptiveDecisions: [],
+        chats: [],
+        activeMonitor,
+        receivedFiles: [],
       };
+
+      // Sum every byte (mod 2^32) — a cheap content checksum the spec compares
+      // against the same computation on the sending side.
+      function checksum(bytes) {
+        let sum = 0;
+        for (let i = 0; i < bytes.length; i++) {
+          sum = (sum + bytes[i]) >>> 0;
+        }
+        return sum;
+      }
+
       window.__host = {
         getFrame: () => frame,
-        getState: () => ({ ...state, receivedInputs: [...state.receivedInputs] }),
+        getState: () => ({
+          ...state,
+          receivedInputs: [...state.receivedInputs],
+          chats: [...state.chats],
+          receivedFiles: state.receivedFiles.map((f) => ({ ...f })),
+        }),
         getReceivedInputs: () => [...state.receivedInputs],
         getLastInput: () => state.lastInput,
+        getChats: () => [...state.chats],
+        getActiveMonitor: () => activeMonitor,
+        getReceivedFiles: () => state.receivedFiles.map((f) => ({ ...f })),
+        sendChat: (text) => {
+          peer.sendControl({ t: 'chat', text, ts: Date.now() });
+        },
       };
 
       const signaling = new SignalingClient(wsUrl);
       const peer = new Peer({ role: 'host', signaling });
       const adaptive = new AdaptiveController();
+
+      // File reception, keyed by transfer id. We use the core createReceiver for
+      // the framing/reassembly but gate completion on byte completeness rather
+      // than blindly finishing on `file-complete`: the control-channel
+      // `file-complete` can race ahead of the trailing binary chunks on the
+      // separate `file` channel, so we only finalize once every offered byte has
+      // arrived (whether that happens on the last chunk or on file-complete).
+      const transfers = new Map(); // id -> { receiver, size, completed, done }
+
+      function recordFile(receiver, meta) {
+        const data = receiver.finish();
+        state.receivedFiles.push({
+          id: meta.id,
+          name: meta.name,
+          size: meta.size,
+          length: data.byteLength,
+          checksum: checksum(data),
+        });
+      }
+
+      function maybeFinish(id) {
+        const t = transfers.get(id);
+        if (!t || t.done) return;
+        // Finalize when the sender has signalled completion AND all bytes are in.
+        if (t.completed && t.receiver.received >= t.size) {
+          t.done = true;
+          recordFile(t.receiver, t.meta);
+          transfers.delete(id);
+        }
+      }
 
       peer.on('state', (s) => {
         state.connectionState = s;
@@ -91,8 +182,6 @@
         state.receivedInputs.push(ev);
         state.lastInput = ev;
         lastInputEl.textContent = `lastInput: ${JSON.stringify(ev)}`;
-        // Render the latest pointer position on the canvas so the input
-        // pipeline is observable visually as well.
         if (ev.t === 'm-move' || ev.t === 'm-down' || ev.t === 'm-up') {
           ctx.strokeStyle = '#ff0';
           ctx.beginPath();
@@ -101,9 +190,89 @@
         }
       });
 
-      // Adaptive loop: sample real stats each tick and apply the decision to
-      // the outbound sender. This exercises the auto-negotiate-lag engine end
-      // to end against a live RTCRtpSender.
+      // Control channel: chat, monitor enumeration/switching, file routing.
+      peer.onControl((m) => {
+        switch (m.t) {
+          case 'file-offer': {
+            const meta = { id: m.id, name: m.name, size: m.size, mime: m.mime };
+            transfers.set(m.id, {
+              receiver: createReceiver({ meta }),
+              meta,
+              size: m.size,
+              completed: false,
+              done: false,
+            });
+            // Auto-accept: release the sender's chunk stream.
+            peer.sendControl({ t: 'file-accept', id: m.id });
+            break;
+          }
+          case 'file-complete': {
+            const t = transfers.get(m.id);
+            if (t) {
+              t.completed = true;
+              maybeFinish(m.id);
+            }
+            break;
+          }
+          case 'file-error':
+          case 'file-reject':
+            transfers.delete(m.id);
+            break;
+          case 'chat':
+            state.chats.push(m);
+            break;
+          case 'request-monitors':
+            peer.sendControl({ t: 'monitors', list: monitors });
+            break;
+          case 'switch-monitor': {
+            // Build a fresh outbound video track from a new canvas and swap it
+            // in place, then ack with monitor-switched.
+            const mon = monitors.find((x) => x.id === m.id);
+            if (mon) {
+              const c2 = document.createElement('canvas');
+              c2.width = mon.width;
+              c2.height = mon.height;
+              const x2 = c2.getContext('2d');
+              let f2 = 0;
+              const tick2 = () => {
+                f2 += 1;
+                x2.fillStyle = mon.primary ? '#103040' : '#401030';
+                x2.fillRect(0, 0, c2.width, c2.height);
+                x2.fillStyle = '#fff';
+                x2.font = '24px monospace';
+                x2.fillText(`${mon.name} #${f2}`, 16, 40);
+                if (activeMonitor === mon.id) requestAnimationFrame(tick2);
+              };
+              const s2 = c2.captureStream(30);
+              const vtrack = s2.getVideoTracks()[0];
+              activeMonitor = mon.id;
+              state.activeMonitor = mon.id;
+              requestAnimationFrame(tick2);
+              void peer.replaceVideoTrack(vtrack).then(() => {
+                peer.sendControl({ t: 'monitor-switched', id: mon.id });
+              });
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      });
+
+      // Route binary file chunks to the active transfer. Chunks carry only a
+      // sequence number (one transfer is in flight per direction at a time), so
+      // we feed the most recent not-yet-finalized receiver, then re-check
+      // completion in case the last chunk arrives after `file-complete`.
+      peer.onFileChunk((buf) => {
+        let activeId = null;
+        for (const [id, t] of transfers) {
+          if (!t.done) activeId = id; // last not-done wins
+        }
+        if (activeId === null) return;
+        transfers.get(activeId).receiver.push(buf);
+        maybeFinish(activeId);
+      });
+
       async function adaptiveTick() {
         try {
           const stats = await peer.getStats();

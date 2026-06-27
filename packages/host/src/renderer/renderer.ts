@@ -10,6 +10,7 @@
 import { HostSession } from '../host-session.js';
 import { normalizeSources, pickDefaultSource, type CaptureSource } from '../capture.js';
 import type { StreamScreenHostApi } from '../preload.js';
+import type { FileMeta } from '@stream-screen/core';
 
 declare global {
   interface Window {
@@ -56,11 +57,22 @@ async function startSession(
   sourceId: string,
 ): Promise<void> {
   session?.stop();
+  // Inform the main process which display is shared so remote clicks land on the
+  // right monitor (multi-monitor / HiDPI coordinate mapping).
+  api.setActiveDisplay(sourceId);
   session = new HostSession({
     signalingUrl,
     code,
     hostName,
     sourceId,
+    getMonitors: () => api.getMonitors(),
+    onActiveDisplay: (id) => api.setActiveDisplay(id),
+    onFileReceived: (data, meta: FileMeta) => {
+      void api.saveFile({ name: meta.name, mime: meta.mime, data });
+    },
+    onChat: (text) => {
+      $stats.textContent = `Chat from viewer: ${text}`;
+    },
     onInput: (e) => api.injectInput(e),
     onState: (state) => {
       api.reportStatus(state);

@@ -137,3 +137,241 @@ export function isInputEvent(v: unknown): v is InputEvent {
 export function isValidSessionCode(code: string): boolean {
   return /^[0-9]{6,9}$/.test(code);
 }
+
+/**
+ * Description of one capturable display on the host, advertised to the viewer
+ * so it can offer a monitor picker and request a runtime switch.
+ */
+export interface MonitorInfo {
+  id: string;
+  name: string;
+  primary: boolean;
+  width: number;
+  height: number;
+}
+
+/** Quality presets the viewer can request; mirrors the adaptive engine modes. */
+export type QualityPreset = 'auto' | 'high' | 'balanced' | 'low';
+
+/**
+ * Application-level control messages exchanged over the reliable, ordered
+ * `control` data channel (text JSON). This carries chat, multi-monitor
+ * enumeration/switching, file-transfer signaling, audio toggling, and quality
+ * preset selection — everything that is not raw {@link InputEvent} traffic and
+ * not media. It never touches the signaling server; it flows peer-to-peer.
+ */
+export type ControlMessage =
+  | { t: 'chat'; text: string; ts: number }
+  | { t: 'monitors'; list: MonitorInfo[] }
+  | { t: 'switch-monitor'; id: string }
+  | { t: 'monitor-switched'; id: string }
+  | { t: 'request-monitors' }
+  | { t: 'file-offer'; id: string; name: string; size: number; mime: string }
+  | { t: 'file-accept'; id: string }
+  | { t: 'file-reject'; id: string }
+  | { t: 'file-progress'; id: string; received: number }
+  | { t: 'file-complete'; id: string }
+  | { t: 'file-error'; id: string; message: string }
+  | { t: 'audio'; enabled: boolean }
+  | { t: 'quality'; preset: QualityPreset };
+
+/** Valid {@link ControlMessage.t} discriminants. */
+const CONTROL_TYPES = new Set<ControlMessage['t']>([
+  'chat',
+  'monitors',
+  'switch-monitor',
+  'monitor-switched',
+  'request-monitors',
+  'file-offer',
+  'file-accept',
+  'file-reject',
+  'file-progress',
+  'file-complete',
+  'file-error',
+  'audio',
+  'quality',
+]);
+
+/** Valid {@link QualityPreset} values. */
+const QUALITY_PRESETS = new Set<QualityPreset>(['auto', 'high', 'balanced', 'low']);
+
+/**
+ * Runtime guard: is `v` a structurally-valid {@link ControlMessage}?
+ *
+ * This validates not just the `t` discriminant but the required fields of each
+ * variant, so a malformed frame off the wire is rejected rather than partially
+ * trusted (the control channel drives file transfer and monitor switching).
+ */
+export function isControlMessage(v: unknown): v is ControlMessage {
+  if (v === null || typeof v !== 'object') return false;
+  const o = v as Record<string, unknown>;
+  const t = o.t;
+  if (typeof t !== 'string' || !CONTROL_TYPES.has(t as ControlMessage['t'])) return false;
+  const isStr = (x: unknown): x is string => typeof x === 'string';
+  const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x);
+  switch (t as ControlMessage['t']) {
+    case 'chat':
+      return isStr(o.text) && isNum(o.ts);
+    case 'monitors':
+      return Array.isArray(o.list) && o.list.every(isMonitorInfo);
+    case 'switch-monitor':
+    case 'monitor-switched':
+    case 'file-accept':
+    case 'file-reject':
+    case 'file-complete':
+      return isStr(o.id);
+    case 'request-monitors':
+      return true;
+    case 'file-offer':
+      return isStr(o.id) && isStr(o.name) && isNum(o.size) && isStr(o.mime);
+    case 'file-progress':
+      return isStr(o.id) && isNum(o.received);
+    case 'file-error':
+      return isStr(o.id) && isStr(o.message);
+    case 'audio':
+      return typeof o.enabled === 'boolean';
+    case 'quality':
+      return isStr(o.preset) && QUALITY_PRESETS.has(o.preset as QualityPreset);
+    default:
+      return false;
+  }
+}
+
+/** Runtime guard for a single {@link MonitorInfo}. */
+function isMonitorInfo(v: unknown): v is MonitorInfo {
+  if (v === null || typeof v !== 'object') return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.id === 'string' &&
+    typeof o.name === 'string' &&
+    typeof o.primary === 'boolean' &&
+    typeof o.width === 'number' &&
+    Number.isFinite(o.width) &&
+    typeof o.height === 'number' &&
+    Number.isFinite(o.height)
+  );
+}
+
+/**
+ * Modifier bitflags used by {@link InputEvent} `k-down`/`k-up`.
+ * Mirrors the documented `mods` set on the input protocol.
+ */
+export const KEY_MODS = {
+  shift: 1,
+  ctrl: 2,
+  alt: 4,
+  meta: 8,
+} as const;
+
+/** A logical name (modifier or key) understood by {@link buildKeyCombo}. */
+export type ComboKey =
+  | 'shift'
+  | 'ctrl'
+  | 'control'
+  | 'alt'
+  | 'meta'
+  | 'win'
+  | 'super'
+  | 'cmd'
+  | string;
+
+/** Map a friendly modifier name to its {@link KEY_MODS} bitflag (0 if not a modifier). */
+function modFlagFor(name: string): number {
+  switch (name.toLowerCase()) {
+    case 'shift':
+      return KEY_MODS.shift;
+    case 'ctrl':
+    case 'control':
+      return KEY_MODS.ctrl;
+    case 'alt':
+      return KEY_MODS.alt;
+    case 'meta':
+    case 'win':
+    case 'super':
+    case 'cmd':
+      return KEY_MODS.meta;
+    default:
+      return 0;
+  }
+}
+
+/** Resolve the `{ code, key }` pair an injector expects for a logical key name. */
+function codeKeyFor(name: string): { code: string; key: string } {
+  const n = name.toLowerCase();
+  switch (n) {
+    case 'shift':
+      return { code: 'ShiftLeft', key: 'Shift' };
+    case 'ctrl':
+    case 'control':
+      return { code: 'ControlLeft', key: 'Control' };
+    case 'alt':
+      return { code: 'AltLeft', key: 'Alt' };
+    case 'meta':
+    case 'win':
+    case 'super':
+    case 'cmd':
+      return { code: 'MetaLeft', key: 'Meta' };
+    case 'delete':
+    case 'del':
+      return { code: 'Delete', key: 'Delete' };
+    case 'escape':
+    case 'esc':
+      return { code: 'Escape', key: 'Escape' };
+    case 'tab':
+      return { code: 'Tab', key: 'Tab' };
+    case 'enter':
+    case 'return':
+      return { code: 'Enter', key: 'Enter' };
+    default: {
+      // Single printable character → letter/digit code; otherwise pass through.
+      if (name.length === 1) {
+        const upper = name.toUpperCase();
+        if (upper >= 'A' && upper <= 'Z') return { code: `Key${upper}`, key: name };
+        if (name >= '0' && name <= '9') return { code: `Digit${name}`, key: name };
+      }
+      return { code: name, key: name };
+    }
+  }
+}
+
+/**
+ * Build an ordered sequence of {@link InputEvent}s for a key combination.
+ *
+ * The combo is expressed as a list of logical key names; trailing modifiers and
+ * keys are pressed in order (each `k-down`), with the cumulative modifier
+ * bitmask applied to every event, then released in reverse order (each `k-up`).
+ * This produces the correct chord semantics for things like Ctrl+Alt+Del or
+ * Win+R on the host injector, which honors the `mods` bitfield.
+ *
+ * @example buildKeyCombo(['ctrl','alt','delete'])
+ */
+export function buildKeyCombo(keys: string[]): InputEvent[] {
+  if (keys.length === 0) return [];
+  // Accumulate the modifier mask from any modifier keys in the chord so the
+  // host sees, e.g., Ctrl+Alt held while Delete is pressed.
+  let mods = 0;
+  for (const k of keys) mods |= modFlagFor(k);
+
+  const down: InputEvent[] = [];
+  const up: InputEvent[] = [];
+  for (const name of keys) {
+    const { code, key } = codeKeyFor(name);
+    down.push({ t: 'k-down', code, key, mods });
+    up.unshift({ t: 'k-up', code, key, mods });
+  }
+  return [...down, ...up];
+}
+
+/** The classic Secure Attention Sequence: Ctrl+Alt+Del, as an ordered event list. */
+export const CTRL_ALT_DEL: InputEvent[] = buildKeyCombo(['ctrl', 'alt', 'delete']);
+
+/** Ready-made combos for the common special chords a viewer exposes. */
+export const SPECIAL_KEYS = {
+  CTRL_ALT_DEL,
+  WIN: buildKeyCombo(['win']),
+  ALT_TAB: buildKeyCombo(['alt', 'tab']),
+  WIN_R: buildKeyCombo(['win', 'r']),
+  WIN_D: buildKeyCombo(['win', 'd']),
+  ALT_F4: buildKeyCombo(['alt', 'F4']),
+  ESCAPE: buildKeyCombo(['escape']),
+} as const;

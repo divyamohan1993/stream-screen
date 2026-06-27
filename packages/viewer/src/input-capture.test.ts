@@ -223,6 +223,37 @@ describe('InputCapture — event emission', () => {
     expect(sent).toEqual([]);
   });
 
+  it('fires the local-cursor callback unthrottled with viewport coords', () => {
+    // Use a fresh capture/video so the shared beforeEach instance doesn't also
+    // emit on these same DOM events.
+    capture.detach();
+    sent = [];
+    const cursors: Array<{ x: number; y: number }> = [];
+    const cap = new InputCapture({
+      video,
+      send: (e) => sent.push(e),
+      moveThrottleMs: 8,
+      now: () => clock,
+      onLocalCursor: (x, y) => cursors.push({ x, y }),
+    });
+    cap.attach();
+    try {
+      // Three moves within the SAME throttle window: the data-channel m-move is
+      // emitted once, but the local cursor must update on every move.
+      video.dispatchEvent(new MouseEvent('mousemove', { clientX: 100, clientY: 50 }));
+      video.dispatchEvent(new MouseEvent('mousemove', { clientX: 200, clientY: 100 }));
+      video.dispatchEvent(new MouseEvent('mousemove', { clientX: 300, clientY: 150 }));
+      expect(sent.filter((e) => e.t === 'm-move')).toHaveLength(1);
+      expect(cursors).toEqual([
+        { x: 100, y: 50 },
+        { x: 200, y: 100 },
+        { x: 300, y: 150 },
+      ]);
+    } finally {
+      cap.detach();
+    }
+  });
+
   it('mirrors host clipboard text into the local clipboard', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {

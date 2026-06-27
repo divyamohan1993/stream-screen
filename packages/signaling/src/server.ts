@@ -19,7 +19,7 @@
  * load-bearing for StreamScreen's "always free, unlimited time" promise.
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { Role, SignalMessage, SessionInfo } from '@stream-screen/core';
@@ -57,21 +57,77 @@ export interface SignalingServerOptions {
   heartbeatMs?: number;
   /** Number of digits for generated session codes (6..9). */
   codeDigits?: number;
+  /**
+   * Browser-Origin allowlist for the WebSocket handshake.
+   *
+   * WebSocket handshakes are NOT subject to CORS, so without a check any web
+   * page loaded in a browser anywhere on the LAN can open a socket to this
+   * server and speak the signaling protocol (enumerate/join/hijack rooms).
+   *
+   * Semantics:
+   *   - `undefined` / not set  -> only NON-browser clients (no `Origin` header,
+   *     e.g. the Electron host, the AI bridge, native ws) are accepted; any
+   *     request that carries an `Origin` is rejected. This is the safe default.
+   *   - `['*']`                -> allow every Origin (explicit opt-out; use only
+   *     if you understand the cross-site-WS risk).
+   *   - `['http://host:5173', ...]` -> exact-match allowlist of browser Origins
+   *     (e.g. the viewer dev server / the served viewer app). Non-browser
+   *     clients (no Origin) are always allowed.
+   */
+  allowedOrigins?: string[];
+  /**
+   * Max bytes for a single inbound WebSocket frame. Signaling messages are tiny
+   * SDP/ICE blobs (a few KB), so we cap well below ws's 100MB default to bound
+   * pre-auth memory pressure. Set to 0 to fall back to the ws default.
+   */
+  maxPayloadBytes?: number;
+  /**
+   * How long (ms) an accepted socket may stay connected without sending a valid
+   * `join` before it is closed. Bounds idle un-authenticated sockets. Set to 0
+   * to disable.
+   */
+  joinTimeoutMs?: number;
+  /**
+   * Max concurrent viewers per room. The model is "one host + N viewers"; this
+   * caps N so a single code cannot be used to attach an unbounded number of
+   * simultaneous controllers. Set to 0 for unlimited (NOT recommended).
+   */
+  maxViewersPerRoom?: number;
+  /**
+   * Brute-force throttle: max failed viewer joins (wrong/unknown code) allowed
+   * per remote address inside `joinFailWindowMs` before further joins from that
+   * address are rejected with `too-many-attempts`. This turns the
+   * `no-such-session` response into a rate-limited oracle instead of a free
+   * one. Set to 0 to disable.
+   */
+  maxJoinFailures?: number;
+  /** Sliding window (ms) for {@link maxJoinFailures}. */
+  joinFailWindowMs?: number;
 }
 
 const DEFAULT_HEARTBEAT_MS = 30_000;
 const DEFAULT_CODE_DIGITS = 6;
+const DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024; // 64 KB: ample for SDP/ICE.
+const DEFAULT_JOIN_TIMEOUT_MS = 15_000;
+const DEFAULT_MAX_VIEWERS_PER_ROOM = 8;
+const DEFAULT_MAX_JOIN_FAILURES = 20;
+const DEFAULT_JOIN_FAIL_WINDOW_MS = 60_000;
 
 /**
  * Generate a numeric session code with the requested number of digits.
  * The first digit is always 1..9 so the code never has a leading zero and
  * always renders as exactly `digits` characters.
+ *
+ * SECURITY: the session code is the ONLY authorization gate for a session, so
+ * it must be unguessable. We draw every digit from `node:crypto`'s CSPRNG
+ * (`randomInt`) — never `Math.random()`, whose output is predictable and
+ * seed-recoverable and would make active codes enumerable.
  */
 export function generateCode(digits = DEFAULT_CODE_DIGITS): string {
   const d = Math.min(9, Math.max(6, Math.floor(digits)));
-  let code = String(1 + Math.floor(Math.random() * 9));
+  let code = String(1 + randomInt(9)); // first digit 1..9 (no leading zero)
   for (let i = 1; i < d; i++) {
-    code += String(Math.floor(Math.random() * 10));
+    code += String(randomInt(10));
   }
   return code;
 }
@@ -81,20 +137,77 @@ export class SignalingServer {
   private readonly rooms = new Map<string, Room>();
   private readonly heartbeatMs: number;
   private readonly codeDigits: number;
+  private readonly allowedOrigins?: Set<string>;
+  private readonly allowAnyOrigin: boolean;
+  private readonly maxPayloadBytes: number;
+  private readonly joinTimeoutMs: number;
+  private readonly maxViewersPerRoom: number;
+  private readonly maxJoinFailures: number;
+  private readonly joinFailWindowMs: number;
+  /** Sliding-window failed-join counters, keyed by remote address. */
+  private readonly joinFailures = new Map<string, { count: number; first: number }>();
   private heartbeat?: ReturnType<typeof setInterval>;
 
   constructor(opts: SignalingServerOptions = {}) {
     this.heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     this.codeDigits = opts.codeDigits ?? DEFAULT_CODE_DIGITS;
+    this.maxPayloadBytes = opts.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
+    this.joinTimeoutMs = opts.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
+    this.maxViewersPerRoom = opts.maxViewersPerRoom ?? DEFAULT_MAX_VIEWERS_PER_ROOM;
+    this.maxJoinFailures = opts.maxJoinFailures ?? DEFAULT_MAX_JOIN_FAILURES;
+    this.joinFailWindowMs = opts.joinFailWindowMs ?? DEFAULT_JOIN_FAIL_WINDOW_MS;
+
+    // Resolve the Origin policy once. `['*']` is an explicit allow-all opt-out;
+    // an empty/undefined list means "non-browser clients only".
+    this.allowAnyOrigin = !!opts.allowedOrigins?.includes('*');
+    this.allowedOrigins = this.allowAnyOrigin
+      ? undefined
+      : new Set(opts.allowedOrigins ?? []);
+
+    const wsOpts = {
+      verifyClient: (info: { origin?: string; req: IncomingMessage }) =>
+        this.verifyOrigin(info.origin ?? info.req.headers.origin, info.req),
+      ...(this.maxPayloadBytes > 0 ? { maxPayload: this.maxPayloadBytes } : {}),
+    };
 
     if (opts.server) {
-      this.wss = new WebSocketServer({ server: opts.server });
+      this.wss = new WebSocketServer({ server: opts.server, ...wsOpts });
     } else {
-      this.wss = new WebSocketServer({ port: opts.port ?? 0 });
+      this.wss = new WebSocketServer({ port: opts.port ?? 0, ...wsOpts });
     }
 
     this.wss.on('connection', (socket, req) => this.onConnection(socket, req));
     this.startHeartbeat();
+  }
+
+  /**
+   * Decide whether a WebSocket handshake from `origin` may proceed.
+   *
+   * The threat is a CROSS-SITE WebSocket: a malicious page on some *other*
+   * origin (loaded in a browser anywhere on the LAN) opening a socket to this
+   * server and speaking the protocol. WS handshakes ignore CORS, so we gate the
+   * `Origin` header ourselves. The policy is:
+   *
+   *   1. No `Origin` header  -> non-browser client (Electron host, AI bridge,
+   *      native `ws`). Always allowed — these trusted processes are the point.
+   *   2. `allowAnyOrigin`    -> explicit allow-all opt-out (`allowedOrigins: ['*']`).
+   *   3. Explicit allowlist  -> Origin must be an exact member.
+   *   4. Otherwise (no allowlist configured) -> allow ONLY same-origin: the
+   *      Origin host:port must equal the request `Host`. This keeps the
+   *      zero-config flow working (the viewer is served from the same host as
+   *      the signaling server) while still rejecting cross-site pages.
+   */
+  private verifyOrigin(origin: string | undefined, req: IncomingMessage): boolean {
+    // 1. Non-browser client.
+    if (!origin) return true;
+    // 2. Explicit allow-all.
+    if (this.allowAnyOrigin) return true;
+    // 3. Explicit allowlist (when one was configured).
+    if (this.allowedOrigins && this.allowedOrigins.size > 0) {
+      return this.allowedOrigins.has(origin);
+    }
+    // 4. Default: same-origin only.
+    return isSameOrigin(origin, req.headers.host);
   }
 
   /** The bound port (useful when constructed with `port: 0`). */
@@ -132,9 +245,66 @@ export class SignalingServer {
     return n;
   }
 
-  private onConnection(socket: WebSocket, _req: IncomingMessage): void {
+  /** Does the room already contain a connected host peer? */
+  private hasHost(room: Room): boolean {
+    for (const p of room.peers.values()) if (p.role === 'host') return true;
+    return false;
+  }
+
+  /**
+   * Is this remote address currently over its failed-join budget? Expired
+   * windows are reset lazily so a quiet attacker eventually gets a fresh budget.
+   */
+  private isJoinThrottled(addr: string): boolean {
+    if (this.maxJoinFailures <= 0) return false;
+    const rec = this.joinFailures.get(addr);
+    if (!rec) return false;
+    if (Date.now() - rec.first > this.joinFailWindowMs) {
+      this.joinFailures.delete(addr);
+      return false;
+    }
+    return rec.count >= this.maxJoinFailures;
+  }
+
+  /** Record a failed viewer join for `addr` within the sliding window. */
+  private recordJoinFailure(addr: string): void {
+    if (this.maxJoinFailures <= 0) return;
+    const now = Date.now();
+    const rec = this.joinFailures.get(addr);
+    if (!rec || now - rec.first > this.joinFailWindowMs) {
+      this.joinFailures.set(addr, { count: 1, first: now });
+      return;
+    }
+    rec.count++;
+  }
+
+  private onConnection(socket: WebSocket, req: IncomingMessage): void {
     // Peer is unregistered until it sends a valid `join`.
     let peer: Peer | undefined;
+    const remoteAddr = remoteAddress(req);
+
+    // Bound idle un-authenticated sockets: if no valid `join` arrives within
+    // the deadline, close the socket so it cannot be parked indefinitely.
+    let joinTimer: ReturnType<typeof setTimeout> | undefined;
+    if (this.joinTimeoutMs > 0) {
+      joinTimer = setTimeout(() => {
+        if (!peer) {
+          this.sendError(socket, 'join-timeout');
+          try {
+            socket.close();
+          } catch {
+            /* already closing */
+          }
+        }
+      }, this.joinTimeoutMs);
+      joinTimer.unref?.();
+    }
+    const clearJoinTimer = (): void => {
+      if (joinTimer) {
+        clearTimeout(joinTimer);
+        joinTimer = undefined;
+      }
+    };
 
     socket.on('message', (data: RawData) => {
       const msg = parseMessage(data);
@@ -149,7 +319,8 @@ export class SignalingServer {
             this.sendError(socket, 'already-joined');
             return;
           }
-          peer = this.handleJoin(socket, msg);
+          peer = this.handleJoin(socket, msg, remoteAddr);
+          if (peer) clearJoinTimer();
           return;
         }
         case 'ping': {
@@ -182,15 +353,17 @@ export class SignalingServer {
     });
 
     socket.on('close', () => {
+      clearJoinTimer();
       if (peer) this.handleLeave(peer);
     });
 
     socket.on('error', () => {
+      clearJoinTimer();
       if (peer) this.handleLeave(peer);
     });
   }
 
-  private handleJoin(socket: WebSocket, msg: SignalMessage): Peer | undefined {
+  private handleJoin(socket: WebSocket, msg: SignalMessage, remoteAddr: string): Peer | undefined {
     const role: Role = msg.role === 'host' ? 'host' : 'viewer';
     const name = (msg.name ?? '').trim() || (role === 'host' ? 'host' : 'viewer');
 
@@ -200,23 +373,63 @@ export class SignalingServer {
       // A host without a code starts a brand-new session; mint one.
       if (!code) code = this.mintCode();
     } else {
-      // Viewers must target an existing room.
+      // Viewers must target an existing room. Apply the brute-force throttle to
+      // viewer joins so the `missing-code`/`no-such-session` responses cannot be
+      // used as an unlimited code-enumeration oracle.
+      if (this.isJoinThrottled(remoteAddr)) {
+        this.sendError(socket, 'too-many-attempts');
+        return undefined;
+      }
       if (!code) {
+        this.recordJoinFailure(remoteAddr);
         this.sendError(socket, 'missing-code');
         return undefined;
       }
       if (!this.rooms.has(code)) {
+        this.recordJoinFailure(remoteAddr);
         this.sendError(socket, 'no-such-session');
         return undefined;
       }
     }
 
-    let room = this.rooms.get(code);
+    const existing = this.rooms.get(code);
+
+    // ONE-HOST-PER-ROOM (authoritative). A room may have exactly one host. A
+    // second `host` join on a code that already has a live host is rejected
+    // outright — without this, a duplicate/rogue host could overwrite
+    // `room.hostName`, receive the real host's offers (broadcast relay), and
+    // corrupt session topology / offer routing. Re-joining is only possible
+    // once the previous host's socket has left and the room is reaped.
+    if (role === 'host' && existing && this.hasHost(existing)) {
+      this.sendError(socket, 'host-exists');
+      return undefined;
+    }
+
+    // A viewer can only join a room that actually has a host; otherwise it would
+    // attach to a hostless (or host-pending) room with nobody to negotiate with.
+    if (role === 'viewer' && existing && !this.hasHost(existing)) {
+      this.recordJoinFailure(remoteAddr);
+      this.sendError(socket, 'no-such-session');
+      return undefined;
+    }
+
+    // Cap simultaneous controllers per room.
+    if (
+      role === 'viewer' &&
+      existing &&
+      this.maxViewersPerRoom > 0 &&
+      this.countViewers(existing) >= this.maxViewersPerRoom
+    ) {
+      this.sendError(socket, 'room-full');
+      return undefined;
+    }
+
+    let room = existing;
     if (!room) {
       room = { code, hostName: name, createdAt: Date.now(), peers: new Map() };
       this.rooms.set(code, room);
     } else if (role === 'host') {
-      // A (re)joining host refreshes the advertised host name.
+      // First host into a pre-existing (but hostless) room sets the name.
       room.hostName = name;
     }
 
@@ -335,6 +548,11 @@ export class SignalingServer {
           }
         }
       }
+      // Prune expired brute-force counters so the map cannot grow unbounded.
+      const now = Date.now();
+      for (const [addr, rec] of this.joinFailures) {
+        if (now - rec.first > this.joinFailWindowMs) this.joinFailures.delete(addr);
+      }
     }, this.heartbeatMs);
     // Don't keep the process alive solely for the heartbeat.
     this.heartbeat.unref?.();
@@ -366,6 +584,39 @@ export class SignalingServer {
       this.wss.close((err) => (err ? reject(err) : resolve()));
     });
   }
+}
+
+/**
+ * Best-effort remote address for throttling. Trusts `x-forwarded-for` only as a
+ * fallback (this is a LAN-direct service, not behind a proxy), otherwise uses
+ * the socket peer address. Returns 'unknown' if neither is available so the
+ * throttle still groups anonymous sockets rather than disabling itself.
+ */
+function remoteAddress(req: IncomingMessage): string {
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.length > 0) {
+    return xff.split(',')[0]!.trim();
+  }
+  return req.socket?.remoteAddress ?? 'unknown';
+}
+
+/**
+ * Is the browser-supplied `Origin` the same origin as the server the request
+ * was sent to? Compares only host:port (the `Host` header), which is what
+ * matters for "did this page come from the same place it's connecting to". The
+ * scheme is intentionally ignored (ws:// vs http://, and http vs https behind a
+ * terminator are common and benign on a LAN). Returns false if either side is
+ * unparseable, so the default policy fails closed.
+ */
+function isSameOrigin(origin: string, host: string | undefined): boolean {
+  if (!host) return false;
+  let originHost: string;
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  return originHost === host;
 }
 
 function parseMessage(data: RawData): SignalMessage | undefined {

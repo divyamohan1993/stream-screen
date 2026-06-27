@@ -107,9 +107,19 @@ export class AdaptiveController {
       return { phase: 'DECREASE', factor, reason: `back off (${why.join(', ')})` };
     }
 
+    // Guard against degenerate all-zero snapshots (pc null, empty stats report,
+    // or media not yet flowing): an all-zero stat trivially passes every "clean"
+    // threshold (0 < target, 0 < LOSS_LOW, 0 < JITTER_HIGH) and would ramp the
+    // bitrate toward maxKbps on no real measurement. Require a real signal —
+    // a measured RTT or an active frame rate / reported headroom — before
+    // increasing; otherwise HOLD.
+    const hasSignal = s.rttMs > 0 || s.fps > 0 || s.availableKbps > 0;
     const clean = s.rttMs < this.targetRttMs && s.lossPct < LOSS_LOW && s.jitterMs < JITTER_HIGH;
-    if (clean) {
+    if (clean && hasSignal) {
       return { phase: 'INCREASE', factor: 1 + INCREASE_FACTOR, reason: 'healthy link, ramping up' };
+    }
+    if (!hasSignal) {
+      return { phase: 'HOLD', factor: 1, reason: 'no telemetry yet, holding steady' };
     }
 
     return { phase: 'HOLD', factor: 1, reason: 'ambiguous signals, holding steady' };

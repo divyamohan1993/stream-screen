@@ -189,7 +189,39 @@ button.primary:hover:not(:disabled) {
   height: 100%;
   object-fit: contain;
   background: #000;
+  /* The local OS cursor is hidden because we render a zero-latency local cursor
+     overlay (.local-cursor) on top of the stream; the in-frame host cursor is
+     suppressed host-side. If the overlay is unavailable the system cursor is
+     restored via the .no-local-cursor modifier below. */
   cursor: none;
+}
+
+/* Fallback when the JS local-cursor overlay is not active: show the real OS
+   cursor so the user is never left without any pointer at all. */
+.stage-video.no-local-cursor {
+  cursor: default;
+}
+
+/* Zero-latency local cursor: a small element positioned at the live mouse
+   coordinates on every mousemove, so the visible pointer tracks the user's hand
+   instantly instead of waiting a full capture+encode+network+decode round-trip
+   for the in-frame host cursor. */
+.local-cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  z-index: 5;
+  /* Classic arrow drawn with borders so we ship no image asset. The hotspot is
+     the top-left corner, matching the OS arrow. */
+  border-style: solid;
+  border-width: 0 6px 12px 6px;
+  border-color: transparent transparent #fff transparent;
+  transform: translate(-1px, -1px) rotate(-45deg);
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.9));
+  will-change: top, left;
 }
 
 .stage-overlay {
@@ -240,6 +272,22 @@ button.primary:hover:not(:disabled) {
 .toolbar .state-pill.error {
   color: var(--bad);
   border-color: var(--bad);
+}
+
+.toolbar .state-pill.reconnecting {
+  color: var(--warn);
+  border-color: var(--warn);
+  animation: pill-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pill-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
 }
 
 .preset-group {
@@ -334,4 +382,204 @@ button.danger:hover:not(:disabled) {
   border: 1px solid var(--good);
   border-radius: 999px;
   padding: 0.1rem 0.5rem;
+}
+
+/* ── New feature UI: audio / monitor / recording / chat / files ───────────── */
+
+.audio-group {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.audio-group input[type='range'] {
+  width: 80px;
+}
+
+.monitor-switcher {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.monitor-switcher .monitor-label {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+.monitor-switcher select {
+  background: var(--bg-elev-2);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.75rem;
+}
+
+button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Side panels overlay the stage (top-right). */
+.side-panels {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  z-index: 5;
+  pointer-events: none;
+}
+.side-panels > * {
+  pointer-events: auto;
+}
+
+.chat-panel,
+.file-panel {
+  width: 280px;
+  max-height: 50vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+}
+
+.chat-header,
+.file-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.7rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.chat-close,
+.file-close {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 1rem;
+  cursor: pointer;
+  padding: 0 0.3rem;
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.5rem 0.7rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+}
+.chat-empty,
+.file-empty {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  text-align: center;
+  padding: 0.6rem 0;
+}
+.chat-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.chat-msg.me {
+  align-items: flex-end;
+}
+.chat-author {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+}
+.chat-text {
+  background: var(--bg-elev-2);
+  border-radius: 8px;
+  padding: 0.3rem 0.5rem;
+  max-width: 90%;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.chat-msg.me .chat-text {
+  background: var(--accent-dim);
+}
+
+.chat-input {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.5rem 0.7rem;
+  border-top: 1px solid var(--border);
+}
+.chat-input input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: inherit;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.file-drop {
+  margin: 0.6rem 0.7rem;
+  padding: 0.9rem;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.file-drop.dragging {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.file-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 0.7rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.file-item {
+  font-size: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.file-item-head {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+}
+.file-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-size {
+  color: var(--text-dim);
+}
+.file-progress-bar {
+  height: 4px;
+  background: var(--bg-elev-2);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.file-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+.file-status {
+  color: var(--text-dim);
+  font-size: 0.68rem;
+}
+.file-item.complete .file-progress-fill {
+  background: var(--good);
 }

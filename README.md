@@ -93,11 +93,14 @@ What a modern remote desktop should have, and where StreamScreen stands:
 | Auto-reconnect signaling | ✅ Implemented | Exponential backoff, replays `join` |
 | Cross-platform viewer | ✅ Implemented | Any modern browser |
 | Windows host installer (.exe) | ✅ Implemented | electron-builder NSIS + portable |
-| Multi-monitor / window selection | ✅ Implemented | Source picker enumerates screens + windows |
-| **AI / agent control (MCP + REST)** | ✅ Implemented | Screenshot, OCR, mouse, keyboard, stats |
+| Multi-monitor / window selection | ✅ Implemented | Source picker + **runtime switch** via control channel (no renegotiation) |
+| **AI / agent control (MCP + REST)** | ✅ Implemented | Screenshot, OCR, mouse, keyboard, monitors, chat, quality, key combos, stats |
 | Screenshot + OCR of remote screen | ✅ Implemented | PNG capture + tesseract.js OCR |
-| File transfer | ⛔ Not yet | Roadmap |
-| Audio streaming | ⛔ Not yet | Capture is video-only today |
+| **System audio streaming** | ✅ Implemented | Host audio track over the same P2P connection; viewer mute/unmute |
+| **Bidirectional file transfer** | ✅ Implemented | Chunked over a reliable `file` data channel, offer/accept handshake |
+| **Session recording** | ✅ Implemented | Viewer-side MediaRecorder → downloadable `.webm` |
+| **In-session chat** | ✅ Implemented | Text both directions over the `control` data channel |
+| **Special key combos / Ctrl+Alt+Del** | ✅ Implemented | Ctrl+Alt+Del, Win, Alt+Tab, Win+R/D, Alt+F4, Esc + arbitrary chords |
 | WAN / VPN traversal (public IP) | ⛔ Not yet | LAN-first by design; STUN/TURN hooks exist |
 
 > The two rows that matter most for "free vs AnyDesk": **no time limit** and **no
@@ -148,6 +151,7 @@ stream-screen/
 │   │       ├── peer.ts             # Peer: RTCPeerConnection wrapper, perfect negotiation, stats
 │   │       ├── signaling-client.ts # SignalingClient: WS join/relay, auto-reconnect
 │   │       ├── adaptive.ts         # AdaptiveController: AIMD "auto-negotiate lag" engine
+│   │       ├── file-transfer.ts    # pure chunker/reassembler for the binary 'file' channel
 │   │       └── input-codec.ts      # compact wire codec for InputEvents
 │   ├── signaling/            # @stream-screen/signaling — zero-config LAN server
 │   │   └── src/
@@ -158,17 +162,19 @@ stream-screen/
 │   ├── host/                 # @stream-screen/host — Electron host agent (Windows)
 │   │   └── src/
 │   │       ├── main.ts             # Electron main: tray, single-instance, IPC, injection
-│   │       ├── capture.ts          # desktopCapturer → MediaStream (renderer)
+│   │       ├── capture.ts          # desktopCapturer → MediaStream (screen + system audio)
+│   │       ├── monitor.ts          # enumerate displays + resolve a monitor switch
+│   │       ├── file-save.ts        # persist files received over the 'file' channel
 │   │       ├── host-session.ts     # capture + Peer + AdaptiveController loop
 │   │       ├── input-injector.ts   # InputEvent → OS input via nut.js (optional native dep)
 │   │       └── renderer/           # control window UI
 │   ├── viewer/               # @stream-screen/viewer — Vite + React web viewer
 │   │   └── src/
-│   │       ├── viewer-session.ts   # signaling + Peer (role viewer), stats polling
-│   │       ├── input-capture.ts    # mouse/keyboard capture, normalized coords
+│   │       ├── viewer-session.ts   # signaling + Peer (role viewer), control/file/audio, stats
+│   │       ├── input-capture.ts    # mouse/keyboard capture, normalized coords, special combos
 │   │       ├── discovery-client.ts # /api/discover + /api/code
 │   │       ├── quality.ts          # Auto/High/Balanced/Low presets
-│   │       └── components/         # ConnectScreen, VideoStage, Toolbar, StatsPanel, DiscoveryList
+│   │       └── components/         # ConnectScreen, VideoStage, Toolbar (chat/files/monitors/record), StatsPanel
 │   └── ai/                   # @stream-screen/ai — MCP server + mirrored REST API
 │       └── src/
 │           ├── tools.ts            # single source of truth: tool catalogue + pure mappers
@@ -177,7 +183,7 @@ stream-screen/
 │           ├── rest-api.ts         # Express REST mirror of every MCP tool
 │           └── ocr.ts              # tesseract.js OCR (optional dep)
 └── e2e/                      # @stream-screen/e2e — Playwright: two real Chromium peers
-    ├── tests/                # session / input / adaptive specs
+    ├── tests/                # session/input/adaptive + audio/file/control/keys/recording specs
     └── scripts/              # serve.mjs (signaling + fixtures), bundle-core.mjs
 ```
 
@@ -254,6 +260,61 @@ dashboard** (RTT, loss, jitter, fps, resolution, current bitrate decision).
 
 ---
 
+## Session features (audio, files, monitors, recording, chat, special keys)
+
+Beyond the live screen + input, a session exposes a set of collaboration features
+that all flow **peer-to-peer** over the same WebRTC connection — no relay, no
+metering, and (like everything else here) **no time limit on any of them.** They
+ride two extra data channels alongside the media track: a reliable text
+`control` channel (chat, monitor enumeration/switching, audio toggle, quality,
+file-transfer signaling) and a reliable binary `file` channel (the file bytes).
+
+- **System audio streaming.** The host mixes its system/desktop audio into the
+  captured stream and negotiates it as an audio track on the *same* peer
+  connection as the video — no second connection. The viewer plays it inline and
+  exposes a **mute/unmute** toggle (it flips the inbound track's `enabled` flag,
+  a receive-side control) and can ask the host to start/stop capture with an
+  `audio` control message.
+
+- **Bidirectional file transfer.** Drag a file onto the viewer (or push from the
+  host) to send it across. The sender emits a `file-offer` on the `control`
+  channel; the peer auto-accepts with `file-accept`; the bytes stream as 16 KiB
+  self-framed chunks over the reliable binary `file` channel; a final
+  `file-complete` closes it. The receiver reassembles deterministically (each
+  chunk carries an 8-byte `seq`+`len` header) and verifies length; progress is
+  surfaced via `file-progress`. On the Windows host, received files are written
+  to disk (`host/src/file-save.ts`).
+
+- **Multi-monitor switching at runtime.** The host enumerates its displays
+  (`MonitorInfo`: id, name, primary, width, height). The viewer requests the list
+  (`request-monitors`), shows a picker, and switches the streamed display
+  (`switch-monitor`). The host swaps the outbound video track **in place**
+  (`replaceTrack`, no SDP renegotiation) and acks with `monitor-switched`, so the
+  switch is near-instant and never tears down the session.
+
+- **Session recording.** The viewer can record the incoming remote `MediaStream`
+  with the browser's `MediaRecorder` and save a downloadable **`.webm`**. Recording
+  is entirely viewer-side and local; nothing is uploaded and there is no length
+  cap — record for as long as the session runs.
+
+- **In-session chat.** Text messages round-trip in both directions over the
+  `control` channel (`chat` messages, timestamped), so the operator and viewer
+  can talk without a separate tool.
+
+- **Special key combos / Ctrl+Alt+Del.** The viewer can send chords the browser
+  would otherwise swallow: **Ctrl+Alt+Del** (Secure Attention Sequence), the
+  **Win** key, **Alt+Tab**, **Win+R**, **Win+D**, **Alt+F4**, **Esc**, plus any
+  arbitrary modifier+key combo. `buildKeyCombo` / `SPECIAL_KEYS`
+  (`core/src/protocol.ts`) build an ordered key-down/up sequence with the correct
+  cumulative modifier bitmask, sent over the input channel and replayed by the
+  host injector.
+
+> Unlike AnyDesk — which gates file transfer, session recording, and even some
+> input behind paid tiers and the ~15-minute free cutoff — every feature here is
+> free, self-hosted, and never times out or meters usage.
+
+---
+
 ## The adaptive realtime engine ("auto-negotiate lag")
 
 The single most important piece for staying realtime on a real Wi‑Fi network is
@@ -320,10 +381,18 @@ unavailable" message. **Nothing here counts usage or expires a session.**
 | `type_text` | `POST /api/type` | `{ text }` | types a string |
 | `press_key` | `POST /api/key` | `{ key, mods? }` | key down/up; `mods` bitflags 1/2/4/8 |
 | `get_stats` | `GET /api/stats` | – | live RTT/loss/jitter/fps/resolution/bitrate |
+| `list_monitors` | `GET /api/monitors` | – | host's displays (`id, name, primary, w, h`) |
+| `switch_monitor` | `POST /api/monitor` | `{ id }` | switch the streamed display (in-place track swap) |
+| `send_chat` | `POST /api/chat` | `{ text }` | send a chat message to the host operator |
+| `set_quality` | `POST /api/quality` | `{ preset }` | `auto` \| `high` \| `balanced` \| `low` |
+| `send_keys` | `POST /api/keys` | `{ keys }` | press an arbitrary chord, e.g. `["ctrl","alt","delete"]` |
+| `press_combo` | `POST /api/combo` | `{ combo }` | named combo: `ctrl+alt+del`, `win`, `alt+tab`, `win+r`, `win+d`, `alt+f4`, `escape` |
 
 Coordinates are always **normalized fractions in [0,1]** of the remote screen, so
 they're resolution-independent. Modifier bitflags: `1`=shift, `2`=ctrl, `4`=alt,
-`8`=meta (combine by OR-ing, e.g. ctrl+shift = `3`).
+`8`=meta (combine by OR-ing, e.g. ctrl+shift = `3`). For multi-key chords prefer
+`send_keys` (arbitrary, e.g. `["ctrl","alt","delete"]`) or `press_combo` (named,
+e.g. `ctrl+alt+del`) over hand-rolling `press_key` with modifiers.
 
 ### Run it
 
@@ -352,6 +421,18 @@ curl -X POST http://localhost:8788/api/move  -H 'content-type: application/json'
 curl -X POST http://localhost:8788/api/click -H 'content-type: application/json' -d '{"x":0.5,"y":0.5,"button":0}'
 curl -X POST http://localhost:8788/api/type  -H 'content-type: application/json' -d '{"text":"hello"}'
 curl -X POST http://localhost:8788/api/key   -H 'content-type: application/json' -d '{"key":"Enter"}'
+
+# Multi-monitor: list displays, then switch the streamed one
+curl http://localhost:8788/api/monitors
+curl -X POST http://localhost:8788/api/monitor -H 'content-type: application/json' -d '{"id":"screen:1:0"}'
+
+# Chat to the operator; pin a quality preset (auto|high|balanced|low)
+curl -X POST http://localhost:8788/api/chat    -H 'content-type: application/json' -d '{"text":"connecting now"}'
+curl -X POST http://localhost:8788/api/quality -H 'content-type: application/json' -d '{"preset":"high"}'
+
+# Special key combos: an arbitrary chord, or a named one (e.g. Ctrl+Alt+Del)
+curl -X POST http://localhost:8788/api/keys    -H 'content-type: application/json' -d '{"keys":["ctrl","alt","delete"]}'
+curl -X POST http://localhost:8788/api/combo   -H 'content-type: application/json' -d '{"combo":"ctrl+alt+del"}'
 
 # Health + capabilities (advertises: limits none, cost free)
 curl http://localhost:8788/health
@@ -404,7 +485,8 @@ npm test                      # unit tests across all workspaces (vitest)
 npm run e2e                   # Playwright e2e (bundles core, serves fixtures)
 ```
 
-What the **e2e** suite proves (no mocks for the hard parts):
+What the **e2e** suite proves (no mocks for the hard parts) — **11 Playwright
+specs**, two real Chromium peers each:
 
 - **`session.spec`** — host + viewer establish a *real* WebRTC P2P session; the
   viewer receives decoded video frames and the input data channel opens.
@@ -412,6 +494,19 @@ What the **e2e** suite proves (no mocks for the hard parts):
   channel and decode correctly.
 - **`adaptive.spec`** — the adaptive engine, exercised in-page, ramps up on a
   clean link and backs off under loss/RTT/jitter.
+- **`audio.spec`** — the viewer receives a *live* system-audio track from the
+  host over the same peer connection, and the mute/unmute toggle flips the
+  inbound track's `enabled` flag.
+- **`file-transfer.spec`** — a multi-chunk (>3×16 KiB) file streams viewer → host
+  over the real `file` data channel and reassembles with exact length and
+  checksum (offer → accept → chunks → complete).
+- **`control.spec`** — multi-monitor enumeration + runtime switch (host acks
+  `monitor-switched` after an in-place `replaceTrack`) and chat round-tripping in
+  both directions over the `control` channel.
+- **`keys.spec`** — Ctrl+Alt+Del / Win / arbitrary combos arrive on the host as
+  the exact ordered key events with the correct cumulative modifier bitmask.
+- **`recording.spec`** — the viewer records the incoming remote stream with
+  `MediaRecorder` and produces non-empty `.webm` output.
 
 Per-package tests can also be run directly, e.g.
 `npm -w @stream-screen/core test` or `npm -w @stream-screen/viewer test`.

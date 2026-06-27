@@ -57,13 +57,24 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
 
   const discovery = new Discovery();
 
+  // Optional hardening config (all opt-in; zero-config defaults stay friendly):
+  //   STREAMSCREEN_ALLOWED_ORIGINS  comma-separated browser Origin allowlist
+  //                                 (use '*' to allow any — explicit opt-out).
+  //   STREAMSCREEN_REST_TOKEN       bearer token that unlocks raw codes on
+  //                                 /api/sessions; without it that endpoint is
+  //                                 always redacted.
+  const allowedOrigins = parseList(process.env.STREAMSCREEN_ALLOWED_ORIGINS);
+  const restToken = process.env.STREAMSCREEN_REST_TOKEN || undefined;
+
   // Build HTTP (REST) first, then attach WS to it so they share a port.
   const http = createRestServer({
     listSessions: () => signaling.listSessions(),
     mintCode: () => signaling.mintCode(),
     discovery,
+    allowedOrigins,
+    token: restToken,
   });
-  const signaling = new SignalingServer({ server: http });
+  const signaling = new SignalingServer({ server: http, allowedOrigins });
 
   await new Promise<void>((resolve, reject) => {
     http.once('error', reject);
@@ -94,6 +105,16 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
       await new Promise<void>((resolve) => http.close(() => resolve()));
     },
   };
+}
+
+/** Parse a comma-separated env list into a trimmed string[] (undefined if empty). */
+function parseList(raw: string | undefined): string[] | undefined {
+  if (!raw) return undefined;
+  const items = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return items.length > 0 ? items : undefined;
 }
 
 function addressPort(server: import('node:http').Server): number | undefined {

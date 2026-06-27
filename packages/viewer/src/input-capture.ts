@@ -144,6 +144,15 @@ export interface InputCaptureOptions {
   moveThrottleMs?: number;
   /** Time source (injectable for tests). Defaults to `performance.now`. */
   now?: () => number;
+  /**
+   * Called on EVERY pointer move with the live viewport coordinates of the
+   * cursor over the stage, so the viewer can draw a zero-latency local cursor on
+   * top of the stream. Unlike the emitted `m-move` events this is NOT throttled
+   * — the local cursor must track the hand at full frame rate. In pointer-lock
+   * mode the coordinates are derived from the accumulated relative position
+   * mapped back into the rendered video box, so the overlay stays meaningful.
+   */
+  onLocalCursor?: (clientX: number, clientY: number) => void;
 }
 
 const DEFAULT_MOVE_THROTTLE_MS = 1000 / 120;
@@ -166,6 +175,7 @@ export class InputCapture {
   private readonly send: (e: InputEvent) => void;
   private readonly moveThrottleMs: number;
   private readonly now: () => number;
+  private readonly onLocalCursor?: (clientX: number, clientY: number) => void;
 
   private attached = false;
   private lastMoveAt = Number.NEGATIVE_INFINITY;
@@ -188,6 +198,7 @@ export class InputCapture {
     this.send = opts.send;
     this.moveThrottleMs = opts.moveThrottleMs ?? DEFAULT_MOVE_THROTTLE_MS;
     this.now = opts.now ?? (() => performance.now());
+    this.onLocalCursor = opts.onLocalCursor;
 
     this.bound = {
       move: (e) => this.onMove(e),
@@ -216,10 +227,6 @@ export class InputCapture {
   }
 
   private onMove(e: MouseEvent): void {
-    const t = this.now();
-    if (t - this.lastMoveAt < this.moveThrottleMs) return;
-    this.lastMoveAt = t;
-
     let x: number;
     let y: number;
     if (this.locked) {
@@ -238,7 +245,59 @@ export class InputCapture {
       this.lockX = x;
       this.lockY = y;
     }
+
+    // Drive the zero-latency local cursor on EVERY move (unthrottled): the
+    // overlay must track the hand smoothly even when we drop the data-channel
+    // m-move for rate-limiting. We feed it viewport coords so it positions
+    // correctly whether the pointer is locked (derived from x/y) or free.
+    if (this.onLocalCursor) {
+      if (this.locked) {
+        const c = this.normalizedToClient(x, y);
+        this.onLocalCursor(c.x, c.y);
+      } else {
+        this.onLocalCursor(e.clientX, e.clientY);
+      }
+    }
+
+    // Throttle only the transmitted movement, not the local cursor above.
+    const t = this.now();
+    if (t - this.lastMoveAt < this.moveThrottleMs) return;
+    this.lastMoveAt = t;
+
     this.send({ t: 'm-move', x, y });
+  }
+
+  /**
+   * Inverse of {@link normalizePointer}: map normalized 0..1 remote-screen
+   * coordinates back to viewport (client) coordinates inside the rendered,
+   * object-fit:contain video box. Used to position the local cursor overlay in
+   * pointer-lock mode where there is no live `clientX/Y`.
+   */
+  private normalizedToClient(x: number, y: number): { x: number; y: number } {
+    const geo = this.geometry();
+    const { rect, intrinsicWidth, intrinsicHeight } = geo;
+    if (
+      rect.width <= 0 ||
+      rect.height <= 0 ||
+      intrinsicWidth <= 0 ||
+      intrinsicHeight <= 0
+    ) {
+      return { x: rect.left, y: rect.top };
+    }
+    const intrinsicAspect = intrinsicWidth / intrinsicHeight;
+    const boxAspect = rect.width / rect.height;
+    let contentWidth: number;
+    let contentHeight: number;
+    if (intrinsicAspect > boxAspect) {
+      contentWidth = rect.width;
+      contentHeight = rect.width / intrinsicAspect;
+    } else {
+      contentHeight = rect.height;
+      contentWidth = rect.height * intrinsicAspect;
+    }
+    const offsetX = rect.left + (rect.width - contentWidth) / 2;
+    const offsetY = rect.top + (rect.height - contentHeight) / 2;
+    return { x: offsetX + clamp01(x) * contentWidth, y: offsetY + clamp01(y) * contentHeight };
   }
 
   private pointerPos(e: MouseEvent): { x: number; y: number } {
