@@ -12,6 +12,27 @@ interface ReceivedFile {
   checksum: number;
 }
 
+/** A viewer-reported real-time latency telemetry frame, as recorded by the host. */
+interface LatencyReport {
+  rttMs: number;
+  playoutMs: number;
+  fps?: number;
+}
+
+/** The live outbound video sender's first-encoding parameters (off the real RTCRtpSender). */
+interface VideoSenderParams {
+  maxBitrate: number | null;
+  maxFramerate: number | null;
+  scaleResolutionDownBy: number | null;
+  degradationPreference: string | null;
+}
+
+/** Result of driving the real adaptive pipeline on the host page. */
+interface DriveAdaptiveResult {
+  decisions: import('@stream-screen/core').AdaptiveDecision[];
+  params: VideoSenderParams | null;
+}
+
 /** Test hooks exposed by the fixture pages onto `window`. */
 declare global {
   interface HostState {
@@ -24,6 +45,7 @@ declare global {
     chats: ChatMsg[];
     activeMonitor: string;
     receivedFiles: ReceivedFile[];
+    receivedLatency: LatencyReport[];
   }
   interface ViewerState {
     ready: boolean;
@@ -44,6 +66,10 @@ declare global {
       getChats(): ChatMsg[];
       getActiveMonitor(): string;
       getReceivedFiles(): ReceivedFile[];
+      getReceivedLatency(): LatencyReport[];
+      setAutoAdaptive(enabled: boolean): void;
+      getVideoSenderParams(): VideoSenderParams | null;
+      driveAdaptive(statsSeq: AdaptiveStats[]): Promise<DriveAdaptiveResult>;
       sendChat(text: string): void;
       sendFileToViewer(
         id: string,
@@ -64,6 +90,14 @@ declare global {
       };
       setMuted(m: boolean): void;
       getStats(): Promise<AdaptiveStats | { error: string }>;
+      getLocalTelemetry(): Promise<
+        { rttMs: number; playoutMs: number; fps: number } | { error: string }
+      >;
+      sendLatency(
+        rttMs?: number,
+        playoutMs?: number,
+        fps?: number,
+      ): Promise<{ t: 'latency'; rttMs: number; playoutMs: number; fps?: number }>;
       sendInput(ev: InputEvent): void;
       sendChat(text: string): void;
       getChats(): ChatMsg[];

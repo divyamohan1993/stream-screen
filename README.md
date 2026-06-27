@@ -85,7 +85,7 @@ What a modern remote desktop should have, and where StreamScreen stands:
 | **No session time limit** | ✅ Guaranteed | No timers/usage caps anywhere (vs AnyDesk's ~15 min) |
 | **No bitrate / quality cap** | ✅ Guaranteed | Ceiling is only what the link sustains |
 | Free & self-hosted, no accounts | ✅ Guaranteed | Session gated by a 6–9 digit code only |
-| Adaptive bitrate/quality ("auto-negotiate lag") | ✅ Implemented | AIMD over RTT/loss/jitter, ~1 Hz |
+| Adaptive bitrate/quality ("auto-negotiate lag") | ✅ Implemented | AIMD over RTT/loss/jitter, ~2 Hz (500 ms); **fast-down / slow-up**, governed on **end-to-end** latency (viewer reports rtt+playout) |
 | Zero-config LAN discovery | ✅ Implemented | mDNS/DNS-SD (`_streamscreen._tcp`); advertises only codes of **live** host rooms |
 | Session codes (6–9 digits) | ✅ Implemented | Minted by host or signaling server |
 | End-to-end transport encryption | ✅ Implemented | DTLS-SRTP (WebRTC stack) |
@@ -375,26 +375,58 @@ file-transfer signaling) and a reliable binary `file` channel (the file bytes).
 The single most important piece for staying realtime on a real Wi‑Fi network is
 the **`AdaptiveController`** in `@stream-screen/core` (`adaptive.ts`). It is a
 research-grade **AIMD** (additive-increase / multiplicative-decrease) congestion
-controller driven by live WebRTC stats.
+controller driven by live WebRTC stats. It is tuned to **always prioritize
+real-time** while pushing the best quality the link can actually sustain: it
+backs off **fast** and ramps up **slowly**, and it governs on the **true
+end-to-end interactive latency** the viewer experiences — not just the host's
+own wire RTT.
 
-Every ~1 second the host runs this loop (`HostSession.tick`):
+Every **~500 ms** the host runs this loop (`HostSession.tick`,
+`ADAPTIVE_INTERVAL_MS = 500`):
 
 ```
-peer.getStats()  ──►  AdaptiveController.update(stats)  ──►  peer.applyDecision(decision)
-   RTT, loss,            choose bitrate / fps /                 setParameters() on the
-   jitter, fps,          resolution downscale                  outbound video sender
-   availableKbps
+peer.getStats()  ─┐
+                  ├─►  AdaptiveController.update(stats)  ──►  peer.applyDecision(decision)
+viewer { t:latency }─┘     choose bitrate / fps /         (applied fast-down / slow-up)
+  rtt + playout (E2E)      resolution downscale            setParameters() on the sender
 ```
 
 How it decides:
 
-- **INCREASE** — link is clean (RTT < target, loss < 2%, low jitter): grow the
-  target bitrate by ~8%, but never sprint past measured `availableOutgoingBitrate`.
-- **DECREASE** — congested (loss > 5%, RTT > 1.6× target, or jitter spike):
-  back off multiplicatively, with a severity-scaled factor (0.85 mild → 0.60 hard)
-  so the response is fast but proportionate. If the link reports lower headroom,
-  it's respected immediately.
+- **INCREASE** — link is clean (RTT < target **and** end-to-end latency < target,
+  loss < 2%, low jitter): grow the target bitrate by ~8%, but never sprint past
+  measured `availableOutgoingBitrate`.
+- **DECREASE** — congested (loss > 5%, **end-to-end latency** > 1.6× target, or
+  jitter spike): back off multiplicatively, with a severity-scaled factor
+  (0.85 mild → 0.60 hard) so the response is fast but proportionate. If the link
+  reports lower headroom, it's respected immediately.
 - **HOLD** — ambiguous region: keep steady to avoid oscillation.
+
+**Fast-down / slow-up (always favor real-time).** The control loop ticks at
+~2 Hz (500 ms), halving the worst-case reaction time to a congestion event vs the
+old 1 Hz. Application is **asymmetric**: a **DECREASE or HOLD applies immediately,
+every tick**, but an **INCREASE only commits after `INCREASE_CONFIRM_TICKS = 4`
+consecutive clean samples** (~2 s of sustained healthy link). Any non-increase
+classification resets that counter. So a single clean blip never bumps quality,
+but a genuinely-recovered link still ramps promptly — we shed quality the instant
+the link hurts and re-earn it only once it's proven stable. The controller's math
+is untouched and authoritative; the host only gates *when* to push an increase to
+the encoder, never *what* the value is (the counter is a deterministic integer, so
+it's unit-tested).
+
+**End-to-end interactive-latency feedback (closed loop).** Wire RTT alone
+understates what the user feels: a decoded frame still waits in the viewer's
+jitter/playout buffer before it's drawn. Only the **viewer** can measure that
+receive-side delay, so every tick the viewer reports its observed
+`{ t:'latency', rttMs, playoutMs, fps }` back to the host over the reliable
+`control` channel (`ViewerSession`; `Peer.getLocalTelemetry()` derives it from
+`jitterBufferDelay / jitterBufferEmittedCount`, delta-averaged over the last
+window). The host folds the **worst-case** reported `rttMs`/`playoutMs` across all
+viewers into the stats it hands the controller (`max` of measured vs reported), so
+the engine backs off on the **true perceived latency** — receiver-side queueing
+forces a real-time backoff even when the host's own sender RTT looks fine. When no
+viewer reports (or `playoutMs` is 0), `realtime === rttMs` and behavior is
+byte-identical to before.
 
 From the chosen bitrate it derives a **max framerate** (15…60 fps) and a
 **resolution downscale** (1 / 1.5 / 2 / 3 / 4), so low-bandwidth links shed
@@ -403,7 +435,20 @@ lag to stay realtime" behavior. The controller is **pure and deterministic** (no
 timers, no randomness), which is why it is directly unit-tested.
 
 There is **no bitrate ceiling** beyond the caller-supplied `maxKbps` (default
-40 Mbps) and **no time-based throttle of any kind.**
+40 Mbps) and **no time-based throttle of any kind** — the 500 ms tick and the
+4-sample increase gate are *control-loop cadence*, never a session limit.
+
+**Proven end-to-end.** A Playwright closed-loop e2e
+(`e2e/tests/adaptive-closed-loop.spec.ts`) brings up a *real* two-Chromium WebRTC
+session and drives the *real* pipeline: it feeds the live `AdaptiveController` a
+stats sequence, calls `peer.applyDecision()` on the live connection, and reads the
+encodings straight off the real `RTCRtpSender`. It proves (a) network congestion
+drops the real sender's `maxBitrate`/`maxFramerate` and raises
+`scaleResolutionDownBy`; (b) **receiver-side `playoutMs` alone** (wire RTT under
+target) forces a backoff — real-time, not just RTT; (c) a sustained clean link
+recovers the real bitrate well above the trough; and (d) the viewer's
+`{ t:latency }` telemetry round-trips and the host receives the exact values — the
+feedback edge of the loop, closed against actual WebRTC rather than a mock.
 
 ---
 
@@ -555,7 +600,7 @@ npm test                      # unit tests across all workspaces (vitest)
 npm run e2e                   # Playwright e2e (bundles core, serves fixtures)
 ```
 
-What the **e2e** suite proves (no mocks for the hard parts) — **12 Playwright
+What the **e2e** suite proves (no mocks for the hard parts) — **15 Playwright
 specs**, two real Chromium peers each:
 
 - **`session.spec`** — host + viewer establish a *real* WebRTC P2P session; the
@@ -564,6 +609,15 @@ specs**, two real Chromium peers each:
   channel and decode correctly.
 - **`adaptive.spec`** — the adaptive engine, exercised in-page, ramps up on a
   clean link and backs off under loss/RTT/jitter.
+- **`adaptive-closed-loop.spec`** — the **closed loop against real WebRTC**: on a
+  live two-Chromium session the host drives the real `AdaptiveController` and calls
+  `peer.applyDecision()`, then reads the encodings off the **real `RTCRtpSender`**.
+  Proves congestion (loss/RTT/jitter) drops the real sender's
+  bitrate/framerate and raises the resolution downscale; that **receiver-side
+  `playoutMs` alone** (wire RTT under target) forces a real-time backoff; that a
+  sustained clean link **recovers** the real bitrate above the trough; and that the
+  viewer's `{ t:latency }` interactive-latency telemetry round-trips to the host
+  over the real `control` channel (the feedback edge of the loop).
 - **`audio.spec`** — the viewer receives a *live* system-audio track from the
   host over the same peer connection, and the mute/unmute toggle flips the
   inbound track's `enabled` flag.

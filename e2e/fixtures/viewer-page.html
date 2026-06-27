@@ -138,6 +138,31 @@
             return { error: String(e) };
           }
         },
+        // Worst-case-aggregated interactive-latency telemetry (network RTT +
+        // receiver playout/jitter-buffer delay + fps) the viewer reports to the
+        // host. Derived from the real WebRTC stats via the core helper.
+        getLocalTelemetry: async () => {
+          try {
+            return await peer.getLocalTelemetry();
+          } catch (e) {
+            return { error: String(e) };
+          }
+        },
+        // Send a { t:'latency' } ControlMessage to the host over the real control
+        // channel. With no args, samples live local telemetry; otherwise sends the
+        // supplied values (lets a spec assert exact parsed receipt deterministically).
+        sendLatency: async (rttMs, playoutMs, fps) => {
+          let msg;
+          if (typeof rttMs === 'number') {
+            msg = { t: 'latency', rttMs, playoutMs: playoutMs ?? 0 };
+            if (typeof fps === 'number') msg.fps = fps;
+          } else {
+            const tel = await peer.getLocalTelemetry();
+            msg = { t: 'latency', rttMs: tel.rttMs, playoutMs: tel.playoutMs, fps: tel.fps };
+          }
+          peer.sendControl(msg);
+          return msg;
+        },
         sendInput: (ev) => {
           peer.sendInput(ev);
         },

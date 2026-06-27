@@ -71,6 +71,14 @@ export interface AdaptiveStats {
   fps: number;
   width: number;
   height: number;
+  /**
+   * Receiver-side jitter-buffer / playout delay in ms (delta-based average over
+   * the last measurement window). This is the time a decoded frame waits in the
+   * viewer's playout buffer before being rendered — pure receive-side queueing
+   * that adds to end-to-end interactive latency on top of network `rttMs`.
+   * 0 when unavailable (e.g. on the sender/host side, which has no inbound video).
+   */
+  playoutMs?: number;
   ts: number;
 }
 
@@ -173,7 +181,8 @@ export type ControlMessage =
   | { t: 'file-complete'; id: string }
   | { t: 'file-error'; id: string; message: string }
   | { t: 'audio'; enabled: boolean }
-  | { t: 'quality'; preset: QualityPreset };
+  | { t: 'quality'; preset: QualityPreset }
+  | { t: 'latency'; rttMs: number; playoutMs: number; fps?: number };
 
 /** Valid {@link ControlMessage.t} discriminants. */
 const CONTROL_TYPES = new Set<ControlMessage['t']>([
@@ -190,6 +199,7 @@ const CONTROL_TYPES = new Set<ControlMessage['t']>([
   'file-error',
   'audio',
   'quality',
+  'latency',
 ]);
 
 /** Valid {@link QualityPreset} values. */
@@ -232,6 +242,10 @@ export function isControlMessage(v: unknown): v is ControlMessage {
       return typeof o.enabled === 'boolean';
     case 'quality':
       return isStr(o.preset) && QUALITY_PRESETS.has(o.preset as QualityPreset);
+    case 'latency':
+      // Viewer -> host real-time telemetry: rttMs and playoutMs are required
+      // finite numbers; fps is optional but must be a finite number if present.
+      return isNum(o.rttMs) && isNum(o.playoutMs) && (o.fps === undefined || isNum(o.fps));
     default:
       return false;
   }

@@ -381,6 +381,20 @@ export class ViewerSession {
     try {
       const stats = await peer.getStats();
       this.handlers.onStats?.(stats);
+      // Real-time telemetry: report our observed END-TO-END interactive latency
+      // (network rttMs + receiver playout/jitter-buffer delay) plus fps back to
+      // the host over the control channel. The host folds this into its adaptive
+      // controller so receiver-side queueing forces real-time backoff — the
+      // viewer is the only side that can measure inbound playout delay. Reuse the
+      // stats already gathered this tick (no extra getStats round-trip) via the
+      // core telemetry shape. `sendControl` itself no-ops while the control
+      // channel is not open, so this is safe before negotiation completes.
+      peer.sendControl({
+        t: 'latency',
+        rttMs: stats.rttMs,
+        playoutMs: stats.playoutMs ?? 0,
+        fps: stats.fps,
+      });
     } catch {
       /* transient stats error — ignore this tick */
     }

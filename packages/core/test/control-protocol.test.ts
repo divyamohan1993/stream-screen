@@ -26,6 +26,9 @@ describe('isControlMessage', () => {
     { t: 'audio', enabled: false },
     { t: 'quality', preset: 'auto' },
     { t: 'quality', preset: 'low' },
+    { t: 'latency', rttMs: 30, playoutMs: 12 },
+    { t: 'latency', rttMs: 30, playoutMs: 12, fps: 60 },
+    { t: 'latency', rttMs: 0, playoutMs: 0 },
   ];
 
   it('accepts every well-formed control message', () => {
@@ -57,6 +60,24 @@ describe('isControlMessage', () => {
     expect(isControlMessage({ t: 'monitors', list: [{ id: 'a' }] })).toBe(false);
     expect(isControlMessage({ t: 'monitors', list: 'nope' })).toBe(false);
     expect(isControlMessage({ t: 'switch-monitor' })).toBe(false);
+  });
+
+  it('accepts a valid latency telemetry message and rejects malformed ones', () => {
+    expect(isControlMessage({ t: 'latency', rttMs: 25, playoutMs: 10 })).toBe(true);
+    expect(isControlMessage({ t: 'latency', rttMs: 25, playoutMs: 10, fps: 30 })).toBe(true);
+    // Missing required numeric fields.
+    expect(isControlMessage({ t: 'latency', rttMs: 25 })).toBe(false);
+    expect(isControlMessage({ t: 'latency', playoutMs: 10 })).toBe(false);
+    expect(isControlMessage({ t: 'latency' })).toBe(false);
+    // Wrong-typed required fields.
+    expect(isControlMessage({ t: 'latency', rttMs: '25', playoutMs: 10 })).toBe(false);
+    expect(isControlMessage({ t: 'latency', rttMs: 25, playoutMs: 'x' })).toBe(false);
+    // Non-finite numbers rejected.
+    expect(isControlMessage({ t: 'latency', rttMs: NaN, playoutMs: 10 })).toBe(false);
+    expect(isControlMessage({ t: 'latency', rttMs: 25, playoutMs: Infinity })).toBe(false);
+    // Optional fps, when present, must be a finite number.
+    expect(isControlMessage({ t: 'latency', rttMs: 25, playoutMs: 10, fps: 'fast' })).toBe(false);
+    expect(isControlMessage({ t: 'latency', rttMs: 25, playoutMs: 10, fps: NaN })).toBe(false);
   });
 });
 

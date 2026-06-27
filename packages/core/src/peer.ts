@@ -139,6 +139,18 @@ export class Peer {
    */
   private jitterBufferTargetMs = 0;
 
+  /**
+   * Per-connection cumulative jitter-buffer samples from the previous getStats
+   * tick, keyed by remote id then by inbound-rtp ssrc/id. Used to compute a
+   * delta-based average playout delay in ms (current jitterBufferDelay /
+   * jitterBufferEmittedCount over just the last window), which is the
+   * receive-side queueing component of end-to-end interactive latency.
+   */
+  private readonly jitterBufferPrev = new Map<
+    string,
+    Map<string, { delay: number; count: number }>
+  >();
+
   // Perfect-negotiation: the host is impolite (wins glare); the viewer is polite.
   private readonly polite: boolean;
 
@@ -726,7 +738,17 @@ export class Peer {
     const conns = [...this.targetConnections(remoteId)];
     const ts = Date.now();
     if (conns.length === 0) {
-      return { rttMs: 0, lossPct: 0, jitterMs: 0, availableKbps: 0, fps: 0, width: 0, height: 0, ts };
+      return {
+        rttMs: 0,
+        lossPct: 0,
+        jitterMs: 0,
+        availableKbps: 0,
+        fps: 0,
+        width: 0,
+        height: 0,
+        playoutMs: 0,
+        ts,
+      };
     }
 
     const perConn = await Promise.all(conns.map((c) => this.statsFor(c)));
@@ -734,6 +756,23 @@ export class Peer {
     agg.ts = ts;
     this.emit('stats', agg);
     return agg;
+  }
+
+  /**
+   * Compact receive-side interactive-latency telemetry for the viewer to report
+   * back to the host over the `control` channel ({@link ControlMessage} variant
+   * `latency`). The viewer is the side with inbound video, so this is where the
+   * real end-to-end latency (network RTT + playout/jitter-buffer delay) is
+   * observed. The host folds the reported `playoutMs` into its
+   * {@link AdaptiveController} so receiver-side queueing forces real-time backoff.
+   *
+   * Returns `{ rttMs, playoutMs, fps }` derived from {@link getStats} (worst-case
+   * across connections when `remoteId` is omitted). All fields are 0 when no
+   * inbound media is flowing yet.
+   */
+  async getLocalTelemetry(remoteId?: string): Promise<{ rttMs: number; playoutMs: number; fps: number }> {
+    const s = await this.getStats(remoteId);
+    return { rttMs: s.rttMs, playoutMs: s.playoutMs ?? 0, fps: s.fps };
   }
 
   /** Combine per-connection snapshots into the worst-case view across viewers. */
@@ -747,6 +786,7 @@ export class Peer {
       fps: 0,
       width: 0,
       height: 0,
+      playoutMs: 0,
       ts: 0,
     };
     let availSet = false;
@@ -755,6 +795,8 @@ export class Peer {
       agg.rttMs = Math.max(agg.rttMs, s.rttMs);
       agg.lossPct = Math.max(agg.lossPct, s.lossPct);
       agg.jitterMs = Math.max(agg.jitterMs, s.jitterMs);
+      // Worst-case playout: the most-buffered viewer drives end-to-end latency.
+      agg.playoutMs = Math.max(agg.playoutMs ?? 0, s.playoutMs ?? 0);
       if (s.availableKbps > 0) {
         agg.availableKbps = availSet
           ? Math.min(agg.availableKbps, s.availableKbps)
@@ -782,12 +824,21 @@ export class Peer {
       fps: 0,
       width: 0,
       height: 0,
+      playoutMs: 0,
       ts: Date.now(),
     };
 
     const report = await conn.pc.getStats();
     let packetsLost = 0;
     let packetsTotal = 0;
+
+    // Accumulate jitter-buffer samples across all inbound video streams this
+    // tick, then convert to a delta-based average against the previous tick.
+    let curDelay = 0;
+    let curCount = 0;
+    let prevDelay = 0;
+    let prevCount = 0;
+    const prevForConn = this.jitterBufferPrev.get(conn.remoteId);
 
     report.forEach((stat: { [k: string]: unknown; type?: string }) => {
       switch (stat.type) {
@@ -813,6 +864,23 @@ export class Peer {
             const h = numOf(stat.frameHeight);
             if (w > 0) snapshot.width = w;
             if (h > 0) snapshot.height = h;
+            // Receiver playout delay (seconds, cumulative): average delay per
+            // emitted frame is jitterBufferDelay / jitterBufferEmittedCount.
+            // Accumulate raw cumulative totals; convert to a per-window average
+            // (in ms) after the report is fully scanned, using the prior tick.
+            const jbDelay = numOf(stat.jitterBufferDelay);
+            const jbCount = numOf(stat.jitterBufferEmittedCount);
+            if (jbCount > 0) {
+              const key = String(stat.id ?? stat.ssrc ?? 'inbound-video');
+              curDelay += jbDelay;
+              curCount += jbCount;
+              const prior = prevForConn?.get(key);
+              if (prior) {
+                prevDelay += prior.delay;
+                prevCount += prior.count;
+              }
+              this.recordJitterBufferSample(conn.remoteId, key, jbDelay, jbCount);
+            }
           }
           break;
         }
@@ -846,7 +914,36 @@ export class Peer {
       snapshot.lossPct = Math.max(snapshot.lossPct, (packetsLost / packetsTotal) * 100);
     }
 
+    // Delta-based average playout delay over just the last window: prefer the
+    // change in cumulative delay/count between ticks (steady-state queueing);
+    // fall back to the lifetime average on the very first tick (no prior).
+    const dCount = curCount - prevCount;
+    const dDelay = curDelay - prevDelay;
+    if (dCount > 0) {
+      snapshot.playoutMs = (dDelay / dCount) * 1000;
+    } else if (curCount > 0) {
+      snapshot.playoutMs = (curDelay / curCount) * 1000;
+    } else {
+      snapshot.playoutMs = 0;
+    }
+    if (!(snapshot.playoutMs > 0)) snapshot.playoutMs = 0;
+
     return snapshot;
+  }
+
+  /** Stash this tick's cumulative jitter-buffer sample for next tick's delta. */
+  private recordJitterBufferSample(
+    remoteId: string,
+    key: string,
+    delay: number,
+    count: number,
+  ): void {
+    let perConn = this.jitterBufferPrev.get(remoteId);
+    if (!perConn) {
+      perConn = new Map();
+      this.jitterBufferPrev.set(remoteId, perConn);
+    }
+    perConn.set(key, { delay, count });
   }
 
   /**
@@ -894,6 +991,7 @@ export class Peer {
     conn.inputChannel = null;
     conn.controlChannel = null;
     conn.fileChannel = null;
+    this.jitterBufferPrev.delete(conn.remoteId);
     try {
       conn.pc.close();
     } catch {
@@ -907,6 +1005,7 @@ export class Peer {
       this.closeConnection(conn);
     }
     this.connections.clear();
+    this.jitterBufferPrev.clear();
     this.localStream = null;
     this.running = false;
     this.inputHandlers.clear();

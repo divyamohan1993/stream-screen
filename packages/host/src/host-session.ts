@@ -54,8 +54,46 @@ export function isCtrlAltDelKeyDown(e: InputEvent): boolean {
   return (mods & KEY_MODS.ctrl) !== 0 && (mods & KEY_MODS.alt) !== 0;
 }
 
-/** How often the adaptive loop samples stats and re-negotiates (ms). */
-export const ADAPTIVE_INTERVAL_MS = 1000;
+/**
+ * How often the adaptive loop samples stats and re-negotiates (ms).
+ *
+ * Sampling at ~2 Hz (every 500ms) — rather than the previous 1 Hz — halves the
+ * worst-case reaction time to a congestion event so the engine can defend
+ * real-time interactivity faster. Application of decisions is ASYMMETRIC and
+ * oscillation-safe (see {@link HostSession.tick} and
+ * {@link INCREASE_CONFIRM_TICKS}): DECREASE/HOLD apply immediately every tick;
+ * an INCREASE applies only after a sustained clean link.
+ */
+export const ADAPTIVE_INTERVAL_MS = 500;
+
+/**
+ * Number of CONSECUTIVE INCREASE classifications required before the host
+ * actually applies one (the "slow-up" half of fast-down / slow-up).
+ *
+ * At {@link ADAPTIVE_INTERVAL_MS} = 500ms, requiring 4 consecutive clean
+ * samples means a ramp-up only commits after ~2s of sustained healthy link,
+ * which damps oscillation: a single clean blip never bumps the bitrate, but a
+ * genuinely-recovered link still ramps promptly. Backing off, by contrast, is
+ * immediate every tick — we always prioritize real-time over quality.
+ *
+ * This gate is a deterministic COUNTER (not wall-clock), so it is fully
+ * unit-testable: N increase decisions in a row commit exactly one increase.
+ */
+export const INCREASE_CONFIRM_TICKS = 4;
+
+/**
+ * The phase a {@link AdaptiveDecision} represents, parsed from the controller's
+ * `reason` string (which the engine prefixes with `INCREASE:` / `HOLD:` /
+ * `DECREASE:`). The controller is authoritative for the MATH; the host only
+ * reads back which phase it chose to gate APPLICATION asymmetrically. Returns
+ * null if the reason is not recognized (then we treat it as non-increase).
+ */
+function decisionPhase(d: AdaptiveDecision): 'INCREASE' | 'HOLD' | 'DECREASE' | null {
+  if (d.reason.startsWith('INCREASE')) return 'INCREASE';
+  if (d.reason.startsWith('DECREASE')) return 'DECREASE';
+  if (d.reason.startsWith('HOLD')) return 'HOLD';
+  return null;
+}
 
 /**
  * Default time (ms) {@link HostSession.start} waits for the signaling server's
@@ -211,6 +249,22 @@ export class HostSession {
   private readonly fileManagers = new Map<string, FileTransferManager>();
   /** A counter that ids outbound (host → viewer) transfers uniquely. */
   private outboundSeq = 0;
+  /**
+   * Consecutive-INCREASE counter implementing the "slow-up" application gate.
+   * Each tick whose controller decision classifies as INCREASE increments it;
+   * once it reaches {@link INCREASE_CONFIRM_TICKS} the increase is APPLIED and
+   * the counter resets to 0. ANY non-increase decision (HOLD/DECREASE) resets it
+   * immediately. Deterministic — no wall-clock involved. See {@link tick}.
+   */
+  private consecutiveIncreases = 0;
+  /**
+   * Latest viewer→host end-to-end latency report(s), keyed by viewer id, from
+   * the `{t:'latency'}` ControlMessage. Each tick the WORST-CASE (max) reported
+   * rttMs/playoutMs across all viewers is folded into the stats handed to the
+   * controller, so the host governs on true end-to-end interactive latency, not
+   * just its own sender-side measurement. Empty until a viewer reports.
+   */
+  private readonly viewerLatency = new Map<string, { rttMs: number; playoutMs: number }>();
 
   constructor(opts: HostSessionOptions) {
     this.opts = opts;
@@ -321,6 +375,7 @@ export class HostSession {
       signaling.on('peer-left', (msg) => {
         if (!msg.from) return;
         this.fileManagers.delete(msg.from);
+        this.viewerLatency.delete(msg.from);
         if (msg.role === 'viewer') this.opts.onViewerLeft?.(msg.from);
       });
 
@@ -474,6 +529,19 @@ export class HostSession {
       case 'quality':
         this.applyQualityPreset(m.preset);
         break;
+      case 'latency':
+        // Record this viewer's reported end-to-end interactive latency. It is
+        // folded (worst-case across viewers) into the next adaptive tick's stats
+        // so the host governs on true end-to-end latency, not just its own
+        // sender-side measurement. Non-finite values are ignored defensively
+        // (the protocol validates, but be robust to a hand-rolled sender).
+        if (Number.isFinite(m.rttMs) && Number.isFinite(m.playoutMs)) {
+          this.viewerLatency.set(viewerId, {
+            rttMs: Math.max(0, m.rttMs),
+            playoutMs: Math.max(0, m.playoutMs),
+          });
+        }
+        break;
       default:
         break;
     }
@@ -600,9 +668,38 @@ export class HostSession {
   }
 
   /**
-   * One iteration of the adaptive loop: sample stats, compute a decision, apply
-   * it to the sender. Safe to call manually in tests. Swallows transient stats
-   * errors (e.g. before the connection is up) so the loop never dies.
+   * Worst-case (max) viewer-reported end-to-end latency across all viewers, or
+   * null if no viewer has reported yet. Folded into the stats each tick so the
+   * host governs on true end-to-end interactive latency, not just its own
+   * sender-side measurement. MAX = pessimistic = real-time-protective.
+   */
+  private worstReportedLatency(): { rttMs: number; playoutMs: number } | null {
+    if (this.viewerLatency.size === 0) return null;
+    let rttMs = 0;
+    let playoutMs = 0;
+    for (const r of this.viewerLatency.values()) {
+      if (r.rttMs > rttMs) rttMs = r.rttMs;
+      if (r.playoutMs > playoutMs) playoutMs = r.playoutMs;
+    }
+    return { rttMs, playoutMs };
+  }
+
+  /**
+   * One iteration of the adaptive loop: sample stats, FOLD IN viewer-reported
+   * end-to-end latency, compute a decision, and apply it ASYMMETRICALLY (the
+   * fast-down / slow-up policy). Safe to call manually in tests. Swallows
+   * transient stats errors (e.g. before the connection is up) so the loop never
+   * dies.
+   *
+   * Fast-down / slow-up — we ALWAYS prioritize real-time:
+   *   - DECREASE / HOLD apply IMMEDIATELY this very tick.
+   *   - INCREASE applies only after {@link INCREASE_CONFIRM_TICKS} consecutive
+   *     increase classifications (a sustained clean link, ~2s at 500ms), gated
+   *     by a deterministic counter; any non-increase decision resets the count.
+   *
+   * The controller stays authoritative: its math is untouched, including the
+   * internal bitrate it advances on every `update()`. The host only chooses
+   * WHEN to push the increase to the encoder, never WHAT the value is.
    */
   async tick(): Promise<void> {
     const peer = this.peer;
@@ -613,12 +710,49 @@ export class HostSession {
     } catch {
       return;
     }
+
+    // Fold viewer-reported end-to-end latency (worst case across viewers) into
+    // the measured stats: take the MAX of measured vs reported for both the
+    // network RTT and the receiver playout delay. This makes the controller
+    // back off on true end-to-end interactive latency even when the host's own
+    // sender-side RTT looks fine (e.g. receiver-side jitter-buffer queueing).
+    const reported = this.worstReportedLatency();
+    if (reported) {
+      stats = {
+        ...stats,
+        rttMs: Math.max(stats.rttMs, reported.rttMs),
+        playoutMs: Math.max(stats.playoutMs ?? 0, reported.playoutMs),
+      };
+    }
+
     const decision = this.controller.update(stats);
     this.lastDecision = decision;
-    try {
-      await peer.applyDecision(decision);
-    } catch {
-      // Sender may not be ready yet; the next tick retries.
+
+    // ASYMMETRIC APPLICATION (fast-down / slow-up). The controller has already
+    // advanced its internal bitrate; we only gate whether to push an INCREASE.
+    const phase = decisionPhase(decision);
+    let apply: boolean;
+    if (phase === 'INCREASE') {
+      this.consecutiveIncreases += 1;
+      if (this.consecutiveIncreases >= INCREASE_CONFIRM_TICKS) {
+        apply = true;
+        this.consecutiveIncreases = 0; // committed — restart the confirmation window
+      } else {
+        apply = false; // not yet sustained; hold the encoder steady
+      }
+    } else {
+      // HOLD / DECREASE / unrecognized: apply immediately and reset the gate so
+      // a future ramp must re-earn a full N-in-a-row clean streak.
+      this.consecutiveIncreases = 0;
+      apply = true;
+    }
+
+    if (apply) {
+      try {
+        await peer.applyDecision(decision);
+      } catch {
+        // Sender may not be ready yet; the next tick retries.
+      }
     }
     this.opts.onDecision?.(decision, stats);
   }
@@ -638,6 +772,8 @@ export class HostSession {
     this.signaling?.close();
     this.signaling = null;
     this.fileManagers.clear();
+    this.viewerLatency.clear();
+    this.consecutiveIncreases = 0;
     this.started = false;
   }
 }

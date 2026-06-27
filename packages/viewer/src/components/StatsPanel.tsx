@@ -17,10 +17,11 @@ function tier(value: number, warn: number, bad: number): 'good' | 'warn' | 'bad'
 }
 
 /**
- * Live connection-quality dashboard: RTT, packet loss, jitter, available
- * bitrate, framerate, and resolution, plus the current
+ * Live connection-quality dashboard: RTT, end-to-end interactive Latency
+ * (network RTT + receiver playout/jitter-buffer delay), packet loss, jitter,
+ * available bitrate, framerate, and resolution, plus the current
  * {@link AdaptiveDecision} reason so the user can see exactly how the engine is
- * "auto-negotiating lag" in real time.
+ * "auto-negotiating lag" in real time and that it is staying real-time.
  */
 export function StatsPanel({ stats, decision }: StatsPanelProps): React.JSX.Element {
   return (
@@ -32,6 +33,11 @@ export function StatsPanel({ stats, decision }: StatsPanelProps): React.JSX.Elem
             k="RTT"
             v={`${Math.round(stats.rttMs)} ms`}
             cls={tier(stats.rttMs, 120, 250)}
+          />
+          <Row
+            k="Latency"
+            v={`${Math.round(stats.rttMs + (stats.playoutMs ?? 0))} ms`}
+            cls={tier(stats.rttMs + (stats.playoutMs ?? 0), 120, 250)}
           />
           <Row
             k="Loss"

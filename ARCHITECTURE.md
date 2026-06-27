@@ -33,7 +33,7 @@ runs identically in a browser and in node.
 | `@stream-screen/host` | Electron (Windows) | Captures screen + system audio, enumerates/switches monitors, runs the adaptive loop, injects remote input incl. special combos (`nut.js`), saves received files, tray UI. |
 | `@stream-screen/viewer` | browser (Vite + React) | Renders the remote screen+audio, captures input, file transfer, monitor switching, recording, chat, live stats dashboard. |
 | `@stream-screen/ai` | node | MCP (stdio) server + mirrored REST API so AI agents can drive a session (incl. monitors, chat, quality, key combos). |
-| `@stream-screen/e2e` | node + Chromium | Playwright: two real browser peers run a live WebRTC session (12 specs: session/input/adaptive/audio/file (both directions)/control/keys/recording). |
+| `@stream-screen/e2e` | node + Chromium | Playwright: two real browser peers run a live WebRTC session (15 specs: session/input/adaptive/adaptive-closed-loop/audio/file (both directions + concurrent)/control/keys/recording). |
 
 ---
 
@@ -237,33 +237,72 @@ discovery. Viewers reach discovery via `GET /api/discover`.
 The "auto-negotiate lag" engine (`core/adaptive.ts`, driven by
 `host/host-session.ts`) keeps the stream realtime on a busy network. It is a
 deterministic **AIMD** (additive-increase / multiplicative-decrease) congestion
-controller — no timers, no randomness, so it is directly unit-testable.
+controller — no timers, no randomness, so it is directly unit-testable. It is
+tuned to **always prioritize real-time** while pushing the best quality the link
+can sustain: a **fast-down / slow-up** application policy at ~2 Hz, and it governs
+on the **true end-to-end interactive latency** the viewer experiences rather than
+only the host's own wire RTT.
 
 ```mermaid
 flowchart TB
-  T["every ~1s (ADAPTIVE_INTERVAL_MS)"] --> G["peer.getStats()"]
-  G --> S["AdaptiveStats:\nRTT, loss%, jitter,\navailableKbps, fps, w x h"]
+  T["every ~500ms (ADAPTIVE_INTERVAL_MS = 500)"] --> G["peer.getStats()"]
+  VL["viewer { t:latency }\nrttMs + playoutMs + fps\n(over control channel)"] --> FOLD
+  G --> FOLD["fold in worst-case viewer latency\n(max of measured vs reported rtt/playout)"]
+  FOLD --> S["AdaptiveStats:\nrtt, loss%, jitter, availableKbps,\nfps, w x h, playoutMs (E2E)"]
   S --> C{classify link}
-  C -->|"clean: RTT<target, loss<2%, low jitter"| INC["INCREASE\nx1.08, capped at availableKbps x1.05"]
-  C -->|"congested: loss>5% OR RTT>1.6xtarget OR jitter spike"| DEC["DECREASE\nx(0.85 -> 0.60 by severity)"]
+  C -->|"clean: rtt<target AND rtt+playout<target,\nloss<2%, low jitter"| INC["INCREASE\nx1.08, capped at availableKbps x1.05"]
+  C -->|"congested: loss>5% OR rtt+playout>1.6xtarget OR jitter spike"| DEC["DECREASE\nx(0.85 -> 0.60 by severity)"]
   C -->|ambiguous| HOLD["HOLD\nkeep steady"]
   INC --> CLAMP["clamp to [minKbps, maxKbps]"]
   DEC --> CLAMP
   HOLD --> CLAMP
   CLAMP --> D["AdaptiveDecision:\ntargetKbps, maxFramerate (15-60),\nscaleResolutionDownBy (1-4)"]
-  D --> A["peer.applyDecision()\nsender.setParameters()"]
+  D --> GATE{"asymmetric apply\n(fast-down / slow-up)"}
+  GATE -->|"DECREASE / HOLD: apply NOW"| A["peer.applyDecision()\nsender.setParameters()"]
+  GATE -->|"INCREASE: only after 4 clean ticks\n(INCREASE_CONFIRM_TICKS)"| A
   A --> T
 ```
 
 - **Inputs** come from the WebRTC stats API: candidate-pair RTT and
   `availableOutgoingBitrate`; inbound/outbound and remote-inbound RTP for
-  loss, jitter, fps, and frame size.
+  loss, jitter, fps, and frame size; and the receiver's playout/jitter-buffer
+  delay (`jitterBufferDelay / jitterBufferEmittedCount`, delta-averaged over the
+  last window) as `playoutMs`.
+- **End-to-end latency feedback (closed loop).** Wire RTT understates perceived
+  lag: a decoded frame still waits in the viewer's jitter/playout buffer before it
+  is drawn, and only the *viewer* can measure that receive-side delay. So every
+  tick the viewer reports `{ t:'latency', rttMs, playoutMs, fps }` to the host over
+  the reliable `control` channel (`ViewerSession`, via `Peer.getLocalTelemetry()`).
+  The host folds the **worst-case** (`max`) reported `rttMs`/`playoutMs` across all
+  viewers into the stats it hands the controller, so the engine classifies on
+  `realtimeMs = rttMs + playoutMs` — receiver-side queueing forces a real-time
+  backoff even when the host's own sender RTT looks fine. With no report (or
+  `playoutMs = 0`), `realtime === rttMs` and behavior is identical to before.
+- **Fast-down / slow-up application.** The loop ticks at 500 ms
+  (`ADAPTIVE_INTERVAL_MS`), halving worst-case reaction time vs the prior 1 Hz.
+  Application is **asymmetric**: a **DECREASE or HOLD applies immediately, every
+  tick**, while an **INCREASE commits only after `INCREASE_CONFIRM_TICKS = 4`
+  consecutive clean classifications** (~2 s of sustained healthy link, tracked by a
+  deterministic integer counter that any non-increase decision resets). The
+  controller's bitrate math stays authoritative and untouched; the host only gates
+  *when* to push an increase to the encoder, never *what* the value is — so we shed
+  quality the instant the link hurts and re-earn it only once it is proven stable.
 - **Outputs** are applied to the outbound video sender's first encoding:
-  `maxBitrate`, `maxFramerate`, `scaleResolutionDownBy`. Low-bandwidth links shed
-  framerate first, then resolution — degrading gracefully instead of stalling.
+  `maxBitrate`, `maxFramerate`, `scaleResolutionDownBy` (degradationPreference
+  `maintain-resolution`). Low-bandwidth links shed framerate first, then
+  resolution — degrading gracefully instead of stalling.
 - **No hard ceiling** other than the caller-supplied `maxKbps` (default 40 Mbps);
-  the controller never imposes a time-based throttle. The viewer additionally
-  surfaces Auto/High/Balanced/Low presets (`viewer/src/quality.ts`).
+  the controller never imposes a time-based throttle (the 500 ms tick and the
+  4-sample gate are control-loop cadence, never a session limit). The viewer
+  additionally surfaces Auto/High/Balanced/Low presets (`viewer/src/quality.ts`).
+- **Proven closed-loop e2e.** `e2e/tests/adaptive-closed-loop.spec.ts` brings up a
+  *real* two-Chromium WebRTC session, drives the *real* `AdaptiveController` +
+  `peer.applyDecision()`, and reads the encodings off the **real `RTCRtpSender`**.
+  It proves congestion drops the real sender's bitrate/framerate and raises the
+  downscale; that **receiver-side `playoutMs` alone** (wire RTT under target)
+  forces a backoff; that a sustained clean link recovers the bitrate above the
+  trough; and that the viewer's `{ t:latency }` telemetry round-trips to the host —
+  the loop closed against actual WebRTC, not a mock.
 
 ---
 
@@ -345,6 +384,7 @@ trusted. Its variants:
 | `file-offer`, `file-accept`, `file-reject`, `file-progress`, `file-complete`, `file-error` | file-transfer signaling for the binary `file` channel |
 | `audio` | toggle host system-audio capture on/off |
 | `quality` | select an `auto`/`high`/`balanced`/`low` preset |
+| `latency` | viewer → host end-to-end interactive-latency telemetry (`rttMs`, `playoutMs`, optional `fps`) folded into the adaptive loop |
 
 ```mermaid
 flowchart LR
@@ -503,8 +543,10 @@ is enforced in code, not just by default config:
   lives exactly as long as its sockets stay open. (Contrast: AnyDesk's free tier
   ~15‑minute cutoff.)
 - **The only timers are safety mechanisms, not limits.** The signaling
-  heartbeat reaps *dead* sockets; the adaptive loop samples stats every ~1 s;
-  `SignalingClient` backoff reconnects; the host's join-ack timeout
+  heartbeat reaps *dead* sockets; the adaptive loop samples stats every ~500 ms
+  (control-loop cadence, plus a 4-sample slow-up gate that is a deterministic
+  counter, not wall-clock); `SignalingClient` backoff reconnects; the host's
+  join-ack timeout
   (`JOIN_ACK_TIMEOUT_MS`) bounds only the connect-time wait for the server's
   `joined` reply. None of these end a live session.
 - **No usage metering or licensing.** No counters, no "commercial use" checks, no

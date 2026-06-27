@@ -262,3 +262,140 @@ describe('Peer multi-viewer (host)', () => {
     expect(FakePC.instances[1].addIceCandidate).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * A PC stub whose getStats returns a caller-supplied report, so we can drive
+ * the receive-side playout (jitterBufferDelay/jitterBufferEmittedCount) parsing
+ * in Peer.getStats deterministically.
+ */
+class StatsPC {
+  static instances: StatsPC[] = [];
+  static reports: Array<Array<Record<string, unknown>>> = [];
+  signalingState = 'stable';
+  connectionState = 'connected';
+  localDescription: unknown = { type: 'offer', sdp: 'v=0' };
+  private readonly idx = StatsPC.instances.length;
+  private call = 0;
+  onicecandidate: unknown = null;
+  ontrack: unknown = null;
+  onconnectionstatechange: unknown = null;
+  ondatachannel: unknown = null;
+  onnegotiationneeded: (() => void) | null = null;
+  restartIce = vi.fn();
+  setLocalDescription = vi.fn(async () => {});
+  setRemoteDescription = vi.fn(async () => {});
+  addIceCandidate = vi.fn(async () => {});
+  constructor() {
+    StatsPC.instances.push(this);
+  }
+  createDataChannel(label: string): FakeChannel {
+    return new FakeChannel(label);
+  }
+  addTrack(track: { kind: string }): { track: { kind: string } } {
+    return { track };
+  }
+  getSenders(): unknown[] {
+    return [];
+  }
+  getReceivers(): unknown[] {
+    return [];
+  }
+  getStats(): Promise<Map<string, Record<string, unknown>>> {
+    // Each connection gets its own queue of per-tick reports; otherwise reuse
+    // the last one so repeated calls are stable.
+    const queue = StatsPC.reports[this.idx] ?? [];
+    const report = queue[Math.min(this.call, queue.length - 1)] ?? [];
+    this.call++;
+    const m = new Map<string, Record<string, unknown>>();
+    report.forEach((s, i) => m.set(String(s.id ?? i), s));
+    return Promise.resolve(m);
+  }
+  close(): void {}
+}
+
+function makeStatsHost() {
+  StatsPC.instances = [];
+  StatsPC.reports = [];
+  const signaling = new FakeSignaling();
+  const peer = new Peer({
+    role: 'host',
+    signaling: signaling as unknown as SignalingClient,
+    rtcPeerConnection: StatsPC as unknown as typeof RTCPeerConnection,
+  });
+  return { peer, signaling };
+}
+
+describe('Peer.getStats playout (receiver jitter-buffer) parsing', () => {
+  it('derives a delta-based average playoutMs in ms from jitterBufferDelay/EmittedCount', async () => {
+    const { peer, signaling } = makeStatsHost();
+    await peer.start();
+    signaling.fire('peer-joined', { type: 'peer-joined', from: 'viewer-A' });
+
+    // Tick 1: cumulative 0.1s over 10 frames. Tick 2: cumulative 0.3s over 20
+    // frames -> window delta 0.2s over 10 frames = 20ms average playout.
+    StatsPC.reports[0] = [
+      [{ type: 'inbound-rtp', kind: 'video', id: 'in0', jitterBufferDelay: 0.1, jitterBufferEmittedCount: 10 }],
+      [{ type: 'inbound-rtp', kind: 'video', id: 'in0', jitterBufferDelay: 0.3, jitterBufferEmittedCount: 20 }],
+    ];
+
+    const first = await peer.getStats();
+    // First tick has no prior -> lifetime average 0.1/10 = 10ms.
+    expect(first.playoutMs).toBeCloseTo(10, 5);
+
+    const second = await peer.getStats();
+    expect(second.playoutMs).toBeCloseTo(20, 5);
+  });
+
+  it('reports 0 playoutMs when no inbound jitter-buffer stats are present (host/sender side)', async () => {
+    const { peer, signaling } = makeStatsHost();
+    await peer.start();
+    signaling.fire('peer-joined', { type: 'peer-joined', from: 'viewer-A' });
+    StatsPC.reports[0] = [
+      [{ type: 'candidate-pair', nominated: true, currentRoundTripTime: 0.02 }],
+    ];
+    const s = await peer.getStats();
+    expect(s.playoutMs).toBe(0);
+    expect(s.rttMs).toBeCloseTo(20, 5);
+  });
+
+  it('aggregates playoutMs as the worst-case (max) across viewers', async () => {
+    const { peer, signaling } = makeStatsHost();
+    await peer.start();
+    signaling.fire('peer-joined', { type: 'peer-joined', from: 'viewer-A' });
+    signaling.fire('peer-joined', { type: 'peer-joined', from: 'viewer-B' });
+
+    // Viewer A: 15ms playout. Viewer B: 80ms playout (lifetime avg, first tick).
+    StatsPC.reports[0] = [
+      [{ type: 'inbound-rtp', kind: 'video', id: 'a', jitterBufferDelay: 0.015, jitterBufferEmittedCount: 1 }],
+    ];
+    StatsPC.reports[1] = [
+      [{ type: 'inbound-rtp', kind: 'video', id: 'b', jitterBufferDelay: 0.08, jitterBufferEmittedCount: 1 }],
+    ];
+
+    const agg = await peer.getStats();
+    expect(agg.playoutMs).toBeCloseTo(80, 5);
+  });
+
+  it('getLocalTelemetry surfaces { rttMs, playoutMs, fps } for viewer reporting', async () => {
+    const { peer, signaling } = makeStatsHost();
+    await peer.start();
+    signaling.fire('peer-joined', { type: 'peer-joined', from: 'viewer-A' });
+    StatsPC.reports[0] = [
+      [
+        { type: 'candidate-pair', nominated: true, currentRoundTripTime: 0.03 },
+        {
+          type: 'inbound-rtp',
+          kind: 'video',
+          id: 'in0',
+          framesPerSecond: 48,
+          jitterBufferDelay: 0.025,
+          jitterBufferEmittedCount: 1,
+        },
+      ],
+    ];
+    const tel = await peer.getLocalTelemetry();
+    expect(tel.rttMs).toBeCloseTo(30, 5);
+    expect(tel.playoutMs).toBeCloseTo(25, 5);
+    expect(tel.fps).toBe(48);
+  });
+});

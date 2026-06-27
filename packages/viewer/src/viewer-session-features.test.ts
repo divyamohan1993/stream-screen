@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ControlMessage, InputEvent } from '@stream-screen/core';
+import type { ControlMessage, InputEvent, AdaptiveStats } from '@stream-screen/core';
 
 /**
  * Feature tests for the viewer session's control-channel + file-transfer wiring.
@@ -19,12 +19,27 @@ class FakePeer {
   sentControl: ControlMessage[] = [];
   sentChunks: ArrayBuffer[] = [];
   sentInput: InputEvent[] = [];
+  /** Stats returned by the next getStats() call (drives latency telemetry). */
+  nextStats: AdaptiveStats = {
+    rttMs: 42,
+    lossPct: 0,
+    jitterMs: 7,
+    availableKbps: 5000,
+    fps: 31,
+    width: 1920,
+    height: 1080,
+    playoutMs: 18,
+    ts: 0,
+  };
 
   constructor() {
     FakePeer.current = this;
   }
   on(): void {}
   async start(): Promise<void> {}
+  async getStats(): Promise<AdaptiveStats> {
+    return { ...this.nextStats, ts: Date.now() };
+  }
   sendControl(m: ControlMessage): void {
     this.sentControl.push(m);
   }
@@ -169,6 +184,75 @@ describe('ViewerSession control channel', () => {
     ]);
     expect(FakePeer.current!.sentInput).toHaveLength(2);
     expect(FakePeer.current!.sentInput[0].t).toBe('k-down');
+  });
+});
+
+describe('ViewerSession real-time latency telemetry', () => {
+  beforeEach(() => {
+    FakePeer.current = null;
+  });
+
+  it('reports measured interactive latency to the host on each stats poll', async () => {
+    vi.useFakeTimers();
+    try {
+      const session = new ViewerSession({
+        code: '123456',
+        signalingUrl: 'ws://x:8787',
+        statsIntervalMs: 1000,
+      });
+      await session.connect();
+      const peer = FakePeer.current!;
+      peer.nextStats = {
+        rttMs: 55,
+        lossPct: 1,
+        jitterMs: 9,
+        availableKbps: 6000,
+        fps: 28,
+        width: 1280,
+        height: 720,
+        playoutMs: 30,
+        ts: 0,
+      };
+
+      // Drive one stats tick (the loop polls on the configured interval).
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const latency = peer.sentControl.find((m) => m.t === 'latency');
+      expect(latency).toEqual({ t: 'latency', rttMs: 55, playoutMs: 30, fps: 28 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports playoutMs as 0 when the stats snapshot omits it', async () => {
+    vi.useFakeTimers();
+    try {
+      const session = new ViewerSession({
+        code: '123456',
+        signalingUrl: 'ws://x:8787',
+        statsIntervalMs: 500,
+      });
+      await session.connect();
+      const peer = FakePeer.current!;
+      peer.nextStats = {
+        rttMs: 12,
+        lossPct: 0,
+        jitterMs: 2,
+        availableKbps: 8000,
+        fps: 60,
+        width: 1920,
+        height: 1080,
+        ts: 0,
+      } as AdaptiveStats;
+      delete (peer.nextStats as { playoutMs?: number }).playoutMs;
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      const latency = peer.sentControl.find((m) => m.t === 'latency');
+      expect(latency).toEqual({ t: 'latency', rttMs: 12, playoutMs: 0, fps: 60 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

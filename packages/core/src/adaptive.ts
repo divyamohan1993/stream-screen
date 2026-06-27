@@ -89,20 +89,35 @@ export class AdaptiveController {
    */
   private classify(s: AdaptiveStats): { phase: Phase; factor: number; reason: string } {
     const rttHard = this.targetRttMs * 1.6;
+    // End-to-end interactive latency = network RTT + receiver playout/jitter
+    // buffer delay. Prioritizing real-time means we must back off when the
+    // *experienced* latency blows the budget even if the wire RTT alone is fine
+    // (receiver-side queueing forces backoff too). When playoutMs is 0/absent,
+    // realtime === rttMs, so behavior is byte-identical to before.
+    const playoutMs = s.playoutMs && s.playoutMs > 0 ? s.playoutMs : 0;
+    const realtimeMs = s.rttMs + playoutMs;
     const congested =
-      s.lossPct > LOSS_HIGH || s.rttMs > rttHard || s.jitterMs > JITTER_HIGH * 1.5;
+      s.lossPct > LOSS_HIGH || realtimeMs > rttHard || s.jitterMs > JITTER_HIGH * 1.5;
 
     if (congested) {
-      // Severity in [0,1]: combine the worst of the three signals.
+      // Severity in [0,1]: combine the worst of the three signals. The latency
+      // severity is driven by realtime latency (rtt + playout), so receiver-side
+      // queueing scales the multiplicative back-off just like network RTT.
       const lossSev = Math.min(1, Math.max(0, (s.lossPct - LOSS_LOW) / (20 - LOSS_LOW)));
-      const rttSev = Math.min(1, Math.max(0, (s.rttMs - this.targetRttMs) / (this.targetRttMs * 2)));
+      const rttSev = Math.min(1, Math.max(0, (realtimeMs - this.targetRttMs) / (this.targetRttMs * 2)));
       const jitterSev = Math.min(1, Math.max(0, (s.jitterMs - JITTER_HIGH) / (JITTER_HIGH * 2)));
       const sev = Math.max(lossSev, rttSev, jitterSev);
       // Map severity to a 0.85 (mild) .. 0.60 (severe) multiplier.
       const factor = 0.85 - 0.25 * sev;
       const why: string[] = [];
       if (s.lossPct > LOSS_HIGH) why.push(`loss ${s.lossPct.toFixed(1)}%`);
-      if (s.rttMs > rttHard) why.push(`rtt ${Math.round(s.rttMs)}ms`);
+      if (realtimeMs > rttHard) {
+        why.push(
+          playoutMs > 0
+            ? `rtt ${Math.round(realtimeMs)}ms (net ${Math.round(s.rttMs)}+playout ${Math.round(playoutMs)})`
+            : `rtt ${Math.round(realtimeMs)}ms`,
+        );
+      }
       if (s.jitterMs > JITTER_HIGH * 1.5) why.push(`jitter ${Math.round(s.jitterMs)}ms`);
       return { phase: 'DECREASE', factor, reason: `back off (${why.join(', ')})` };
     }
@@ -114,7 +129,15 @@ export class AdaptiveController {
     // a measured RTT or an active frame rate / reported headroom — before
     // increasing; otherwise HOLD.
     const hasSignal = s.rttMs > 0 || s.fps > 0 || s.availableKbps > 0;
-    const clean = s.rttMs < this.targetRttMs && s.lossPct < LOSS_LOW && s.jitterMs < JITTER_HIGH;
+    // Only ramp up when BOTH the network RTT and the end-to-end realtime latency
+    // are under target — pushing more bits is only safe if the experienced
+    // interactive latency has headroom (receiver playout included). With
+    // playoutMs 0/absent, realtimeMs === rttMs so this is identical to before.
+    const clean =
+      s.rttMs < this.targetRttMs &&
+      realtimeMs < this.targetRttMs &&
+      s.lossPct < LOSS_LOW &&
+      s.jitterMs < JITTER_HIGH;
     if (clean && hasSignal) {
       return { phase: 'INCREASE', factor: 1 + INCREASE_FACTOR, reason: 'healthy link, ramping up' };
     }
