@@ -22,6 +22,7 @@
         SignalingClient,
         createSender,
         createReceiver,
+        ReceiverRouter,
       } from './core.bundle.js';
 
       const params = new URLSearchParams(location.search);
@@ -57,6 +58,9 @@
       // file-complete can race ahead of the trailing chunks on the file channel).
       const receivedFiles = []; // { id, name, size, length, checksum }
       const inboundTransfers = new Map(); // id -> { receiver, meta, size, completed, done }
+      // Demuxes inbound binary frames to the right receiver by embedded transfer
+      // id, so concurrent host->viewer transfers cannot cross-contaminate.
+      const inboundRouter = new ReceiverRouter();
 
       // Sum every byte (mod 2^32) — the same cheap content checksum the host uses.
       function fileChecksum(bytes) {
@@ -85,6 +89,7 @@
           t.done = true;
           recordInboundFile(t);
           inboundTransfers.delete(id);
+          inboundRouter.unregister(id);
         }
       }
 
@@ -167,6 +172,64 @@
             }
           });
           await sender.start();
+          return true;
+        },
+        // --- Concurrent file transfer (viewer -> host), two files INTERLEAVED. ---
+        // Both senders are started concurrently over the SAME binary `file`
+        // channel, and we manually interleave their chunk streams (alternating one
+        // chunk from each) so the host must demux by the transfer id embedded in
+        // every frame. Resolves once both files have sent every chunk +
+        // file-complete. Proves no cross-contamination on the wire.
+        sendFilesInterleaved: async (files) => {
+          // files: [{ id, name, mime, bytes }, ...]
+          const senders = files.map((f) => {
+            const data = new Uint8Array(f.bytes);
+            const queue = []; // framed ArrayBuffers, in seq order
+            const sender = createSender({
+              meta: { id: f.id, name: f.name, size: data.byteLength, mime: f.mime },
+              data,
+              send: (m) => peer.sendControl(m),
+              // Buffer frames instead of sending immediately so we control the
+              // interleave order below.
+              sendChunk: (buf) => {
+                queue.push(buf);
+              },
+            });
+            peer.onControl((m) => {
+              if (m.t === 'file-accept' && m.id === f.id) sender.accept();
+              if ((m.t === 'file-reject' || m.t === 'file-error') && m.id === f.id) {
+                sender.abort(m.t);
+              }
+            });
+            return { sender, queue, started: false };
+          });
+
+          // Kick all senders: each emits its offer, awaits accept, then drains its
+          // chunks into its own queue and finally sends file-complete (control).
+          const startPromises = senders.map((s) => s.sender.start());
+
+          // Interleave the buffered chunks round-robin across senders, draining the
+          // shared file channel between sends, until every queue is empty AND every
+          // sender.start() has resolved (so file-complete has gone out for each).
+          let allStarted = false;
+          Promise.all(startPromises).then(() => {
+            allStarted = true;
+          });
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          for (;;) {
+            let sentAny = false;
+            for (const s of senders) {
+              if (s.queue.length > 0) {
+                await peer.drainFile();
+                await peer.sendFileChunk(s.queue.shift());
+                sentAny = true;
+              }
+            }
+            const drained = senders.every((s) => s.queue.length === 0);
+            if (drained && allStarted) break;
+            if (!sentAny) await sleep(1); // wait for accept / next chunk to enqueue
+          }
+          await Promise.all(startPromises);
           return true;
         },
         // --- Inbound files (host -> viewer). ---
@@ -262,13 +325,15 @@
             break;
           case 'file-offer': {
             const meta = { id: m.id, name: m.name, size: m.size, mime: m.mime };
+            const receiver = createReceiver({ meta });
             inboundTransfers.set(m.id, {
-              receiver: createReceiver({ meta }),
+              receiver,
               meta,
               size: m.size,
               completed: false,
               done: false,
             });
+            inboundRouter.register(m.id, receiver);
             // Auto-accept: release the host's chunk stream.
             peer.sendControl({ t: 'file-accept', id: m.id });
             break;
@@ -284,22 +349,20 @@
           case 'file-error':
           case 'file-reject':
             inboundTransfers.delete(m.id);
+            inboundRouter.unregister(m.id);
             break;
           default:
             break;
         }
       });
 
-      // Route inbound binary file chunks to the active (last not-done) transfer,
-      // then re-check completion in case the final chunk lands after file-complete.
+      // Route each inbound binary chunk to its receiver by the embedded transfer
+      // id, then re-check completion of that exact transfer in case its final
+      // chunk lands after file-complete. Concurrent transfers stay separate.
       peer.onFileChunk((buf) => {
-        let activeId = null;
-        for (const [id, t] of inboundTransfers) {
-          if (!t.done) activeId = id;
-        }
-        if (activeId === null) return;
-        inboundTransfers.get(activeId).receiver.push(buf);
-        maybeFinishInbound(activeId);
+        const receiver = inboundRouter.handleChunk(buf);
+        if (!receiver) return; // unknown id (e.g. already finalized) — dropped
+        maybeFinishInbound(receiver.meta.id);
       });
 
       (async () => {

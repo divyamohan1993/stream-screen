@@ -172,7 +172,11 @@ TXT records. **Discovery is truthful: it advertises the codes of ACTUAL live hos
 rooms, never a placeholder minted at startup with no host behind it.** The server
 re-syncs the advertised set from `SignalingServer.listSessions()` whenever a host
 joins (room becomes live ⇒ publish that code) or leaves (room reaped ⇒ withdraw
-it), via a `sessions-changed` event; multiple concurrent hosts each get their own
+it), via a `sessions-changed` event. `listSessions()` only counts rooms with a
+currently-live host, and when a host disconnects its room is reaped immediately
+(any lingering viewers get `host-disconnected` and are dropped) — so a hostless
+room never lingers to feed a dead code to discovery or `/api/sessions`. Multiple
+concurrent hosts each get their own
 advertisement, and only valid 6–9 digit codes are published. The Electron host
 makes this work end-to-end: it connects to the signaling server (LAN-local by
 default) and joins a room with a stable code (`STREAMSCREEN_CODE` or generated),
@@ -325,10 +329,14 @@ flowchart LR
   frame.
 - **File transfer.** `FileTransferManager` (`core/src/file-transfer.ts`) is a
   pure, DOM-free chunker/reassembler. The sender emits `file-offer`, awaits
-  `file-accept`, streams 16 KiB chunks each prefixed with an 8-byte
-  `seq`+`payloadLen` header over the binary `file` channel, then `file-complete`.
-  The receiver reassembles deterministically (the header lets it detect
-  out-of-order delivery defensively) and reports `file-progress`; the Windows host
+  `file-accept`, streams 16 KiB chunks over the binary `file` channel, then
+  `file-complete`. Each chunk carries its **own transfer id** (a uint16
+  length-prefixed id ahead of the `seq`+`payloadLen` header), so several
+  concurrent transfers can share the single binary channel: the receiver routes
+  every frame to its transfer by id, which keeps overlapping transfers (the
+  viewer picker allows selecting multiple files) from corrupting one another. The
+  receiver reassembles deterministically (the seq lets it slot out-of-order
+  frames and detect gaps/duplicates) and reports `file-progress`; the Windows host
   persists received files via `host/src/file-save.ts`.
 - **Recording.** Purely viewer-side and local: a `MediaRecorder` over the
   incoming remote `MediaStream` yields a downloadable `.webm`. Nothing is uploaded
@@ -373,7 +381,12 @@ drives the MCP and REST surfaces, so they cannot drift. `list_hosts` is backed b
 the signaling server's **REST API over HTTP** (`GET /api/discover`, falling back
 to `/api/sessions`; the HTTP base is derived from the signaling WS URL or set via
 `STREAMSCREEN_SIGNALING_HTTP_URL`), since the WS server has no `hosts` request —
-so every code it returns maps to a live, joinable room. The node WebRTC
+so every code it returns maps to a live, joinable room. Returned codes are
+validated against the 6–9 digit pattern and any unusable one is dropped; in
+particular the `/api/sessions` fallback redacts codes (e.g. `****56`) for
+unauthenticated callers, so `list_hosts` presents `STREAMSCREEN_TOKEN` as a bearer
+token for un-redacted codes and drops any redacted code that `connect` would
+reject. The node WebRTC
 runtime and OCR engine are optional dynamic imports; when missing, the server and
 its schemas stay valid and only the affected calls return a clear error.
 Screenshots are produced by converting raw I420 frames to PNG with a
@@ -404,6 +417,14 @@ StreamScreen is **LAN-first** and trades WAN reach for simplicity and privacy.
 - **CORS.** The REST surfaces use permissive CORS deliberately, because they are
   intended to be reached from the LAN viewer/automation on other origins. Run the
   signaling and AI servers on trusted networks.
+- **WS Origin policy.** The signaling WebSocket handshake checks the browser
+  `Origin`. Non-browser clients (no Origin) and an explicit
+  `STREAMSCREEN_ALLOWED_ORIGINS` allowlist (or `*`) are honored first; otherwise
+  the default LAN/dev policy accepts Origins whose host is loopback, the same host
+  as the server (any port — so the Vite dev viewer on `:5173` reaches signaling on
+  `:8787`), or a private/link-local LAN address, and rejects foreign public
+  origins. This keeps the zero-config and documented dev-viewer flows working
+  without configuration while blocking cross-site public pages.
 - **Threat model & limits.** The code gates *access*, but a short numeric code is
   not a substitute for network-level isolation on hostile networks. There is no
   built-in authentication beyond the code and no audit log. For untrusted
@@ -429,7 +450,8 @@ is enforced in code, not just by default config:
 - **No bitrate cap.** The only ceiling is the caller-supplied `maxKbps` (default
   40 Mbps) and what the physical link sustains — the adaptive engine raises
   quality whenever the link allows.
-- **Rooms disappear only when empty.** A room is reaped after the last socket
+- **Rooms disappear only when the host leaves or the room empties.** A room is
+  reaped once the host disconnects (it is no longer joinable) or the last socket
   leaves — this is cleanup, not a timeout.
 - **Every feature is unmetered.** Audio, file transfer, multi-monitor switching,
   session recording, chat, and special key combos all run for the full life of

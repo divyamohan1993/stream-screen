@@ -25,6 +25,7 @@
         AdaptiveController,
         createReceiver,
         createSender,
+        ReceiverRouter,
       } from './core.bundle.js';
 
       const params = new URLSearchParams(location.search);
@@ -169,7 +170,12 @@
       // `file-complete` can race ahead of the trailing binary chunks on the
       // separate `file` channel, so we only finalize once every offered byte has
       // arrived (whether that happens on the last chunk or on file-complete).
-      const transfers = new Map(); // id -> { receiver, size, completed, done }
+      //
+      // Inbound binary frames are demultiplexed by their EMBEDDED transfer id via
+      // a ReceiverRouter, so several concurrent transfers can interleave their
+      // chunks over the single `file` channel without cross-contamination.
+      const transfers = new Map(); // id -> { receiver, meta, size, completed, done }
+      const router = new ReceiverRouter();
 
       function recordFile(receiver, meta) {
         const data = receiver.finish();
@@ -190,6 +196,7 @@
           t.done = true;
           recordFile(t.receiver, t.meta);
           transfers.delete(id);
+          router.unregister(id);
         }
       }
 
@@ -223,13 +230,16 @@
         switch (m.t) {
           case 'file-offer': {
             const meta = { id: m.id, name: m.name, size: m.size, mime: m.mime };
+            const receiver = createReceiver({ meta });
             transfers.set(m.id, {
-              receiver: createReceiver({ meta }),
+              receiver,
               meta,
               size: m.size,
               completed: false,
               done: false,
             });
+            // Register with the router so its embedded-id frames get demuxed here.
+            router.register(m.id, receiver);
             // Auto-accept: release the sender's chunk stream.
             peer.sendControl({ t: 'file-accept', id: m.id });
             break;
@@ -245,6 +255,7 @@
           case 'file-error':
           case 'file-reject':
             transfers.delete(m.id);
+            router.unregister(m.id);
             break;
           case 'chat':
             state.chats.push(m);
@@ -287,18 +298,14 @@
         }
       });
 
-      // Route binary file chunks to the active transfer. Chunks carry only a
-      // sequence number (one transfer is in flight per direction at a time), so
-      // we feed the most recent not-yet-finalized receiver, then re-check
-      // completion in case the last chunk arrives after `file-complete`.
+      // Route each binary file chunk to its receiver by the transfer id embedded
+      // in the frame (ReceiverRouter demuxes), then re-check completion of that
+      // exact transfer in case its final chunk lands after `file-complete`.
+      // Interleaved chunks from concurrent transfers are kept fully separate.
       peer.onFileChunk((buf) => {
-        let activeId = null;
-        for (const [id, t] of transfers) {
-          if (!t.done) activeId = id; // last not-done wins
-        }
-        if (activeId === null) return;
-        transfers.get(activeId).receiver.push(buf);
-        maybeFinish(activeId);
+        const receiver = router.handleChunk(buf);
+        if (!receiver) return; // unknown id (e.g. already finalized) — dropped
+        maybeFinish(receiver.meta.id);
       });
 
       async function adaptiveTick() {

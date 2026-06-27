@@ -207,22 +207,29 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
    *      native `ws`). Always allowed — these trusted processes are the point.
    *   2. `allowAnyOrigin`    -> explicit allow-all opt-out (`allowedOrigins: ['*']`).
    *   3. Explicit allowlist  -> Origin must be an exact member.
-   *   4. Otherwise (no allowlist configured) -> allow ONLY same-origin: the
-   *      Origin host:port must equal the request `Host`. This keeps the
-   *      zero-config flow working (the viewer is served from the same host as
-   *      the signaling server) while still rejecting cross-site pages.
+   *   4. Otherwise (no allowlist configured) -> the DEFAULT LAN/dev policy:
+   *      accept Origins that are plausibly a legitimate local viewer and reject
+   *      clearly foreign public ones. Concretely an Origin is accepted when its
+   *      host is loopback (localhost / 127.0.0.0/8 / ::1), is the SAME host as
+   *      the request `Host` (the viewer served from the signaling host, on ANY
+   *      port — e.g. Vite :5173 talking to signaling :8787), or is a private /
+   *      link-local LAN IP (10/8, 172.16-31, 192.168, 169.254, fc00::/7,
+   *      fe80::/10). Port is ignored throughout. A foreign public Origin
+   *      (https://evil.example) matches none of these and is rejected, so the
+   *      zero-config + documented dev-viewer flows work without
+   *      STREAMSCREEN_ALLOWED_ORIGINS while cross-site public pages stay out.
    */
   private verifyOrigin(origin: string | undefined, req: IncomingMessage): boolean {
     // 1. Non-browser client.
     if (!origin) return true;
     // 2. Explicit allow-all.
     if (this.allowAnyOrigin) return true;
-    // 3. Explicit allowlist (when one was configured).
+    // 3. Explicit allowlist (when one was configured) takes precedence.
     if (this.allowedOrigins && this.allowedOrigins.size > 0) {
       return this.allowedOrigins.has(origin);
     }
-    // 4. Default: same-origin only.
-    return isSameOrigin(origin, req.headers.host);
+    // 4. Default LAN/dev policy.
+    return isLanOrDevOrigin(origin, req.headers.host);
   }
 
   /** The bound port (useful when constructed with `port: 0`). */
@@ -232,10 +239,17 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
     return 0;
   }
 
-  /** Snapshot of all active sessions, for the REST `/api/sessions` endpoint. */
+  /**
+   * Snapshot of all active sessions, for the REST `/api/sessions` endpoint and
+   * the `sessions-changed` payload. Only rooms with a CURRENTLY-LIVE host are
+   * returned: a hostless room (host disconnected, viewers lingering) is NOT a
+   * joinable session, so surfacing it would feed a dead code to mDNS discovery
+   * and REST while a new viewer joining that code gets `no-such-session`.
+   */
   listSessions(): SessionInfo[] {
     const out: SessionInfo[] = [];
     for (const room of this.rooms.values()) {
+      if (!this.hasHost(room)) continue;
       out.push({
         code: room.code,
         hostName: room.hostName,
@@ -553,9 +567,30 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
       });
     }
 
-    // Reap empty rooms so `listSessions` reflects reality. NOTE: this is NOT a
-    // session timeout — the room only disappears once every socket has left.
-    const reaped = room.peers.size === 0;
+    // HOST DEPARTURE REAPS THE ROOM. When the host leaves, the room is no longer
+    // joinable: there is nobody to negotiate WebRTC with, the code is dead, and
+    // leaving the room around would let `listSessions()` advertise a code that a
+    // new viewer cannot actually join (it'd get `no-such-session`). So when the
+    // host goes, explicitly notify every remaining viewer that the host
+    // disconnected, disconnect them, and delete the room. (A viewer leaving a
+    // still-hosted room is the ordinary case and leaves the room intact.)
+    let reaped = room.peers.size === 0;
+    if (peer.role === 'host' && !reaped) {
+      for (const other of room.peers.values()) {
+        this.sendError(other.socket, 'host-disconnected');
+        try {
+          other.socket.close();
+        } catch {
+          /* already closing */
+        }
+      }
+      room.peers.clear();
+      reaped = true;
+    }
+
+    // Reap empty / hostless rooms so `listSessions` reflects reality. NOTE: this
+    // is NOT a session timeout — the room only disappears once the host leaves or
+    // every socket has closed.
     if (reaped) this.rooms.delete(room.code);
 
     // The set of live host sessions changes when a host leaves (the room is no
@@ -640,22 +675,82 @@ function remoteAddress(req: IncomingMessage): string {
 }
 
 /**
- * Is the browser-supplied `Origin` the same origin as the server the request
- * was sent to? Compares only host:port (the `Host` header), which is what
- * matters for "did this page come from the same place it's connecting to". The
- * scheme is intentionally ignored (ws:// vs http://, and http vs https behind a
- * terminator are common and benign on a LAN). Returns false if either side is
- * unparseable, so the default policy fails closed.
+ * DEFAULT (no-allowlist) Origin policy for the WS handshake. Decide whether a
+ * browser-supplied `Origin` is a plausibly-legitimate LAN/dev viewer rather than
+ * a foreign public page mounting a cross-site WebSocket.
+ *
+ * Accept when the Origin's HOSTNAME (port ignored throughout) is:
+ *   - loopback: `localhost`, `127.0.0.0/8`, or `::1`; OR
+ *   - the SAME hostname as the request `Host` header (the viewer served from the
+ *     signaling host itself — possibly on a different port, e.g. Vite :5173
+ *     connecting to signaling :8787); OR
+ *   - a private / link-local LAN address: 10/8, 172.16–31/12, 192.168/16,
+ *     169.254/16, or IPv6 ULA/link-local (fc00::/7, fe80::/10).
+ *
+ * Everything else (a public hostname / public IP) is rejected. Returns false if
+ * the Origin is unparseable, so the default policy fails closed.
  */
-function isSameOrigin(origin: string, host: string | undefined): boolean {
-  if (!host) return false;
+function isLanOrDevOrigin(origin: string, host: string | undefined): boolean {
   let originHost: string;
   try {
-    originHost = new URL(origin).host;
+    originHost = new URL(origin).hostname;
   } catch {
     return false;
   }
-  return originHost === host;
+  if (!originHost) return false;
+
+  // Same host as the server (any port) — covers the served viewer and the Vite
+  // dev viewer (:5173) pointing at the signaling port.
+  const serverHost = hostnameOf(host);
+  if (serverHost && originHost.toLowerCase() === serverHost.toLowerCase()) return true;
+
+  if (isLoopbackHost(originHost)) return true;
+  if (isPrivateLanHost(originHost)) return true;
+
+  return false;
+}
+
+/** Extract the bare hostname (no port, IPv6 brackets stripped) from a `Host` header. */
+function hostnameOf(host: string | undefined): string | undefined {
+  if (!host) return undefined;
+  try {
+    // URL parsing normalises bracketed IPv6 and strips the port for us.
+    return new URL(`http://${host}`).hostname || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Loopback hostnames: `localhost`, 127.0.0.0/8, and IPv6 `::1`. */
+function isLoopbackHost(h: string): boolean {
+  const host = h.toLowerCase();
+  if (host === 'localhost') return true;
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  return false;
+}
+
+/**
+ * Private / link-local LAN addresses (RFC 1918 + RFC 3927 + IPv6 ULA/link-local).
+ * IPv6 may arrive zone-id-suffixed (`fe80::1%eth0`); strip that before matching.
+ */
+function isPrivateLanHost(h: string): boolean {
+  const host = h.toLowerCase().split('%')[0]!;
+  // IPv4 RFC 1918 + link-local 169.254/16.
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    if (a === 10) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true;
+    return false;
+  }
+  // IPv6 ULA fc00::/7 (fc.. / fd..) and link-local fe80::/10 (fe8/fe9/fea/feb).
+  if (/^f[cd][0-9a-f]*:/.test(host)) return true;
+  if (/^fe[89ab][0-9a-f]*:/.test(host)) return true;
+  return false;
 }
 
 function parseMessage(data: RawData): SignalMessage | undefined {

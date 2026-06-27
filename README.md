@@ -205,6 +205,10 @@ single port (default `8787`). It advertises **live host rooms** over mDNS: a cod
 is advertised only once a real host has joined that room (re-synced from
 `server.listSessions()` whenever a host joins or leaves), so every discovered
 code maps to a joinable session rather than a placeholder minted at startup.
+`listSessions()` (and `/api/sessions`) only return rooms with a currently-live
+host: when the host disconnects the room is **reaped** (remaining viewers are
+notified with `host-disconnected` and dropped), so a dead code is never surfaced
+to mDNS or REST for a viewer to fail joining.
 
 ```bash
 npm run dev:signaling                 # tsx, hot dev
@@ -236,10 +240,16 @@ STREAMSCREEN_SIGNALING_URL=ws://<server-ip>:8787 npm -w @stream-screen/host star
 ```
 
 - `build` compiles TypeScript to `dist/` (entrypoint `dist/main.js`, per the
-  package `main`) **and** copies the renderer's static assets
+  package `main`), copies the renderer's static assets
   (`src/renderer/index.html` + CSS/images) into `dist/renderer/` via
-  `scripts/copy-assets.mjs` — `tsc` only emits JS, so without this the packaged
-  control window would open blank.
+  `scripts/copy-assets.mjs`, **and bundles the renderer + preload with esbuild**
+  (`scripts/bundle.mjs`). `tsc` alone emits raw module JS that the packaged
+  control window cannot run: the renderer loads as a `<script type=module>` over
+  `file://` (so bare specifiers like `@stream-screen/core` won't resolve) and the
+  preload runs in a sandboxed CommonJS context (so an ESM preload throws). The
+  bundle step rewrites the renderer to a self-contained browser ESM (all deps
+  inlined) and the preload to CommonJS (only `electron` left external), so the
+  control window actually loads instead of opening blank.
 - The host **mints a 6–9 digit session code** on launch (or honors
   `STREAMSCREEN_CODE`), connects to the signaling server (LAN-local by default),
   and **joins a room with that code** so the session becomes live and is
@@ -264,7 +274,13 @@ npm -w @stream-screen/viewer run preview
 ```
 
 The viewer derives its signaling WebSocket URL from the page host on port `8787`
-(override the REST proxy with `VITE_SIGNALING_HTTP`). It renders the remote
+(override the REST proxy with `VITE_SIGNALING_HTTP`). By default — with no
+`STREAMSCREEN_ALLOWED_ORIGINS` configured — the signaling server accepts WS
+handshakes whose browser `Origin` is loopback, the same host as the server (on
+**any** port, so the Vite dev viewer on `:5173` reaches signaling on `:8787`), or
+a private/link-local LAN address, while rejecting foreign public origins; set
+`STREAMSCREEN_ALLOWED_ORIGINS` to an exact allowlist (or `*`) to override. It
+renders the remote
 screen, captures mouse/keyboard (with resolution-independent coordinates,
 pointer lock, fullscreen, clipboard sync), and shows a **live adaptive-stats
 dashboard** (RTT, loss, jitter, fps, resolution, current bitrate decision).
@@ -291,10 +307,14 @@ file-transfer signaling) and a reliable binary `file` channel (the file bytes).
   host) to send it across. The sender emits a `file-offer` on the `control`
   channel; the peer auto-accepts with `file-accept`; the bytes stream as 16 KiB
   self-framed chunks over the reliable binary `file` channel; a final
-  `file-complete` closes it. The receiver reassembles deterministically (each
-  chunk carries an 8-byte `seq`+`len` header) and verifies length; progress is
-  surfaced via `file-progress`. On the Windows host, received files are written
-  to disk (`host/src/file-save.ts`).
+  `file-complete` closes it. Each binary chunk embeds its **own transfer id**
+  (a uint16-length-prefixed id ahead of the `seq`+`len` header), so several
+  concurrent transfers can share the single `file` channel — every frame is
+  routed to its transfer by id, so picking multiple files (offers overlapping in
+  flight) never cross-contaminates the streams. The receiver reassembles
+  deterministically and verifies length; progress is surfaced via
+  `file-progress`. On the Windows host, received files are written to disk
+  (`host/src/file-save.ts`).
 
 - **Multi-monitor switching at runtime.** The host enumerates its displays
   (`MonitorInfo`: id, name, primary, width, height). The viewer requests the list
@@ -376,7 +396,12 @@ Both drive a single `RemoteDesktopSession`, which connects as a **viewer** via t
 core `Peer`. `list_hosts` queries the signaling server's REST API over HTTP
 (`GET /api/discover`, falling back to `/api/sessions`) — the HTTP base URL is
 derived from the signaling WS URL or set via `STREAMSCREEN_SIGNALING_HTTP_URL` —
-so every returned code maps to a live, joinable host room. A node WebRTC runtime
+so every returned code maps to a live, joinable host room. Codes are validated
+against the 6–9 digit pattern and any unusable one is dropped, so `list_hosts`
+never surfaces a code `connect` would reject; in particular the `/api/sessions`
+fallback **redacts** codes (e.g. `****56`) for unauthenticated callers, so set
+`STREAMSCREEN_TOKEN` (sent as a bearer token) to obtain un-redacted, joinable
+codes from that fallback. A node WebRTC runtime
 (`@roamhq/wrtc`) and OCR (`tesseract.js`) are
 **optional**: without them the server, tool list, and schemas stay fully valid and
 the affected calls return a clear "requires native webrtc runtime" / "OCR
@@ -540,6 +565,8 @@ Per-package tests can also be run directly, e.g.
 | `STREAMSCREEN_HOST_NAME` | signaling, host | machine hostname | advertised name |
 | `STREAMSCREEN_SIGNALING_URL` | host, ai | `ws://127.0.0.1:8787` | signaling WS URL |
 | `STREAMSCREEN_SIGNALING_HTTP_URL` | ai | derived from WS URL | signaling REST base for `list_hosts` |
+| `STREAMSCREEN_TOKEN` | ai | – | bearer token for `/api/sessions` to get un-redacted codes |
+| `STREAMSCREEN_ALLOWED_ORIGINS` | signaling | – | comma-separated WS Origin allowlist (or `*`); default accepts loopback/LAN/same-host |
 | `STREAMSCREEN_CODE` | host | minted | fixed session code |
 | `STREAMSCREEN_AI_MODE` | ai | `mcp` | `rest` to run the REST API |
 | `STREAMSCREEN_AI_PORT` | ai | `8788` | REST port |

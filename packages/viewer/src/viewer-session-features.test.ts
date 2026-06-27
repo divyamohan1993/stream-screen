@@ -234,7 +234,7 @@ describe('ViewerSession file transfer (send/offer state machine)', () => {
 
     // Build a framed chunk via the real core encoder and feed it as a binary chunk.
     const { frameChunk } = await import('@stream-screen/core');
-    peer.chunkCb!(frameChunk(0, payload));
+    peer.chunkCb!(frameChunk('in1', 0, payload));
     peer.controlCb!({ t: 'file-complete', id: 'in1' });
 
     expect(ready).toEqual({ name: 'down.bin', bytes: 5 });

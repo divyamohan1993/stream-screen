@@ -12,9 +12,21 @@
  * only dist/**) was BLANK. The fix adds scripts/copy-assets.mjs and chains it
  * after tsc in the build script.
  *
+ * Finding 3 (NEW): copying assets is not enough — `tsc` still shipped RAW module
+ * JS. dist/renderer/renderer.js (loaded as a `<script type=module>` over file://
+ * with nodeIntegration:false) transitively imported the BARE specifier
+ * '@stream-screen/core' (via ../host-session.js), which a browser cannot resolve
+ * from file://; and dist/preload.js started with ESM `import` while the window
+ * uses sandbox:true, where the preload must be CommonJS. Either way the packaged
+ * control window could not start the session. The fix BUNDLES both with esbuild:
+ * the renderer to a browser ES module with every dep INLINED (no bare
+ * '@stream-screen/...' specifier survives), and the preload to a sandbox-safe
+ * CJS module with only 'electron' external.
+ *
  * These assertions are derived purely from tsconfig + package.json (no Electron),
- * plus an end-to-end check that `npm run build` materializes both dist/main.js
- * and dist/renderer/index.html. They fail before the fix and pass after.
+ * plus an end-to-end check that `npm run build` materializes dist/main.js,
+ * dist/renderer/index.html, a CJS preload, and a fully-inlined renderer. They
+ * fail before the fix and pass after.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -63,6 +75,25 @@ describe('host build output consistency (P1 regression)', () => {
     expect(scripts.build).toContain('copy-assets.mjs');
   });
 
+  it('bundles the renderer + preload after tsc (Finding 3)', () => {
+    const scripts = pkg.scripts as Record<string, string>;
+    expect(scripts.build).toContain('bundle.mjs');
+    // esbuild is the bundler and must be declared so CI installs it.
+    const dev = (pkg.devDependencies ?? {}) as Record<string, string>;
+    expect(dev.esbuild, 'esbuild must be a devDependency').toBeTruthy();
+  });
+
+  it('ships a bundle script that produces a CJS preload and a browser renderer', () => {
+    const scriptPath = join(pkgRoot, 'scripts', 'bundle.mjs');
+    expect(existsSync(scriptPath)).toBe(true);
+    const src = readFileSync(scriptPath, 'utf8');
+    expect(src).toContain('esbuild');
+    // Preload is CJS with only electron external; renderer is a browser bundle.
+    expect(src).toContain("format: 'cjs'");
+    expect(src).toContain("external: ['electron']");
+    expect(src).toContain("platform: 'browser'");
+  });
+
   it('ships a copy-assets script that targets the renderer index.html', () => {
     const scriptPath = join(pkgRoot, 'scripts', 'copy-assets.mjs');
     expect(existsSync(scriptPath)).toBe(true);
@@ -83,5 +114,43 @@ describe('host build output consistency (P1 regression)', () => {
     expect(existsSync(join(pkgRoot, 'dist', 'renderer', 'index.html'))).toBe(true);
     expect(existsSync(join(pkgRoot, 'dist', 'preload.js'))).toBe(true);
     expect(existsSync(join(pkgRoot, 'dist', 'renderer', 'renderer.js'))).toBe(true);
+  }, 120_000);
+
+  it('produces a bundled renderer with NO unresolved bare workspace import', () => {
+    execFileSync('npm', ['run', 'build'], {
+      cwd: pkgRoot,
+      stdio: 'pipe',
+      env: { ...process.env, ELECTRON_SKIP_BINARY_DOWNLOAD: '1' },
+    });
+    const rendererPath = join(pkgRoot, 'dist', 'renderer', 'renderer.js');
+    expect(existsSync(rendererPath)).toBe(true);
+    const renderer = readFileSync(rendererPath, 'utf8');
+    // The crux of Finding 3: a browser file:// loader cannot resolve bare
+    // specifiers. After bundling, NONE of the workspace deps remain bare —
+    // they are inlined into the bundle.
+    expect(renderer).not.toMatch(/from\s+["']@stream-screen\//);
+    expect(renderer).not.toMatch(/require\(\s*["']@stream-screen\//);
+    // Relative imports of sibling tsc output must also be gone (inlined), since
+    // ../host-session.js is what dragged in the bare core import.
+    expect(renderer).not.toMatch(/from\s+["']\.\.\/host-session/);
+  }, 120_000);
+
+  it('produces a sandbox-safe CJS preload with deps inlined (only electron external)', () => {
+    execFileSync('npm', ['run', 'build'], {
+      cwd: pkgRoot,
+      stdio: 'pipe',
+      env: { ...process.env, ELECTRON_SKIP_BINARY_DOWNLOAD: '1' },
+    });
+    const preloadPath = join(pkgRoot, 'dist', 'preload.js');
+    expect(existsSync(preloadPath)).toBe(true);
+    const preload = readFileSync(preloadPath, 'utf8');
+    // CJS, not ESM: a sandboxed preload cannot start with bare `import` and must
+    // be loadable as CommonJS (uses module.exports / require).
+    expect(preload).not.toMatch(/^\s*import\s/m);
+    expect(preload).toMatch(/module\.exports|exports\./);
+    // Only 'electron' may stay external (sandboxed preloads may require it);
+    // workspace deps must be inlined, never required bare.
+    expect(preload).not.toMatch(/require\(\s*["']@stream-screen\//);
+    expect(preload).toMatch(/require\(\s*["']electron["']\s*\)/);
   }, 120_000);
 });

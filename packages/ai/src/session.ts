@@ -79,6 +79,15 @@ export interface SessionOptions {
   rtcPeerConnection?: typeof RTCPeerConnection;
   /** Name this viewer advertises to the host. */
   viewerName?: string;
+  /**
+   * Bearer token for the signaling REST API. When set, it is presented to
+   * `/api/sessions` so that endpoint returns UN-REDACTED session codes (the REST
+   * server masks codes by default for unauthenticated callers). Without it, the
+   * `/api/sessions` fallback only yields redacted codes like `****56`, which are
+   * not joinable — {@link RemoteDesktopSession.listHosts} drops those. Defaults
+   * to `STREAMSCREEN_TOKEN`.
+   */
+  token?: string;
 }
 
 /** A captured frame: raw encoded image bytes plus its declared MIME type. */
@@ -172,6 +181,7 @@ export class RemoteDesktopSession {
   private readonly opts: SessionOptions;
   private readonly signalingUrl: string;
   private readonly signalingHttpUrl: string;
+  private readonly token: string | undefined;
 
   private signaling: SignalingClient | null = null;
   private peer: SessionPeer | null = null;
@@ -196,6 +206,7 @@ export class RemoteDesktopSession {
       opts.signalingHttpUrl ??
       process.env.STREAMSCREEN_SIGNALING_HTTP_URL ??
       deriveSignalingHttpUrl(this.signalingUrl);
+    this.token = opts.token ?? process.env.STREAMSCREEN_TOKEN ?? undefined;
     this.rtcCtor = opts.rtcPeerConnection ?? null;
   }
 
@@ -227,10 +238,16 @@ export class RemoteDesktopSession {
    * body, or timeout). Never throws.
    */
   async listHosts(timeoutMs = 1500): Promise<HostEntry[]> {
-    // Prefer discovered LAN hosts; fall back to this server's live sessions.
+    // Prefer discovered LAN hosts (`/api/discover` returns full codes). It is an
+    // open endpoint, so no token is needed.
     const discovered = await this.fetchHosts('/api/discover', timeoutMs);
     if (discovered.length > 0) return discovered;
-    return this.fetchHosts('/api/sessions', timeoutMs);
+    // Fall back to this server's live sessions. The REST server REDACTS codes
+    // (e.g. `****56`) for unauthenticated callers, so present the configured
+    // bearer token to obtain UN-REDACTED, joinable codes. Without a token any
+    // redacted/invalid code is dropped by `toHostEntry`, so the fallback only
+    // ever returns USABLE host codes.
+    return this.fetchHosts('/api/sessions', timeoutMs, this.token);
   }
 
   /**
@@ -238,14 +255,21 @@ export class RemoteDesktopSession {
    * normalize it to {@link HostEntry}[]. Resolves to `[]` on any failure so the
    * tool/REST surface degrades gracefully rather than hanging or throwing.
    */
-  private async fetchHosts(pathName: string, timeoutMs: number): Promise<HostEntry[]> {
+  private async fetchHosts(
+    pathName: string,
+    timeoutMs: number,
+    token?: string,
+  ): Promise<HostEntry[]> {
     const url = `${this.signalingHttpUrl}${pathName}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const headers: Record<string, string> = { accept: 'application/json' };
+    // Present the bearer token so the REST server returns un-redacted codes.
+    if (token) headers.authorization = `Bearer ${token}`;
     try {
       const res = await fetch(url, {
         method: 'GET',
-        headers: { accept: 'application/json' },
+        headers,
         signal: controller.signal,
       });
       if (!res.ok) return [];
@@ -262,10 +286,18 @@ export class RemoteDesktopSession {
     }
   }
 
-  /** Normalize a REST host record to a {@link HostEntry}, or `null` if unusable. */
+  /**
+   * Normalize a REST host record to a {@link HostEntry}, or `null` if unusable.
+   *
+   * A code is only USABLE if `connect` would accept it, so we drop any code that
+   * fails {@link isValidSessionCode}. This includes the REDACTED codes the REST
+   * server returns to unauthenticated callers on `/api/sessions` (e.g. `****56`),
+   * which contain `*` and therefore never match the 6–9 digit pattern. The result
+   * is that list_hosts never surfaces a code that `connect` would reject.
+   */
   private toHostEntry(h: RestHost): HostEntry | null {
     const code = typeof h.code === 'string' ? h.code : undefined;
-    if (!code) return null;
+    if (!code || !isValidSessionCode(code)) return null;
     const name =
       (typeof h.name === 'string' && h.name) ||
       (typeof h.hostName === 'string' && h.hostName) ||

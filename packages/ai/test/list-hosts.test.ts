@@ -9,6 +9,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isValidSessionCode } from '@stream-screen/core';
 import { RemoteDesktopSession, deriveSignalingHttpUrl } from '../src/session.js';
 import { dispatchTool } from '../src/mcp-server.js';
 
@@ -132,6 +133,98 @@ describe('RemoteDesktopSession.listHosts (REST-backed)', () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse([], false)));
     const session = new RemoteDesktopSession({ signalingUrl: 'ws://127.0.0.1:8787' });
     await expect(session.listHosts()).resolves.toEqual([]);
+  });
+
+  it('DROPS a redacted /api/sessions code when no token is configured (P2)', async () => {
+    // mDNS discovery is empty/unavailable, so list_hosts falls back to
+    // /api/sessions. The REST server redacts codes for unauthenticated callers
+    // (e.g. "****56"). Such a code fails isValidSessionCode and would be rejected
+    // by connect(), so list_hosts must NOT return it.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/discover')) return jsonResponse([]);
+      if (url.endsWith('/api/sessions')) {
+        return jsonResponse([{ code: '****56', hostName: 'redacted-host', viewers: 1, createdAt: 9 }]);
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const session = new RemoteDesktopSession({ signalingUrl: 'ws://127.0.0.1:8787' });
+    const hosts = await session.listHosts();
+
+    // The redacted, unusable code is dropped — no unusable codes returned.
+    expect(hosts).toEqual([]);
+    // Unauthenticated fallback request carried no Authorization header.
+    const sessionsCall = fetchMock.mock.calls.find((c) =>
+      String(c[0]).endsWith('/api/sessions'),
+    );
+    expect(sessionsCall).toBeDefined();
+    const sentHeaders = (sessionsCall?.[1] as RequestInit | undefined)?.headers as
+      | Record<string, string>
+      | undefined;
+    expect(sentHeaders?.authorization).toBeUndefined();
+  });
+
+  it('passes the bearer token to /api/sessions and returns the UNREDACTED code (P2)', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/discover')) return jsonResponse([]);
+      if (url.endsWith('/api/sessions')) {
+        // An authorized caller receives the full, joinable code.
+        return jsonResponse([{ code: '778856', hostName: 'desk', viewers: 1, createdAt: 9 }]);
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const session = new RemoteDesktopSession({
+      signalingUrl: 'ws://127.0.0.1:8787',
+      token: 's3cret',
+    });
+    const hosts = await session.listHosts();
+
+    expect(hosts).toEqual([{ code: '778856', name: 'desk' }]);
+    expect(isValidSessionCode(hosts[0]!.code)).toBe(true);
+
+    // The token was presented as a bearer header on the /api/sessions request.
+    const sessionsCall = fetchMock.mock.calls.find((c) =>
+      String(c[0]).endsWith('/api/sessions'),
+    );
+    const sentHeaders = (sessionsCall?.[1] as RequestInit | undefined)?.headers as
+      | Record<string, string>
+      | undefined;
+    expect(sentHeaders?.authorization).toBe('Bearer s3cret');
+  });
+
+  it('returns a valid /api/discover host as-is (full LAN code, no token needed) (P2)', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/discover')) {
+        return jsonResponse([{ code: '654321', hostName: 'lan-pc', viewers: 0, createdAt: 1 }]);
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const session = new RemoteDesktopSession({ signalingUrl: 'ws://127.0.0.1:8787' });
+    const hosts = await session.listHosts();
+
+    expect(hosts).toEqual([{ code: '654321', name: 'lan-pc' }]);
+    expect(isValidSessionCode(hosts[0]!.code)).toBe(true);
+    // /api/discover is open: no Authorization header is sent.
+    const discoverCall = fetchMock.mock.calls.find((c) =>
+      String(c[0]).endsWith('/api/discover'),
+    );
+    const sentHeaders = (discoverCall?.[1] as RequestInit | undefined)?.headers as
+      | Record<string, string>
+      | undefined;
+    expect(sentHeaders?.authorization).toBeUndefined();
+    // Never falls through to /api/sessions when discover has usable results.
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      'http://127.0.0.1:8787/api/sessions',
+      expect.anything(),
+    );
   });
 
   it('list_hosts MCP tool surfaces the REST hosts as JSON', async () => {

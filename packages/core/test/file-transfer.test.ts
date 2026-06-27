@@ -5,9 +5,11 @@ import {
   frameChunk,
   createSender,
   createReceiver,
+  ReceiverRouter,
   FileTransferManager,
   DEFAULT_CHUNK_SIZE,
   CHUNK_HEADER_BYTES,
+  CHUNK_ID_LEN_BYTES,
 } from '../src/file-transfer.js';
 import type { ControlMessage } from '../src/protocol.js';
 import type { FileMeta } from '../src/file-transfer.js';
@@ -35,14 +37,16 @@ describe('chunkBuffer / parseChunk framing', () => {
   it('round-trips arbitrary sizes incl. 0, 1, exact multiples', () => {
     for (const size of SIZES) {
       const data = bytes(size);
-      const chunks = chunkBuffer(data);
+      const chunks = chunkBuffer('t', data);
       // reassemble
       const out = new Uint8Array(size);
       let off = 0;
       let expectedSeq = 0;
       for (const c of chunks) {
-        const { seq, payload } = parseChunk(c);
+        const { id, seq, len, payload } = parseChunk(c);
+        expect(id).toBe('t');
         expect(seq).toBe(expectedSeq++);
+        expect(len).toBe(payload.byteLength);
         out.set(payload, off);
         off += payload.byteLength;
       }
@@ -51,36 +55,47 @@ describe('chunkBuffer / parseChunk framing', () => {
     }
   });
 
+  it('embeds the transfer id in every frame', () => {
+    const chunks = chunkBuffer('abc-123', bytes(40000));
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) expect(parseChunk(c).id).toBe('abc-123');
+  });
+
   it('emits exactly one empty chunk for zero-length input', () => {
-    const chunks = chunkBuffer(new Uint8Array(0));
+    const chunks = chunkBuffer('t', new Uint8Array(0));
     expect(chunks).toHaveLength(1);
-    expect(chunks[0].byteLength).toBe(CHUNK_HEADER_BYTES);
+    // Header = id-len prefix + id bytes ('t' = 1 byte) + fixed header.
+    expect(chunks[0].byteLength).toBe(CHUNK_ID_LEN_BYTES + 1 + CHUNK_HEADER_BYTES);
     expect(parseChunk(chunks[0]).payload.byteLength).toBe(0);
   });
 
   it('chunk count matches ceil(size/chunkSize) for non-empty inputs', () => {
     const size = 40000;
-    const chunks = chunkBuffer(bytes(size));
+    const chunks = chunkBuffer('t', bytes(size));
     expect(chunks).toHaveLength(Math.ceil(size / DEFAULT_CHUNK_SIZE));
   });
 
   it('honors a custom chunk size and exact multiples', () => {
-    const chunks = chunkBuffer(bytes(40), 10);
+    const chunks = chunkBuffer('t', bytes(40), 10);
     expect(chunks).toHaveLength(4);
     for (const c of chunks) expect(parseChunk(c).payload.byteLength).toBe(10);
   });
 
   it('rejects a chunkSize <= 0', () => {
-    expect(() => chunkBuffer(bytes(10), 0)).toThrow();
+    expect(() => chunkBuffer('t', bytes(10), 0)).toThrow();
   });
 
   it('parseChunk detects truncation / corruption', () => {
-    const good = frameChunk(3, bytes(100));
+    const good = frameChunk('t', 3, bytes(100));
     // Truncate the payload: declared length no longer matches.
     const truncated = good.slice(0, good.byteLength - 5);
     expect(() => parseChunk(truncated)).toThrow();
-    // Frame shorter than the header.
-    expect(() => parseChunk(new ArrayBuffer(4))).toThrow();
+    // Frame shorter than the id-length prefix.
+    expect(() => parseChunk(new ArrayBuffer(1))).toThrow();
+    // Frame shorter than the full header (id-len says 4 but buffer is tiny).
+    const short = new ArrayBuffer(CHUNK_ID_LEN_BYTES);
+    new DataView(short).setUint16(0, 4, true);
+    expect(() => parseChunk(short)).toThrow();
   });
 });
 
@@ -93,7 +108,7 @@ describe('createReceiver reassembly', () => {
     for (const size of SIZES) {
       const data = bytes(size);
       const r = createReceiver({ meta: meta(size) });
-      for (const c of chunkBuffer(data)) r.push(c);
+      for (const c of chunkBuffer('x', data)) r.push(c);
       expect(eq(r.finish(), data)).toBe(true);
     }
   });
@@ -101,7 +116,7 @@ describe('createReceiver reassembly', () => {
   it('reassembles out-of-order chunks correctly', () => {
     const size = 40000;
     const data = bytes(size);
-    const chunks = chunkBuffer(data);
+    const chunks = chunkBuffer('x', data);
     const shuffled = [...chunks].reverse();
     const r = createReceiver({ meta: meta(size) });
     for (const c of shuffled) r.push(c);
@@ -113,7 +128,7 @@ describe('createReceiver reassembly', () => {
     const data = bytes(size);
     let got: Uint8Array | null = null;
     const r = createReceiver({ meta: meta(size), onComplete: (d) => (got = d) });
-    for (const c of chunkBuffer(data)) r.push(c);
+    for (const c of chunkBuffer('x', data)) r.push(c);
     r.finish();
     expect(got).not.toBeNull();
     expect(eq(got!, data)).toBe(true);
@@ -121,7 +136,7 @@ describe('createReceiver reassembly', () => {
 
   it('throws on duplicate chunk seq', () => {
     const data = bytes(40000);
-    const chunks = chunkBuffer(data);
+    const chunks = chunkBuffer('x', data);
     const r = createReceiver({ meta: meta(data.byteLength) });
     r.push(chunks[0]);
     expect(() => r.push(chunks[0])).toThrow(/duplicate/);
@@ -129,7 +144,7 @@ describe('createReceiver reassembly', () => {
 
   it('throws on a missing chunk (gap) at finish', () => {
     const data = bytes(40000);
-    const chunks = chunkBuffer(data);
+    const chunks = chunkBuffer('x', data);
     const r = createReceiver({ meta: meta(data.byteLength) });
     // Skip the middle chunk.
     r.push(chunks[0]);
@@ -140,8 +155,15 @@ describe('createReceiver reassembly', () => {
   it('throws when reassembled size != offered size', () => {
     const data = bytes(16384);
     const r = createReceiver({ meta: meta(99999) });
-    for (const c of chunkBuffer(data)) r.push(c);
+    for (const c of chunkBuffer('x', data)) r.push(c);
     expect(() => r.finish()).toThrow(/size/);
+  });
+
+  it('rejects a chunk framed for a different transfer id', () => {
+    const data = bytes(16384);
+    const r = createReceiver({ meta: meta(data.byteLength) }); // id 'x'
+    const foreign = chunkBuffer('y', data)[0];
+    expect(() => r.push(foreign)).toThrow(/id/);
   });
 });
 
@@ -201,7 +223,7 @@ describe('createSender + createReceiver end-to-end', () => {
     const done = sender.start();
     sender.accept();
     await done;
-    expect(drains).toBe(chunkBuffer(data).length);
+    expect(drains).toBe(chunkBuffer(meta.id, data).length);
     expect(eq(receiver.finish(), data)).toBe(true);
   });
 
@@ -233,7 +255,7 @@ describe('FileTransferManager', () => {
     expect(sent.some((m) => m.t === 'file-accept' && m.id === meta.id)).toBe(true);
     expect(mgr.has(meta.id)).toBe(true);
 
-    for (const c of chunkBuffer(data)) mgr.onChunk(c, meta.id);
+    for (const c of chunkBuffer(meta.id, data)) mgr.onChunk(c);
     mgr.onControl({ t: 'file-complete', id: meta.id });
 
     expect(delivered).not.toBeNull();
@@ -247,5 +269,96 @@ describe('FileTransferManager', () => {
     expect(mgr.has('r')).toBe(true);
     mgr.onControl({ t: 'file-reject', id: 'r' });
     expect(mgr.has('r')).toBe(false);
+  });
+
+  it('reassembles two transfers whose chunks arrive INTERLEAVED without cross-contamination', () => {
+    // Regression for the misrouting bug: a second file-offer arriving before the
+    // first file's chunks finish must NOT push the first file's remaining chunks
+    // into the second receiver.
+    const sizeA = 40000;
+    const sizeB = 50000;
+    const dataA = bytes(sizeA);
+    const dataB = bytes(sizeB).map((b) => b ^ 0xff); // distinct content
+    const metaA: FileMeta = { id: 'A', name: 'a', size: sizeA, mime: 'x' };
+    const metaB: FileMeta = { id: 'B', name: 'b', size: sizeB, mime: 'x' };
+
+    const delivered = new Map<string, Uint8Array>();
+    const mgr = new FileTransferManager((d, m) => delivered.set(m.id, d));
+
+    // Both offers arrive (B before A's chunks complete).
+    mgr.onControl({ t: 'file-offer', ...metaA });
+    mgr.onControl({ t: 'file-offer', ...metaB });
+
+    const chunksA = chunkBuffer('A', dataA);
+    const chunksB = chunkBuffer('B', dataB);
+
+    // Interleave the two chunk streams arbitrarily.
+    const max = Math.max(chunksA.length, chunksB.length);
+    for (let i = 0; i < max; i++) {
+      if (i < chunksA.length) mgr.onChunk(chunksA[i]);
+      if (i < chunksB.length) mgr.onChunk(chunksB[i]);
+    }
+
+    mgr.onControl({ t: 'file-complete', id: 'A' });
+    mgr.onControl({ t: 'file-complete', id: 'B' });
+
+    expect(delivered.has('A')).toBe(true);
+    expect(delivered.has('B')).toBe(true);
+    expect(delivered.get('A')!.byteLength).toBe(sizeA);
+    expect(delivered.get('B')!.byteLength).toBe(sizeB);
+    expect(eq(delivered.get('A')!, dataA)).toBe(true);
+    expect(eq(delivered.get('B')!, dataB)).toBe(true);
+  });
+});
+
+describe('ReceiverRouter', () => {
+  function meta(id: string, size: number): FileMeta {
+    return { id, name: `${id}.bin`, size, mime: 'application/octet-stream' };
+  }
+
+  it('routes interleaved chunks from two senders to their own receivers', () => {
+    const sizeA = 40000;
+    const sizeB = 33000;
+    const dataA = bytes(sizeA);
+    const dataB = bytes(sizeB).map((b) => (b + 7) & 0xff);
+
+    const router = new ReceiverRouter();
+    const rA = createReceiver({ meta: meta('A', sizeA) });
+    const rB = createReceiver({ meta: meta('B', sizeB) });
+    router.register('A', rA);
+    router.register('B', rB);
+
+    const chunksA = chunkBuffer('A', dataA);
+    const chunksB = chunkBuffer('B', dataB);
+    const max = Math.max(chunksA.length, chunksB.length);
+    for (let i = 0; i < max; i++) {
+      // Deliberately deliver B before A on each step to maximise interleaving.
+      if (i < chunksB.length) expect(router.handleChunk(chunksB[i])).toBe(rB);
+      if (i < chunksA.length) expect(router.handleChunk(chunksA[i])).toBe(rA);
+    }
+
+    expect(eq(rA.finish(), dataA)).toBe(true);
+    expect(eq(rB.finish(), dataB)).toBe(true);
+  });
+
+  it('drops chunks for an unknown id (no misrouting)', () => {
+    const router = new ReceiverRouter();
+    const r = createReceiver({ meta: meta('known', 16384) });
+    router.register('known', r);
+    const orphan = chunkBuffer('unknown', bytes(16384))[0];
+    expect(router.handleChunk(orphan)).toBeUndefined();
+    expect(r.received).toBe(0);
+  });
+
+  it('register/unregister/has/get track receivers', () => {
+    const router = new ReceiverRouter();
+    const r = createReceiver({ meta: meta('z', 1) });
+    expect(router.has('z')).toBe(false);
+    router.register('z', r);
+    expect(router.has('z')).toBe(true);
+    expect(router.get('z')).toBe(r);
+    router.unregister('z');
+    expect(router.has('z')).toBe(false);
+    expect(router.get('z')).toBeUndefined();
   });
 });

@@ -77,6 +77,9 @@ declare global {
         mime: string,
         bytesArray: number[],
       ): Promise<boolean>;
+      sendFilesInterleaved(
+        files: { id: string; name: string; mime: string; bytes: number[] }[],
+      ): Promise<boolean>;
       getReceivedFiles(): ReceivedFile[];
       getReceivedFile(id: string): ReceivedFile | null;
       startRecording(): boolean;

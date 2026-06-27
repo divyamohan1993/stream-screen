@@ -340,6 +340,154 @@ describe('SignalingServer', () => {
     }
   });
 
+  it('allows the documented Vite dev viewer origin (:5173) by default', async () => {
+    // FINDING A regression: the viewer dev server runs on :5173 while the client
+    // connects to the signaling port. That Origin shares the server's host but
+    // differs in port, and must be accepted by the DEFAULT policy (no allowlist),
+    // otherwise the documented dev flow is broken without env config.
+    const ws = await new Promise<WebSocket>((resolve, reject) => {
+      const s = new WebSocket(`ws://127.0.0.1:${port}`, {
+        headers: { origin: 'http://127.0.0.1:5173' },
+      });
+      s.once('open', () => resolve(s));
+      s.once('error', reject);
+    });
+    send(ws, { type: 'join', role: 'host', code: '517351' });
+    await nextMessage(ws, 'joined');
+    ws.close();
+  });
+
+  it('allows localhost on any port by default', async () => {
+    const ws = await new Promise<WebSocket>((resolve, reject) => {
+      const s = new WebSocket(`ws://127.0.0.1:${port}`, {
+        headers: { origin: 'http://localhost:5173' },
+      });
+      s.once('open', () => resolve(s));
+      s.once('error', reject);
+    });
+    send(ws, { type: 'join', role: 'host', code: '600600' });
+    await nextMessage(ws, 'joined');
+    ws.close();
+  });
+
+  it('allows a private LAN-IP origin on any port by default', async () => {
+    const ws = await new Promise<WebSocket>((resolve, reject) => {
+      const s = new WebSocket(`ws://127.0.0.1:${port}`, {
+        headers: { origin: 'http://192.168.1.50:5173' },
+      });
+      s.once('open', () => resolve(s));
+      s.once('error', reject);
+    });
+    send(ws, { type: 'join', role: 'host', code: '192192' });
+    await nextMessage(ws, 'joined');
+    ws.close();
+  });
+
+  it('allows a no-Origin (native) client by default', async () => {
+    // The default `connect` helper sends no Origin header — a native client.
+    const ws = await connect(port);
+    send(ws, { type: 'join', role: 'host', code: '770077' });
+    await nextMessage(ws, 'joined');
+    ws.close();
+  });
+
+  it('rejects an unrelated public Origin by default', async () => {
+    const rejected = new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}`, {
+        headers: { origin: 'https://evil.example' },
+      });
+      ws.once('open', () => reject(new Error('expected handshake to be rejected')));
+      ws.once('error', () => resolve());
+      ws.once('unexpected-response', () => resolve());
+    });
+    await rejected;
+  });
+
+  it('honours STREAMSCREEN_ALLOWED_ORIGINS override (allowlist takes precedence)', async () => {
+    // When an explicit allowlist is set it takes precedence over the default LAN
+    // policy: a LAN/loopback Origin NOT on the list is rejected, while the listed
+    // Origin is accepted.
+    const allow = new SignalingServer({
+      port: 0,
+      heartbeatMs: 0,
+      allowedOrigins: ['https://trusted.example'],
+    });
+    try {
+      const p = allow.port;
+
+      // Listed Origin: accepted.
+      const ok = await new Promise<WebSocket>((resolve, reject) => {
+        const s = new WebSocket(`ws://127.0.0.1:${p}`, {
+          headers: { origin: 'https://trusted.example' },
+        });
+        s.once('open', () => resolve(s));
+        s.once('error', reject);
+      });
+      send(ok, { type: 'join', role: 'host', code: '848484' });
+      await nextMessage(ok, 'joined');
+      ok.close();
+
+      // A LAN Origin that the default policy WOULD allow is now rejected, proving
+      // the explicit allowlist overrides the default.
+      const rejected = new Promise<void>((resolve, reject) => {
+        const s = new WebSocket(`ws://127.0.0.1:${p}`, {
+          headers: { origin: 'http://192.168.1.5:5173' },
+        });
+        s.once('open', () => reject(new Error('expected handshake to be rejected')));
+        s.once('error', () => resolve());
+        s.once('unexpected-response', () => resolve());
+      });
+      await rejected;
+    } finally {
+      await allow.close();
+    }
+  });
+
+  it('drops a hostless room from listSessions when the host leaves, notifies viewers, and rejects a new viewer', async () => {
+    // FINDING B regression: after the host disconnects with viewers still
+    // present, the room must NOT linger in listSessions() (a dead code fed to
+    // discovery/REST), remaining viewers must be told the host departed, and a
+    // NEW viewer using that code must get no-such-session rather than silently
+    // attaching to a dead room.
+    const changes: number[] = [];
+    server.on('sessions-changed', (sessions) => changes.push(sessions.length));
+
+    const host = await connect(port);
+    send(host, { type: 'join', role: 'host', name: 'Reapable', code: '262626' });
+    await nextMessage(host, 'joined');
+
+    const viewer = await connect(port);
+    send(viewer, { type: 'join', role: 'viewer', code: '262626' });
+    await nextMessage(viewer, 'joined');
+    await nextMessage(host, 'peer-joined');
+
+    // One live session right now.
+    expect(server.listSessions().some((s) => s.code === '262626')).toBe(true);
+    expect(server.listSessions()).toHaveLength(1);
+
+    // Remaining viewer is notified the host disconnected when the host leaves.
+    const hostGone = nextMessage(viewer, 'error');
+    host.close();
+    const err = await hostGone;
+    expect(err.message).toBe('host-disconnected');
+
+    // Give the close/reap a tick.
+    await new Promise((r) => setTimeout(r, 50));
+
+    // The hostless room no longer appears in listSessions().
+    expect(server.listSessions().some((s) => s.code === '262626')).toBe(false);
+    // sessions-changed fired on host departure (last snapshot has no room).
+    expect(changes.length).toBeGreaterThanOrEqual(2);
+    expect(changes.at(-1)).toBe(0);
+
+    // A NEW viewer joining the now-dead code is handled as no-such-session.
+    const late = await connect(port);
+    send(late, { type: 'join', role: 'viewer', code: '262626' });
+    const lateErr = await nextMessage(late, 'error');
+    expect(lateErr.message).toBe('no-such-session');
+    late.close();
+  });
+
   it('lists active sessions with live viewer counts', async () => {
     const host = await connect(port);
     send(host, { type: 'join', role: 'host', name: 'Listed', code: '111000' });
