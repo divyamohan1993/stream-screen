@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import type { SignalMessage } from '@stream-screen/core';
-import { SignalingServer, generateCode } from '../src/server.js';
+import { SignalingServer, generateCode, isLanOrDevOrigin } from '../src/server.js';
 
 /** Open a ws client and resolve once connected. */
 function connect(port: number, headers?: Record<string, string>): Promise<WebSocket> {
@@ -602,5 +602,48 @@ describe('SignalingServer', () => {
 
     host.close();
     viewer.close();
+  });
+});
+
+describe('isLanOrDevOrigin (default WS origin policy)', () => {
+  // FINDING P2 regression: IPv6 browser origins arrive with the hostname still
+  // wrapped in square brackets from `new URL(origin).hostname` in this Node
+  // runtime (e.g. `[::1]`, `[fd00::2]`), and zone-id'd link-local literals make
+  // `new URL` throw outright. The default LAN/dev policy must strip the brackets
+  // (and tolerate a zone-id) BEFORE the loopback / ULA / link-local checks so it
+  // ALLOWS the IPv6 viewer origins it intends to allow — while still rejecting
+  // genuinely foreign public origins and leaving IPv4 behaviour unchanged.
+  const host = '192.168.1.10:8787';
+
+  it('ALLOWS IPv6 loopback ::1 (brackets stripped)', () => {
+    expect(isLanOrDevOrigin('http://[::1]:5173', host)).toBe(true);
+  });
+
+  it('ALLOWS an IPv6 ULA (fd00::/8) origin', () => {
+    expect(isLanOrDevOrigin('http://[fd00::2]:5173', host)).toBe(true);
+  });
+
+  it('ALLOWS an IPv6 link-local origin carrying a zone-id', () => {
+    // `new URL` throws on this; the policy must still recover the host.
+    expect(isLanOrDevOrigin('http://[fe80::1%eth0]:5173', host)).toBe(true);
+  });
+
+  it('REJECTS a public IPv6 origin by default', () => {
+    expect(isLanOrDevOrigin('http://[2606:4700::1111]', host)).toBe(false);
+  });
+
+  it('keeps IPv4 loopback / private behaviour unchanged', () => {
+    expect(isLanOrDevOrigin('http://127.0.0.1:5173', host)).toBe(true);
+    expect(isLanOrDevOrigin('http://localhost:5173', host)).toBe(true);
+    expect(isLanOrDevOrigin('http://192.168.1.50:5173', host)).toBe(true);
+    expect(isLanOrDevOrigin('http://10.0.0.5:5173', host)).toBe(true);
+  });
+
+  it('still rejects an unrelated public origin by default', () => {
+    expect(isLanOrDevOrigin('https://evil.example', host)).toBe(false);
+  });
+
+  it('returns false for an unparseable origin (fails closed)', () => {
+    expect(isLanOrDevOrigin('not a url', host)).toBe(false);
   });
 });

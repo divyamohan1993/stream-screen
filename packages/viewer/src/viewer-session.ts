@@ -93,12 +93,44 @@ export interface ViewerSessionOptions {
    * to 4000.
    */
   reconnectGraceMs?: number;
+  /**
+   * Override the connect-time handshake timeout (ms) — how long {@link
+   * ViewerSession.connect} (and the ICE-reconnect rebuild) waits for the
+   * signaling server's `joined` acknowledgement before aborting. Purely a
+   * connect handshake bound; NOT a session time limit. Defaults to {@link
+   * VIEWER_JOIN_ACK_TIMEOUT_MS}.
+   */
+  joinTimeoutMs?: number;
   /** Handlers for session events. */
   handlers?: ViewerSessionHandlers;
 }
 
 const DEFAULT_STATS_INTERVAL_MS = 1000;
 const DEFAULT_RECONNECT_GRACE_MS = 4000;
+
+/**
+ * Default time (ms) {@link ViewerSession.connect} (and the ICE-reconnect rebuild
+ * path) waits for the signaling server's `joined` acknowledgement after sending
+ * the viewer `join`, before aborting.
+ *
+ * This is a CONNECT-TIME HANDSHAKE TIMEOUT ONLY — it bounds the wait for the
+ * server to confirm we actually entered the room. It is emphatically NOT a
+ * session duration limit or usage cap: once joined, the session runs until the
+ * user closes it.
+ */
+export const VIEWER_JOIN_ACK_TIMEOUT_MS = 10_000;
+
+/**
+ * Thrown when the viewer's signaling `join` is rejected by the server (e.g. the
+ * code names no live session, or the room is full — `no-such-session`) or no
+ * `joined` acknowledgement arrives within {@link VIEWER_JOIN_ACK_TIMEOUT_MS}.
+ */
+export class ViewerJoinRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ViewerJoinRejectedError';
+  }
+}
 
 /**
  * Derive the signaling WebSocket URL from the current page origin when one is
@@ -190,9 +222,6 @@ export class ViewerSession {
     const signaling = new SignalingClient(this.opts.signalingUrl);
     this.signaling = signaling;
 
-    signaling.on('error', (m: SignalMessage) => {
-      this.setState('error', m.message ?? 'Signaling error');
-    });
     signaling.on('peer-left', (m: SignalMessage) => {
       this.onPeerLeft(m);
     });
@@ -202,13 +231,82 @@ export class ViewerSession {
     try {
       await signaling.connect();
       await this.peer!.start();
-      signaling.join({ code: this.opts.code, role: 'viewer', name: this.opts.name ?? 'web-viewer' });
+      // Join the room by code, as a viewer, then WAIT for the server's `joined`
+      // acknowledgement before we resolve / enter waiting-for-host / start the
+      // stats loop. Per the shared signaling contract the server replies `joined`
+      // on success or `error` (e.g. `no-such-session` when the code names no live
+      // host, or a full room) otherwise. Without this handshake a rejected join
+      // would still resolve connect() and start the stats loop, while the
+      // SignalingClient's remembered `lastJoin` keeps reconnecting and REPLAYING
+      // the rejected join. A rejection or a handshake timeout throws and is fully
+      // cleaned up by the catch below.
+      await this.awaitJoinAck(signaling, () => {
+        signaling.join({
+          code: this.opts.code,
+          role: 'viewer',
+          name: this.opts.name ?? 'web-viewer',
+        });
+      });
+      // Only AFTER a confirmed join do we install the persistent signaling error
+      // handler (so a later signaling error surfaces as session error) and begin
+      // the session. Wiring it before the handshake would let the join-ack's own
+      // `error` rejection AND this handler both fire on the same rejection.
+      signaling.on('error', (m: SignalMessage) => {
+        if (this.closed) return;
+        this.setState('error', m.message ?? 'Signaling error');
+      });
       this.setState('waiting-for-host', 'Joined — waiting for host stream.');
       this.startStatsLoop();
     } catch (err) {
+      // ANY failure — connect, peer start, a rejected join such as
+      // `no-such-session`, or a join-ack timeout — must fully tear down so no
+      // dangling joined socket is left whose remembered join the SignalingClient
+      // could reconnect and replay. disconnect() closes the peer and CLOSES the
+      // SignalingClient (clearing its reconnect schedule) and stops the loop.
+      this.disconnect();
       this.setState('error', err instanceof Error ? err.message : 'Failed to connect');
       throw err;
     }
+  }
+
+  /**
+   * Resolve when the signaling server acknowledges our viewer `join` with
+   * `joined`; reject if it replies `error` (e.g. `no-such-session` for a code
+   * that names no live host, or a full room) or if no acknowledgement arrives
+   * within the handshake timeout. The `join` is sent via `sendJoin` AFTER the
+   * listeners are wired so the reply can never be missed. CONNECT-TIME HANDSHAKE
+   * ONLY — it imposes no session duration limit.
+   */
+  private awaitJoinAck(signaling: SignalingClient, sendJoin: () => void): Promise<void> {
+    const timeoutMs = this.opts.joinTimeoutMs ?? VIEWER_JOIN_ACK_TIMEOUT_MS;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onJoined = (): void => finish();
+      const onError = (m: SignalMessage): void =>
+        finish(new ViewerJoinRejectedError(m.message ?? 'signaling viewer join rejected'));
+      const finish = (err?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signaling.off('joined', onJoined);
+        signaling.off('error', onError);
+        if (err) reject(err);
+        else resolve();
+      };
+      const timer = setTimeout(
+        () =>
+          finish(
+            new ViewerJoinRejectedError(
+              `Timed out after ${timeoutMs}ms waiting for the signaling server to ` +
+                `acknowledge the viewer join for code "${this.opts.code}".`,
+            ),
+          ),
+        timeoutMs,
+      );
+      signaling.on('joined', onJoined);
+      signaling.on('error', onError);
+      sendJoin();
+    });
   }
 
   /**
@@ -348,9 +446,6 @@ export class ViewerSession {
       this.signaling?.close();
       const signaling = new SignalingClient(this.opts.signalingUrl);
       this.signaling = signaling;
-      signaling.on('error', (m: SignalMessage) => {
-        this.setState('error', m.message ?? 'Signaling error');
-      });
       signaling.on('peer-left', (m: SignalMessage) => {
         this.onPeerLeft(m);
       });
@@ -358,8 +453,24 @@ export class ViewerSession {
       const peer = this.buildPeer(signaling);
       await signaling.connect();
       await peer.start();
-      // Announce ourselves on the fresh socket so the host emits a new offer.
-      signaling.join({ code: this.opts.code, role: 'viewer', name: this.opts.name ?? 'web-viewer' });
+      // Announce ourselves on the fresh socket and AWAIT the `joined`
+      // acknowledgement before treating the rebuilt peer as live — don't start
+      // relying on a rebuilt peer before it has actually re-joined the room. A
+      // rejection (e.g. the host has since gone away — `no-such-session`) or a
+      // handshake timeout throws to the catch below. CONNECT-TIME bound only.
+      await this.awaitJoinAck(signaling, () => {
+        signaling.join({
+          code: this.opts.code,
+          role: 'viewer',
+          name: this.opts.name ?? 'web-viewer',
+        });
+      });
+      // Re-install the persistent signaling error handler only after the rebuilt
+      // socket has confirmed its re-join.
+      signaling.on('error', (m: SignalMessage) => {
+        if (this.closed) return;
+        this.setState('error', m.message ?? 'Signaling error');
+      });
     } catch (err) {
       this.setState('error', err instanceof Error ? err.message : 'Reconnection failed');
     } finally {

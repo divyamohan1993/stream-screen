@@ -52,12 +52,21 @@ class FakePeer {
 
 let constructedUrls: string[] = [];
 class FakeSignaling {
+  private handlers = new Map<string, (m: unknown) => void>();
   constructor(url: string) {
     constructedUrls.push(url);
   }
-  on(): void {}
+  on(ev: string, cb: (m: unknown) => void): void {
+    this.handlers.set(ev, cb);
+  }
+  off(ev: string, _cb: (m: unknown) => void): void {
+    this.handlers.delete(ev);
+  }
   async connect(): Promise<void> {}
-  join(): void {}
+  join(): void {
+    // Acknowledge the join so connect() resolves.
+    this.handlers.get('joined')?.({ type: 'joined' });
+  }
   close(): void {}
 }
 

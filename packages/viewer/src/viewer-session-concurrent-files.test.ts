@@ -57,9 +57,19 @@ class FakePeer {
 }
 
 class FakeSignaling {
-  on(): void {}
+  private handlers = new Map<string, (m: unknown) => void>();
+  on(ev: string, cb: (m: unknown) => void): void {
+    this.handlers.set(ev, cb);
+  }
+  off(ev: string, _cb: (m: unknown) => void): void {
+    this.handlers.delete(ev);
+  }
   async connect(): Promise<void> {}
-  join(): void {}
+  join(): void {
+    // Mirror the signaling contract: a successful join is acknowledged with
+    // `joined`, which the session awaits before resolving connect().
+    this.handlers.get('joined')?.({ type: 'joined' });
+  }
   close(): void {}
 }
 

@@ -190,6 +190,18 @@ Key points:
   only, **not** a session limit) — fully **tears down via `stop()`**, so a failed
   start never leaves a dangling joined socket or a live advertised room with no
   media behind it.
+- **Viewer join ack + teardown.** `ViewerSession.connect` (`viewer/viewer-session.ts`)
+  symmetrically **awaits the `joined` acknowledgement** before reporting
+  connected, entering `waiting-for-host`, installing the persistent signaling
+  error handler, or starting the stats loop. A rejected viewer join
+  (`no-such-session` for a code naming no live host, or a full room) or a
+  join-ack timeout (`VIEWER_JOIN_ACK_TIMEOUT_MS`, a connect-time bound only,
+  **not** a session limit) throws `ViewerJoinRejectedError` and fully tears the
+  session down — closing the peer and **closing the `SignalingClient`** so its
+  remembered `lastJoin` can never reconnect and replay a rejected join. The same
+  ack gate guards the ICE-reconnect peer rebuild. `App.connect` also disconnects
+  any prior session before creating a new one, guaranteeing at most one live
+  session.
 
 ---
 
@@ -523,8 +535,12 @@ StreamScreen is **LAN-first** and trades WAN reach for simplicity and privacy.
   the default LAN/dev policy accepts Origins whose host is loopback, the same host
   as the server (any port — so the Vite dev viewer on `:5173` reaches signaling on
   `:8787`), or a private/link-local LAN address, and rejects foreign public
-  origins. This keeps the zero-config and documented dev-viewer flows working
-  without configuration while blocking cross-site public pages.
+  origins. Bracketed IPv6 literals in the `Origin` are unwrapped before the LAN
+  check — `[::1]` (loopback), `[fd00::…]` (ULA), and `[fe80::…%zone]`
+  (link-local, including a zone-id that makes `new URL().hostname` throw) are
+  recognised rather than rejected. This keeps the zero-config and documented
+  dev-viewer flows working without configuration while blocking cross-site
+  public pages.
 - **Threat model & limits.** The code gates *access*, but a short numeric code is
   not a substitute for network-level isolation on hostile networks. There is no
   built-in authentication beyond the code and no audit log. For untrusted

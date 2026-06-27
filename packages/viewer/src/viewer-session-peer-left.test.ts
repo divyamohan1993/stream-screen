@@ -35,11 +35,19 @@ type PeerLeftCb = (m: SignalMessage) => void;
 
 class FakeSignaling {
   peerLeftCb: PeerLeftCb | null = null;
+  joinedCb: ((m: unknown) => void) | null = null;
   on(ev: string, cb: (...a: unknown[]) => void): void {
     if (ev === 'peer-left') this.peerLeftCb = cb as PeerLeftCb;
+    if (ev === 'joined') this.joinedCb = cb as (m: unknown) => void;
+  }
+  off(ev: string, _cb: (...a: unknown[]) => void): void {
+    if (ev === 'joined') this.joinedCb = null;
   }
   async connect(): Promise<void> {}
-  join(): void {}
+  join(): void {
+    // Acknowledge the join so the session resolves connect().
+    this.joinedCb?.({ type: 'joined' });
+  }
   close(): void {}
   /** Drive a synthetic peer-left for the given role. */
   emitPeerLeft(role: SignalMessage['role']): void {

@@ -49,12 +49,21 @@ class FakeSignaling {
   joins = 0;
   connects = 0;
   closed = false;
-  on(): void {}
+  private handlers = new Map<string, (m: unknown) => void>();
+  on(ev: string, cb: (m: unknown) => void): void {
+    this.handlers.set(ev, cb);
+  }
+  off(ev: string, _cb: (m: unknown) => void): void {
+    this.handlers.delete(ev);
+  }
   async connect(): Promise<void> {
     this.connects++;
   }
   join(): void {
     this.joins++;
+    // Acknowledge the join (success) so connect()/rebuild resolves; the session
+    // awaits `joined` before resolving and before starting to use the peer.
+    this.handlers.get('joined')?.({ type: 'joined' });
   }
   close(): void {
     this.closed = true;

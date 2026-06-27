@@ -721,13 +721,38 @@ function remoteAddress(req: IncomingMessage, trustProxy: boolean): string {
  * Everything else (a public hostname / public IP) is rejected. Returns false if
  * the Origin is unparseable, so the default policy fails closed.
  */
-function isLanOrDevOrigin(origin: string, host: string | undefined): boolean {
-  let originHost: string;
+/**
+ * Extract the bare hostname from a browser `Origin`, with IPv6 surrounding
+ * brackets stripped so the loopback / private-address checks see the raw
+ * address form they expect (e.g. `[::1]` -> `::1`, `[fd00::2]` -> `fd00::2`).
+ *
+ * `new URL(origin).hostname` is used when possible, but in this Node runtime it
+ * (a) RETAINS the surrounding brackets for IPv6 literals and (b) THROWS for an
+ * IPv6 literal carrying a zone-id (`http://[fe80::1%eth0]:5173`). So when URL
+ * parsing fails we fall back to extracting the `[...]` host ourselves, and we
+ * always strip a surrounding bracket pair from the result. IPv4/named hosts are
+ * returned unchanged. Returns undefined if no hostname can be recovered.
+ */
+function originHostname(origin: string): string | undefined {
+  let host: string | undefined;
   try {
-    originHost = new URL(origin).hostname;
+    host = new URL(origin).hostname || undefined;
   } catch {
-    return false;
+    // URL parsing rejects zone-id'd IPv6 literals; recover the bracketed host
+    // (and any `host:port`) from the scheme-relative authority manually.
+    const m = origin.match(/^[a-z][a-z0-9+.-]*:\/\/(\[[^\]]*\]|[^/?#]*)/i);
+    host = m?.[1];
   }
+  if (!host) return undefined;
+  // Strip a single surrounding pair of IPv6 brackets, if present.
+  if (host.startsWith('[') && host.endsWith(']')) {
+    host = host.slice(1, -1);
+  }
+  return host || undefined;
+}
+
+export function isLanOrDevOrigin(origin: string, host: string | undefined): boolean {
+  const originHost = originHostname(origin);
   if (!originHost) return false;
 
   // Same host as the server (any port) — covers the served viewer and the Vite

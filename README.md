@@ -282,13 +282,20 @@ The viewer derives its signaling WebSocket URL from the page host on port `8787`
 for manually entered codes; when you instead **pick a host from the discovered
 LAN list**, the viewer connects to **that host's own advertised signaling
 endpoint** (`ws://<host-address>:<port>`), so a host running on another LAN
-machine is reachable rather than failing with `no-such-session`. By default — with no
+machine is reachable rather than failing with `no-such-session`. On connect the
+viewer **awaits the signaling server's `joined` acknowledgement** before
+reporting connected and starting its stats loop; a rejected join (e.g.
+`no-such-session` for a code that names no live host, or a full room) or a
+handshake timeout tears the session fully down — closing the peer and the
+signaling client so no socket is left replaying a rejected join. By default — with no
 `STREAMSCREEN_ALLOWED_ORIGINS` configured — the signaling server accepts WS
 handshakes whose browser `Origin` is loopback, the same host as the server (on
 **any** port, so the Vite dev viewer on `:5173` reaches signaling on `:8787`), or
-a private/link-local LAN address, while rejecting foreign public origins; set
-`STREAMSCREEN_ALLOWED_ORIGINS` to an exact allowlist (or `*`) to override. It
-renders the remote
+a private/link-local LAN address, while rejecting foreign public origins;
+bracketed IPv6 literals in the `Origin` (loopback `[::1]`, ULA `[fd00::…]`,
+link-local `[fe80::…%zone]`) are unwrapped before the LAN check so they are
+recognised rather than rejected. Set `STREAMSCREEN_ALLOWED_ORIGINS` to an exact
+allowlist (or `*`) to override. It renders the remote
 screen, captures mouse/keyboard (with resolution-independent coordinates,
 pointer lock, fullscreen, clipboard sync), and shows a **live adaptive-stats
 dashboard** (RTT, loss, jitter, fps, resolution, current bitrate decision).

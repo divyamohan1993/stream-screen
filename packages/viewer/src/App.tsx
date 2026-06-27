@@ -117,6 +117,13 @@ export function App(): React.JSX.Element {
 
   const connect = useCallback(
     async (code: string, signalingUrl?: string) => {
+      // Tear down any existing session BEFORE creating a new one. Otherwise a
+      // failed/old session lingers — its SignalingClient keeps reconnecting and
+      // replaying its remembered join, and its stats loop keeps running — while
+      // sessionRef is overwritten and can never disconnect it. Disconnecting
+      // first guarantees at most one live session.
+      sessionRef.current?.disconnect();
+      sessionRef.current = null;
       setError(null);
       setChatMessages([]);
       setTransfers([]);
