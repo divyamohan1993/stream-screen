@@ -122,13 +122,32 @@ function rebuildTrayMenu(): void {
   tray.setContextMenu(menu);
 }
 
-/** Snapshot the connected displays as plain {@link DisplayGeometry} objects. */
+/**
+ * Snapshot the connected displays as plain {@link DisplayGeometry} objects.
+ *
+ * `physicalOrigin` is the display's TRUE top-left in virtual-desktop physical
+ * pixels, obtained via Electron `screen.dipToScreenPoint` on the DIP origin.
+ * This is the only value that is correct across MIXED-DPI multi-monitor layouts:
+ * `bounds.x * scaleFactor` mis-places any display that follows a differently
+ * scaled one (e.g. a 150% secondary after a 100% primary). We compute it
+ * defensively so a hypothetical missing/throwing API can never break enumeration.
+ */
 function collectDisplays(): DisplayGeometry[] {
-  return screen.getAllDisplays().map((d) => ({
-    id: d.id,
-    bounds: { x: d.bounds.x, y: d.bounds.y, width: d.bounds.width, height: d.bounds.height },
-    scaleFactor: d.scaleFactor,
-  }));
+  return screen.getAllDisplays().map((d) => {
+    let physicalOrigin: { x: number; y: number } | undefined;
+    try {
+      const p = screen.dipToScreenPoint({ x: d.bounds.x, y: d.bounds.y });
+      physicalOrigin = { x: Math.round(p.x), y: Math.round(p.y) };
+    } catch {
+      physicalOrigin = undefined;
+    }
+    return {
+      id: d.id,
+      bounds: { x: d.bounds.x, y: d.bounds.y, width: d.bounds.width, height: d.bounds.height },
+      scaleFactor: d.scaleFactor,
+      ...(physicalOrigin ? { physicalOrigin } : {}),
+    };
+  });
 }
 
 /** Enumerate just the screen sources (for multi-monitor listing/switching). */

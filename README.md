@@ -278,11 +278,18 @@ npm -w @stream-screen/viewer run build
 npm -w @stream-screen/viewer run preview
 ```
 
-The viewer derives its signaling WebSocket URL from the page host on port `8787`
-for manually entered codes; when you instead **pick a host from the discovered
-LAN list**, the viewer connects to **that host's own advertised signaling
-endpoint** (`ws://<host-address>:<port>`), so a host running on another LAN
-machine is reachable rather than failing with `no-such-session`. On connect the
+For manually entered codes the viewer derives its signaling WebSocket URL from
+the page host on port `8787` by default, but the connect form also accepts an
+**optional signaling-server override** — a bare `host` / `host:port` authority
+(promoted to `ws://host:port`, defaulting port `8787`) or a full `ws://`/`wss://`
+URL (IPv6 literals may be bracketed or bare). This lets a viewer served from a
+machine *other* than the signaling host (e.g. the dev viewer on `localhost:5173`
+while the host joined `ws://192.168.1.10:8787`) target the correct server; the
+last value is persisted in `localStorage` for convenience, and leaving it blank
+falls back to the derived default. When you instead **pick a host from the
+discovered LAN list**, the viewer connects to **that host's own advertised
+signaling endpoint** (`ws://<host-address>:<port>`), so a host running on another
+LAN machine is reachable rather than failing with `no-such-session`. On connect the
 viewer **awaits the signaling server's `joined` acknowledgement** before
 reporting connected and starting its stats loop; a rejected join (e.g.
 `no-such-session` for a code that names no live host, or a full room) or a

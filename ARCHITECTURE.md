@@ -348,6 +348,17 @@ flowchart LR
   `[0,1]` of the remote screen, so they work regardless of either side's
   resolution. The host maps them to pixels against the live screen size
   (`normalizedToPixels`).
+- **Mixed-DPI multi-monitor mapping.** On a virtual desktop, each display's
+  pointer mapping (`normalizedToVirtualPixels`, `monitor.ts`) uses the display's
+  **real physical origin** — Electron `screen.dipToScreenPoint(bounds)`, carried
+  on `DisplayGeometry.physicalOrigin` — rather than `bounds.x * scaleFactor`. The
+  latter mis-places any display that follows a differently scaled one: a 100%
+  1920px primary plus a 150% secondary at DIP `x=1920` has physical origin
+  `x=1920`, not `1920*1.5=2880`. The physical *extent* stays `bounds * scaleFactor`
+  (a per-display quantity). The reduction to a `PhysicalDisplayRect` and the pure
+  `normalizedToPhysicalPoint` math are exhaustively unit-tested with synthetic
+  mixed-DPI layouts; when `physicalOrigin` is absent the mapping falls back to
+  `bounds * scaleFactor`, exact for uniform-scale (and single-display) layouts.
 - **Events.** `m-move`, `m-down`, `m-up`, `m-wheel`, `k-down`, `k-up`,
   `clipboard`. Buttons: 0=left, 1=middle, 2=right. Modifier bitflags: 1=shift,
   2=ctrl, 4=alt, 8=meta.
@@ -531,7 +542,12 @@ overrides this and uses the given/configured endpoint. The node WebRTC
 runtime and OCR engine are optional dynamic imports; when missing, the server and
 its schemas stay valid and only the affected calls return a clear error.
 Screenshots are produced by converting raw I420 frames to PNG with a
-dependency-free encoder. **No call counts usage or expires a session.**
+dependency-free encoder. The native `@roamhq/wrtc` `RTCVideoSink` attached to the
+inbound track is **retained on the session instance for the session's lifetime**,
+not as a method-local — a garbage-collected sink stops delivering frames even
+while the connection stays up, which would silently starve `screenshot` /
+`ocr_screen`; `disconnect` stops and clears it so a reconnect installs a fresh
+one. **No call counts usage or expires a session.**
 
 ---
 

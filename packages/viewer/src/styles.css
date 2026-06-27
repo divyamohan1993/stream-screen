@@ -91,6 +91,22 @@ body {
   border-color: var(--accent);
 }
 
+.signaling-input {
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  padding: 0.55rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  width: 100%;
+}
+
+.signaling-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 button {
   font-family: var(--sans);
   font-size: 0.95rem;

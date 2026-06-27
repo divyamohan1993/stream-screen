@@ -1,7 +1,35 @@
 import React, { useRef, useState } from 'react';
 import { isValidSessionCode } from '@stream-screen/core';
 import { DiscoveryList } from './DiscoveryList.js';
-import { signalingUrlForHost, type DiscoveredHost } from '../discovery-client.js';
+import {
+  normalizeSignalingUrl,
+  signalingUrlForHost,
+  type DiscoveredHost,
+} from '../discovery-client.js';
+
+/** localStorage key under which the last-used signaling server value is kept. */
+const SIGNALING_STORAGE_KEY = 'streamscreen.signalingServer';
+
+/** Read the persisted signaling-server value, tolerating absent storage/SSR. */
+function loadSignalingServer(): string {
+  try {
+    return globalThis.localStorage?.getItem(SIGNALING_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/** Persist (or clear) the signaling-server value, tolerating absent storage. */
+function saveSignalingServer(value: string): void {
+  try {
+    const store = globalThis.localStorage;
+    if (!store) return;
+    if (value.trim()) store.setItem(SIGNALING_STORAGE_KEY, value.trim());
+    else store.removeItem(SIGNALING_STORAGE_KEY);
+  } catch {
+    /* ignore persistence failures — convenience only */
+  }
+}
 
 /** Props for {@link ConnectScreen}. */
 export interface ConnectScreenProps {
@@ -29,11 +57,24 @@ export function ConnectScreen({
   connecting,
 }: ConnectScreenProps): React.JSX.Element {
   const [code, setCode] = useState('');
+  // Optional signaling-server override for MANUAL code entry. Lets a viewer
+  // served from a machine OTHER than the signaling host (the quickstart "other
+  // machine" case — e.g. viewer on localhost:5173 while the host joined
+  // ws://192.168.1.10:8787) target the correct server. Empty → App derives the
+  // default. Seeded from (and persisted to) localStorage for convenience.
+  const [signalingServer, setSignalingServer] = useState(loadSignalingServer);
   const inputRef = useRef<HTMLInputElement>(null);
   const valid = isValidSessionCode(code);
 
   const submit = (): void => {
-    if (valid && !connecting) onConnect(code);
+    if (!valid || connecting) return;
+    // When the user supplied a signaling server, normalize it (host:port or full
+    // ws/wss URL) and connect THERE; otherwise pass no override so App falls back
+    // to the derived defaultSignalingUrl(). Persist the value either way.
+    saveSignalingServer(signalingServer);
+    const override = normalizeSignalingUrl(signalingServer);
+    if (override) onConnect(code, override);
+    else onConnect(code);
   };
 
   const pick = (host: DiscoveredHost): void => {
@@ -87,6 +128,27 @@ export function ConnectScreen({
         {!error && !valid && code.length > 0 ? (
           <p className="hint">Codes are 6 to 9 digits.</p>
         ) : null}
+
+        <input
+          className="signaling-input"
+          type="text"
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          placeholder="Signaling server (optional)"
+          value={signalingServer}
+          onChange={(e) => setSignalingServer(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') submit();
+          }}
+          aria-label="Signaling server"
+        />
+        <p className="hint">
+          Leave blank to use this page&apos;s server. To connect to a host on
+          another machine, enter its address (e.g. <code>192.168.1.10:8787</code>{' '}
+          or <code>ws://192.168.1.10:8787</code>).
+        </p>
       </div>
 
       <DiscoveryList onPick={pick} />

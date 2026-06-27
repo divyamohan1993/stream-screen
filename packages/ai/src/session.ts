@@ -253,6 +253,20 @@ async function resolveNodeRtc(): Promise<typeof RTCPeerConnection | null> {
   return null;
 }
 
+/** A frame delivered by the native `@roamhq/wrtc` video sink. */
+interface NativeVideoFrameEvent {
+  frame: { width: number; height: number; data: Uint8Array };
+}
+
+/** The subset of `@roamhq/wrtc`'s nonstandard `RTCVideoSink` we rely on. */
+interface NativeVideoSink {
+  onframe: ((e: NativeVideoFrameEvent) => void) | null;
+  /** Releases the underlying native sink; present on `@roamhq/wrtc`'s sink. */
+  stop?: () => void;
+}
+
+type NativeVideoSinkCtor = new (track: unknown) => NativeVideoSink;
+
 export class RemoteDesktopSession {
   private readonly opts: SessionOptions;
   private readonly signalingUrl: string;
@@ -281,6 +295,14 @@ export class RemoteDesktopSession {
   private lastFrame: CapturedFrame | null = null;
   /** Frame sink installed on the inbound track, if the runtime supports it. */
   private frameSink: ((frame: CapturedFrame) => void) | null = null;
+  /**
+   * The native `@roamhq/wrtc` `RTCVideoSink` attached to the inbound track, when
+   * the runtime supports it. Held on the instance for the session's lifetime so
+   * it is not garbage-collected — a collected sink stops delivering frames even
+   * while the connection stays up, starving screenshot/ocr_screen. Cleared (and
+   * stopped) on {@link disconnect} so a reconnect creates a fresh one.
+   */
+  private videoSink: NativeVideoSink | null = null;
 
   constructor(opts: SessionOptions = {}) {
     this.opts = opts;
@@ -546,6 +568,17 @@ export class RemoteDesktopSession {
       this.signaling.close();
       this.signaling = null;
     }
+    if (this.videoSink) {
+      // Stop the native sink so its native resources are released; a reconnect
+      // installs a fresh one. Guard the call since `stop` is runtime-specific.
+      try {
+        this.videoSink.stop?.();
+      } catch {
+        /* best-effort: never let sink teardown break disconnect */
+      }
+      this.videoSink.onframe = null;
+      this.videoSink = null;
+    }
     this.connectedCode = null;
     this.lastFrame = null;
     this.frameSink = null;
@@ -720,11 +753,7 @@ export class RemoteDesktopSession {
   private async tryNativeSink(track: unknown): Promise<void> {
     try {
       const wrtc = (await import('@roamhq/wrtc')) as unknown as {
-        nonstandard?: {
-          RTCVideoSink?: new (t: unknown) => {
-            onframe: ((e: { frame: { width: number; height: number; data: Uint8Array } }) => void) | null;
-          };
-        };
+        nonstandard?: { RTCVideoSink?: NativeVideoSinkCtor };
       };
       const Sink = wrtc.nonstandard?.RTCVideoSink;
       if (!Sink) return;
@@ -736,6 +765,11 @@ export class RemoteDesktopSession {
         const png = encodeI420ToPng(e.frame);
         if (png) this.pushFrame({ data: png, mimeType: 'image/png' });
       };
+      // Retain the sink on the instance for the session's lifetime. Without this
+      // the sink (and its onframe callback) becomes GC-eligible once this method
+      // returns, so frame delivery can silently stop even though the connection
+      // is still up. disconnect() stops + clears it.
+      this.videoSink = sink;
     } catch {
       /* native sink unavailable; frames may be pushed externally */
     }

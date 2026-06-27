@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ControlMessage, InputEvent } from '@stream-screen/core';
-import { signalingUrlForHost, type DiscoveredHost } from './discovery-client.js';
+import {
+  normalizeSignalingUrl,
+  signalingUrlForHost,
+  type DiscoveredHost,
+} from './discovery-client.js';
 
 /**
  * Regression for FINDING A: a discovered mDNS host must be reached via ITS OWN
@@ -34,6 +38,36 @@ describe('signalingUrlForHost', () => {
     expect(signalingUrlForHost(host({ address: 'fe80::1', port: 8787 }))).toBe(
       'ws://[fe80::1]:8787',
     );
+  });
+});
+
+describe('normalizeSignalingUrl', () => {
+  it('returns null for empty/blank input (caller falls back to default)', () => {
+    expect(normalizeSignalingUrl('')).toBeNull();
+    expect(normalizeSignalingUrl('   ')).toBeNull();
+  });
+
+  it('promotes a bare host to ws://host:8787', () => {
+    expect(normalizeSignalingUrl('192.168.1.10')).toBe('ws://192.168.1.10:8787');
+    expect(normalizeSignalingUrl('myhost.local')).toBe('ws://myhost.local:8787');
+  });
+
+  it('promotes host:port to ws://host:port', () => {
+    expect(normalizeSignalingUrl('192.168.1.10:8787')).toBe('ws://192.168.1.10:8787');
+    expect(normalizeSignalingUrl('10.0.0.7:9000')).toBe('ws://10.0.0.7:9000');
+  });
+
+  it('accepts a full ws/wss URL verbatim (trimmed)', () => {
+    expect(normalizeSignalingUrl('ws://192.168.1.10:8787')).toBe('ws://192.168.1.10:8787');
+    expect(normalizeSignalingUrl('  wss://host.example:443/sig  ')).toBe(
+      'wss://host.example:443/sig',
+    );
+  });
+
+  it('brackets bare IPv6 literals and preserves bracketed ones', () => {
+    expect(normalizeSignalingUrl('fe80::1')).toBe('ws://[fe80::1]:8787');
+    expect(normalizeSignalingUrl('[fe80::1]')).toBe('ws://[fe80::1]:8787');
+    expect(normalizeSignalingUrl('[fe80::1]:9000')).toBe('ws://[fe80::1]:9000');
   });
 });
 

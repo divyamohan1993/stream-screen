@@ -60,6 +60,35 @@ export function signalingUrlForHost(host: DiscoveredHost): string | null {
   return `ws://${authority}:${host.port}`;
 }
 
+/**
+ * Normalize a user-entered signaling server value into a WebSocket URL.
+ *
+ * Accepts either a full ws/wss URL (returned as-is after trimming) or a bare
+ * `host` / `host:port` authority, which is promoted to `ws://host:port`
+ * (defaulting to port 8787 when none is given). IPv6 literals may be supplied
+ * bracketed (`[::1]:8787`) or bare (`::1`); a bare literal is bracketed here.
+ *
+ * Returns `null` for an empty/blank value so callers can fall back to the
+ * derived default signaling URL.
+ */
+export function normalizeSignalingUrl(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  // Already a ws/wss URL — accept verbatim.
+  if (/^wss?:\/\//i.test(trimmed)) return trimmed;
+  // Bracketed IPv6 authority, optionally with :port.
+  const bracketed = /^\[[^\]]+\](?::\d+)?$/.exec(trimmed);
+  if (bracketed) {
+    return /\]:\d+$/.test(trimmed) ? `ws://${trimmed}` : `ws://${trimmed}:8787`;
+  }
+  // Bare IPv6 literal (more than one colon and no brackets) → bracket it.
+  if ((trimmed.match(/:/g)?.length ?? 0) > 1) {
+    return `ws://[${trimmed}]:8787`;
+  }
+  // host or host:port.
+  return /:\d+$/.test(trimmed) ? `ws://${trimmed}` : `ws://${trimmed}:8787`;
+}
+
 function isDiscoveredHost(v: unknown): v is DiscoveredHost {
   if (v === null || typeof v !== 'object') return false;
   const o = v as Record<string, unknown>;

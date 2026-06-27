@@ -9,7 +9,9 @@ import {
   buildMonitorList,
   geometryForSource,
   isPrimaryGeometry,
+  normalizedToPhysicalPoint,
   normalizedToVirtualPixels,
+  toPhysicalRect,
   type DisplayGeometry,
   type RawScreenSource,
 } from '../src/monitor.js';
@@ -20,10 +22,13 @@ const primary: DisplayGeometry = {
   scaleFactor: 1,
 };
 // Secondary monitor to the right, scaled 150% (HiDPI). Logical 1280x800.
+// Its TRUE physical origin is (1920,0): the 100% primary contributes exactly
+// 1920 physical px before it. (bounds.x * scaleFactor = 2880 would be wrong.)
 const secondaryHiDPI: DisplayGeometry = {
   id: 2,
   bounds: { x: 1920, y: 0, width: 1280, height: 800 },
   scaleFactor: 1.5,
+  physicalOrigin: { x: 1920, y: 0 },
 };
 
 const sources: RawScreenSource[] = [
@@ -82,18 +87,83 @@ describe('normalizedToVirtualPixels', () => {
   });
 
   it('offsets coords onto a secondary display (the misaim fix)', () => {
-    // Centre of the secondary (physical 1920x1200) anchored at x=1920*1.5=2880.
+    // Centre of the secondary (physical 1920x1200) anchored at its REAL physical
+    // origin (1920,0) — NOT bounds.x * scaleFactor (2880).
     const p = normalizedToVirtualPixels(0.5, 0.5, secondaryHiDPI);
-    // origin x = 1920 * 1.5 = 2880; local centre = round(0.5*(1920-1)) = 960.
-    expect(p.x).toBe(2880 + 960);
+    expect(p.x).toBe(1920 + 960);
     expect(p.y).toBe(0 + Math.round(0.5 * (1200 - 1)));
   });
 
   it('maps the secondary top-left to its physical origin', () => {
-    expect(normalizedToVirtualPixels(0, 0, secondaryHiDPI)).toEqual({ x: 2880, y: 0 });
+    expect(normalizedToVirtualPixels(0, 0, secondaryHiDPI)).toEqual({ x: 1920, y: 0 });
   });
 
   it('clamps out-of-range normalized values', () => {
     expect(normalizedToVirtualPixels(-1, 2, primary)).toEqual({ x: 0, y: 1079 });
+  });
+
+  // REGRESSION (P2): a mixed-DPI multi-monitor layout must place a scaled
+  // secondary at the correct CUMULATIVE physical origin. The old code computed
+  // the origin as bounds.x * thisDisplay.scaleFactor, which moved every injected
+  // pointer coordinate by the wrong offset (left edge -> 2880 instead of 1920).
+  // These assertions fail with that math and pass once the real physicalOrigin
+  // (screen.dipToScreenPoint) is used.
+  describe('mixed-DPI virtual desktop (100% primary + 150% secondary)', () => {
+    it('maps the secondary normalized (0,0) to the true adjacent edge ~(1920,0), not 2880', () => {
+      const p = normalizedToVirtualPixels(0, 0, secondaryHiDPI);
+      expect(p).toEqual({ x: 1920, y: 0 });
+      expect(p.x).not.toBe(2880);
+    });
+
+    it('maps the secondary normalized (1,1) to its far physical corner', () => {
+      // Physical extent 1280*1.5=1920 x 800*1.5=1200; far corner =
+      // origin(1920,0) + (width-1, height-1) = (1920+1919, 0+1199).
+      expect(normalizedToVirtualPixels(1, 1, secondaryHiDPI)).toEqual({ x: 3839, y: 1199 });
+    });
+
+    it('leaves the all-100% single-display case unchanged', () => {
+      // No physicalOrigin and uniform scale: identical to the legacy mapping.
+      expect(normalizedToVirtualPixels(0, 0, primary)).toEqual({ x: 0, y: 0 });
+      expect(normalizedToVirtualPixels(1, 1, primary)).toEqual({ x: 1919, y: 1079 });
+      expect(normalizedToVirtualPixels(0.5, 0.5, primary)).toEqual({ x: 960, y: 540 });
+    });
+  });
+});
+
+describe('toPhysicalRect', () => {
+  it('uses physicalOrigin when present (correct for mixed DPI)', () => {
+    expect(toPhysicalRect(secondaryHiDPI)).toEqual({
+      originX: 1920,
+      originY: 0,
+      width: 1920,
+      height: 1200,
+    });
+  });
+
+  it('falls back to bounds * scaleFactor when physicalOrigin is absent', () => {
+    const noOrigin: DisplayGeometry = {
+      id: 3,
+      bounds: { x: 1920, y: 0, width: 1280, height: 800 },
+      scaleFactor: 1.5,
+    };
+    expect(toPhysicalRect(noOrigin)).toEqual({
+      originX: 2880,
+      originY: 0,
+      width: 1920,
+      height: 1200,
+    });
+  });
+});
+
+describe('normalizedToPhysicalPoint (pure math)', () => {
+  it('scales and offsets within a physical rect', () => {
+    const rect = { originX: 1920, originY: 0, width: 1920, height: 1200 };
+    expect(normalizedToPhysicalPoint(0, 0, rect)).toEqual({ x: 1920, y: 0 });
+    expect(normalizedToPhysicalPoint(1, 1, rect)).toEqual({ x: 3839, y: 1199 });
+  });
+
+  it('clamps out-of-range normalized values', () => {
+    const rect = { originX: 0, originY: 0, width: 1920, height: 1080 };
+    expect(normalizedToPhysicalPoint(-1, 2, rect)).toEqual({ x: 0, y: 1079 });
   });
 });

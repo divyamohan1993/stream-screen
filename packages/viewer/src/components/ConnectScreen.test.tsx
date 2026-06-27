@@ -29,6 +29,11 @@ describe('ConnectScreen', () => {
   beforeEach(() => {
     discoverHosts.mockReset();
     discoverHosts.mockResolvedValue([]);
+    try {
+      globalThis.localStorage?.clear();
+    } catch {
+      /* no storage in this environment */
+    }
   });
 
   it('disables Connect until a valid 6–9 digit code is entered', () => {
@@ -105,6 +110,56 @@ describe('ConnectScreen', () => {
     fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
     // Manual entry passes only the code; App falls back to defaultSignalingUrl().
     expect(onConnect).toHaveBeenCalledWith('123456');
+  });
+
+  it('manual connect with a configured signaling host:port targets THAT server', () => {
+    // Regression for FINDING P2: a viewer NOT served by the signaling machine
+    // must be able to point a manual code at the right server. host:port is
+    // normalized to a ws:// URL and threaded through onConnect.
+    const onConnect = vi.fn();
+    render(<ConnectScreen onConnect={onConnect} />);
+    fireEvent.change(screen.getByLabelText(/session code/i), { target: { value: '123456' } });
+    fireEvent.change(screen.getByLabelText(/signaling server/i), {
+      target: { value: '192.168.1.10:8787' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    expect(onConnect).toHaveBeenCalledWith('123456', 'ws://192.168.1.10:8787');
+  });
+
+  it('manual connect with a full ws URL targets THAT server verbatim', () => {
+    const onConnect = vi.fn();
+    render(<ConnectScreen onConnect={onConnect} />);
+    fireEvent.change(screen.getByLabelText(/session code/i), { target: { value: '123456' } });
+    fireEvent.change(screen.getByLabelText(/signaling server/i), {
+      target: { value: 'ws://192.168.1.10:8787' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    expect(onConnect).toHaveBeenCalledWith('123456', 'ws://192.168.1.10:8787');
+  });
+
+  it('manual connect with an EMPTY signaling field omits the override (uses default)', () => {
+    const onConnect = vi.fn();
+    render(<ConnectScreen onConnect={onConnect} />);
+    fireEvent.change(screen.getByLabelText(/session code/i), { target: { value: '123456' } });
+    // Leave the signaling field blank.
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    expect(onConnect).toHaveBeenCalledWith('123456');
+    expect(onConnect.mock.calls[0]).toHaveLength(1);
+  });
+
+  it('persists the configured signaling server and restores it on next mount', () => {
+    const first = render(<ConnectScreen onConnect={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText(/session code/i), { target: { value: '123456' } });
+    fireEvent.change(screen.getByLabelText(/signaling server/i), {
+      target: { value: '192.168.1.10:8787' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    first.unmount();
+
+    // Remount: the field is seeded from the persisted value.
+    render(<ConnectScreen onConnect={vi.fn()} />);
+    const restored = screen.getByLabelText(/signaling server/i) as HTMLInputElement;
+    expect(restored.value).toBe('192.168.1.10:8787');
   });
 
   it('does NOT auto-connect on a host with an invalid (too-short) code; prefills+focuses the field', async () => {

@@ -27,6 +27,20 @@ export interface DisplayGeometry {
   bounds: { x: number; y: number; width: number; height: number };
   /** Per-display DPI scale factor (e.g. 1.5 for 150% Windows scaling). */
   scaleFactor: number;
+  /**
+   * The display's TRUE top-left in virtual-desktop PHYSICAL pixels, as reported
+   * by Electron's `screen.dipToScreenPoint(bounds)`. This is the cumulative
+   * physical origin across all displays and is the ONLY correct way to place a
+   * display on a mixed-DPI virtual desktop. Multiplying the DIP origin
+   * (`bounds.x`) by this display's own `scaleFactor` is WRONG whenever an
+   * earlier display has a different scale — e.g. a 100% 1920px primary plus a
+   * 150% secondary at DIP x=1920 has physical origin x=1920, NOT 1920*1.5=2880.
+   *
+   * Optional for backward compatibility: when absent, the mapping falls back to
+   * `bounds.{x,y} * scaleFactor`, which is exact for the all-100% single-display
+   * (and any uniform-scale) case the host historically supported.
+   */
+  physicalOrigin?: { x: number; y: number };
 }
 
 /** The subset of an Electron `desktopCapturer` screen source we depend on. */
@@ -87,15 +101,78 @@ export interface VirtualPoint {
 }
 
 /**
+ * A display fully expressed in virtual-desktop PHYSICAL pixels: its true origin
+ * and its physical width/height. This is the canonical input to the coordinate
+ * math — no DIP/scale ambiguity remains once a display is reduced to this shape.
+ */
+export interface PhysicalDisplayRect {
+  /** True top-left in virtual-desktop physical pixels (cumulative across displays). */
+  originX: number;
+  originY: number;
+  /** Physical pixel extent of the display. */
+  width: number;
+  height: number;
+}
+
+/**
+ * Reduce a {@link DisplayGeometry} to its {@link PhysicalDisplayRect}.
+ *
+ * The physical EXTENT is always `bounds.{width,height} * scaleFactor` (a
+ * per-display quantity, so this is correct). The physical ORIGIN is taken from
+ * `physicalOrigin` when present (Electron `screen.dipToScreenPoint(bounds)` —
+ * the only value correct across mixed-DPI layouts). When absent we fall back to
+ * `bounds.{x,y} * scaleFactor`, which is exact for uniform-scale layouts (and
+ * the historical all-100% single-display case) but WRONG once an earlier
+ * display has a different scale.
+ */
+export function toPhysicalRect(geom: DisplayGeometry): PhysicalDisplayRect {
+  const width = geom.bounds.width * geom.scaleFactor;
+  const height = geom.bounds.height * geom.scaleFactor;
+  const originX = geom.physicalOrigin
+    ? geom.physicalOrigin.x
+    : geom.bounds.x * geom.scaleFactor;
+  const originY = geom.physicalOrigin
+    ? geom.physicalOrigin.y
+    : geom.bounds.y * geom.scaleFactor;
+  return { originX, originY, width, height };
+}
+
+/**
+ * PURE coordinate math: map a normalized (0..1) pointer coord — relative to the
+ * captured frame of ONE display — into an absolute virtual-desktop PHYSICAL
+ * pixel point, given that display's {@link PhysicalDisplayRect}.
+ *
+ * nut.js moves the cursor in the virtual desktop's physical-pixel space (origin
+ * at the primary display's top-left), so we scale the normalized coord across
+ * the display's physical extent and offset by its true physical origin. Keeping
+ * this free of DIP/scale lets it be exhaustively unit-tested with synthetic
+ * mixed-DPI layouts.
+ *
+ * Inputs are clamped to [0,1]; the result is rounded to whole pixels.
+ */
+export function normalizedToPhysicalPoint(
+  x: number,
+  y: number,
+  rect: PhysicalDisplayRect,
+): VirtualPoint {
+  const nx = clamp01(x);
+  const ny = clamp01(y);
+  const localX = Math.min(rect.width - 1, Math.max(0, Math.round(nx * (rect.width - 1))));
+  const localY = Math.min(rect.height - 1, Math.max(0, Math.round(ny * (rect.height - 1))));
+  return { x: Math.round(rect.originX + localX), y: Math.round(rect.originY + localY) };
+}
+
+/**
  * Translate a normalized (0..1) pointer coordinate — relative to the captured
  * frame of ONE display — into an absolute virtual-desktop PHYSICAL pixel point.
  *
- * This is the multi-monitor / HiDPI fix. nut.js moves the cursor in the virtual
- * desktop's physical-pixel space (origin at the primary display's top-left), so
- * we must:
- *   1. scale the normalized coord across that display's physical extent
- *      (bounds * scaleFactor), then
- *   2. offset by that display's physical origin (bounds.{x,y} * scaleFactor).
+ * This is the multi-monitor / HiDPI fix. It reduces the display to its true
+ * physical rect (see {@link toPhysicalRect}) and applies the pure
+ * {@link normalizedToPhysicalPoint} math. Crucially the offset uses the
+ * display's REAL physical origin (`physicalOrigin` from
+ * `screen.dipToScreenPoint`), NOT `bounds.x * scaleFactor` — so a 150% secondary
+ * adjacent to a 100% primary maps its left edge to the correct cumulative
+ * physical edge (1920) rather than 2880.
  *
  * For the primary display (origin 0,0, scale 1) this reduces to the previous
  * behaviour. For a secondary or 150%-scaled monitor it lands the cursor on the
@@ -108,16 +185,7 @@ export function normalizedToVirtualPixels(
   y: number,
   geom: DisplayGeometry,
 ): VirtualPoint {
-  const nx = clamp01(x);
-  const ny = clamp01(y);
-  const physW = geom.bounds.width * geom.scaleFactor;
-  const physH = geom.bounds.height * geom.scaleFactor;
-  const originX = geom.bounds.x * geom.scaleFactor;
-  const originY = geom.bounds.y * geom.scaleFactor;
-  // Map into [0, physW-1] within the display, then offset to virtual space.
-  const localX = Math.min(physW - 1, Math.max(0, Math.round(nx * (physW - 1))));
-  const localY = Math.min(physH - 1, Math.max(0, Math.round(ny * (physH - 1))));
-  return { x: Math.round(originX + localX), y: Math.round(originY + localY) };
+  return normalizedToPhysicalPoint(x, y, toPhysicalRect(geom));
 }
 
 function clamp01(v: number): number {
