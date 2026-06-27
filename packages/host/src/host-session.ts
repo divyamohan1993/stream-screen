@@ -602,6 +602,34 @@ export class HostSession {
   }
 
   /**
+   * Change the shared CAPTURE SOURCE at runtime IN PLACE — the host operator
+   * picking a different screen from the source dropdown.
+   *
+   * This MUST NOT leave and rejoin the signaling room. The earlier renderer
+   * implementation tore the whole session down (`stop()`, which closes the
+   * signaling socket) and immediately constructed a fresh {@link HostSession}
+   * with the SAME code. Because {@link stop} returns BEFORE the signaling server
+   * has observed the host's departure, the new join could race ahead and be
+   * rejected as `host-exists` (duplicate host codes are rejected), leaving the
+   * operator with NO advertised session after a source switch.
+   *
+   * Instead we reuse the very same in-place mechanism as a monitor switch:
+   * re-capture the chosen source and swap the outbound video track via
+   * `replaceVideoTrack` (NO renegotiation, NO signaling leave/rejoin). The
+   * room/code/socket stay joined and advertised across the change, so the
+   * `host-exists` race cannot happen at all. There is no session time limit or
+   * usage cap involved anywhere here.
+   *
+   * No-op if the requested source is already the active one (avoids a needless
+   * re-capture + track swap). Delegates to {@link switchMonitor}, which is the
+   * authoritative in-place re-capture + track-replace path.
+   */
+  async switchSource(sourceId: string): Promise<void> {
+    if (sourceId === this.activeSourceId) return;
+    await this.switchMonitor(sourceId);
+  }
+
+  /**
    * Enable/disable the outbound system-audio track in response to a viewer
    * `{t:'audio'}` toggle. Disabling mutes by setting `track.enabled=false`
    * (keeps the sender so re-enabling needs no renegotiation).

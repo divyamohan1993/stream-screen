@@ -199,7 +199,11 @@ Key points:
   **not** a session limit) throws `ViewerJoinRejectedError` and fully tears the
   session down — closing the peer and **closing the `SignalingClient`** so its
   remembered `lastJoin` can never reconnect and replay a rejected join. The same
-  ack gate guards the ICE-reconnect peer rebuild. `App.connect` also disconnects
+  ack gate guards the ICE-reconnect peer rebuild, and a rejected/timed-out rebuild
+  join gets the **identical full teardown** (`teardownForError`): the freshly-built
+  peer and the SignalingClient are closed and the stats loop stopped, so a failed
+  rebuild ends cleanly in `error` instead of leaving a dangling peer plus a socket
+  that keeps reconnecting and replaying the rejected join. `App.connect` also disconnects
   any prior session before creating a new one, guaranteeing at most one live
   session.
 
@@ -431,7 +435,15 @@ flowchart LR
   (`replaceTrack`) — no SDP renegotiation, no session teardown — then acks
   `monitor-switched`. Only the *previous* tracks are stopped; the newly swapped-in
   track is kept live, so the viewer sees the new monitor instead of a frozen
-  frame.
+  frame. The **host operator's own capture-source switch** (the control-window
+  dropdown) uses this very same in-place path (`HostSession.switchSource` →
+  `switchMonitor` → `replaceVideoTrack`): it re-captures the chosen source and
+  swaps the outbound track **without leaving and rejoining the signaling room**.
+  The earlier renderer stopped the session and immediately created a new one with
+  the same code, but `stop()` returns before the server observes the host's
+  departure, so the fresh join could race ahead and be rejected as `host-exists`
+  — leaving the operator with no advertised session after a source change. Staying
+  joined in place removes the race entirely.
 - **File transfer.** `FileTransferManager` (`core/src/file-transfer.ts`) is a
   pure, DOM-free chunker/reassembler. The sender emits `file-offer`, awaits
   `file-accept`, streams 16 KiB chunks over the binary `file` channel, then

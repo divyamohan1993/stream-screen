@@ -472,10 +472,48 @@ export class ViewerSession {
         this.setState('error', m.message ?? 'Signaling error');
       });
     } catch (err) {
+      // The rebuild's fresh join was REJECTED or TIMED OUT (e.g. the host left
+      // during the reconnect grace period). Mirror connect()'s join-error
+      // teardown discipline: the freshly-created peer and signaling are left
+      // dangling otherwise — the SignalingClient remembers the failed join and
+      // keeps reconnecting and REPLAYING it while the UI is already in 'error',
+      // and the stats loop (armed back at connect()) keeps polling. Fully tear
+      // down: close the fresh peer AND signaling (so lastJoin is never
+      // reconnected/replayed) and stop the stats loop, leaving the session
+      // cleanly in 'error'. This is a hard failure (the room is gone), NOT a
+      // transparent recovery, so the session ends here — it imposes no time
+      // limit; the path is reached only on a real join rejection/timeout.
+      this.teardownForError();
       this.setState('error', err instanceof Error ? err.message : 'Reconnection failed');
     } finally {
       this.rebuilding = false;
     }
+  }
+
+  /**
+   * Tear down all live resources after an unrecoverable failure (e.g. the ICE
+   * rebuild's fresh join was rejected/timed out). Closes the peer and the
+   * SignalingClient — closing the socket clears its reconnect schedule so a
+   * remembered `lastJoin` can never be reconnected/replayed — and stops the
+   * stats loop. Marks the session `closed` so no further peer-state event acts.
+   * Leaves state-setting to the caller (so it can surface `error`). Mirrors
+   * {@link disconnect}'s teardown without forcing a `disconnected` state.
+   */
+  private teardownForError(): void {
+    this.closed = true;
+    this.clearReconnectTimer();
+    if (this.statsTimer) {
+      clearInterval(this.statsTimer);
+      this.statsTimer = null;
+    }
+    for (const sender of this.outboundSenders.values()) sender.abort('disconnected');
+    this.outboundSenders.clear();
+    this.fileManager = null;
+    this.peer?.close();
+    this.peer = null;
+    this.signaling?.close();
+    this.signaling = null;
+    this.stream = null;
   }
 
   private startStatsLoop(): void {

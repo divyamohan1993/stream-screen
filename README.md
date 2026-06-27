@@ -287,7 +287,12 @@ viewer **awaits the signaling server's `joined` acknowledgement** before
 reporting connected and starting its stats loop; a rejected join (e.g.
 `no-such-session` for a code that names no live host, or a full room) or a
 handshake timeout tears the session fully down — closing the peer and the
-signaling client so no socket is left replaying a rejected join. By default — with no
+signaling client so no socket is left replaying a rejected join. The same
+teardown discipline guards the **ICE-reconnect rebuild**: if the rebuild's fresh
+join is rejected or times out (e.g. the host left during the reconnect grace
+period) the viewer fully tears the failed rebuild down — closing the new peer and
+the signaling client and stopping the stats loop — and ends cleanly in `error`
+rather than leaving a peer and a reconnecting socket dangling. By default — with no
 `STREAMSCREEN_ALLOWED_ORIGINS` configured — the signaling server accepts WS
 handshakes whose browser `Origin` is loopback, the same host as the server (on
 **any** port, so the Vite dev viewer on `:5173` reaches signaling on `:8787`), or
@@ -336,7 +341,12 @@ file-transfer signaling) and a reliable binary `file` channel (the file bytes).
   (`request-monitors`), shows a picker, and switches the streamed display
   (`switch-monitor`). The host swaps the outbound video track **in place**
   (`replaceTrack`, no SDP renegotiation) and acks with `monitor-switched`, so the
-  switch is near-instant and never tears down the session.
+  switch is near-instant and never tears down the session. The **host operator's
+  own source dropdown** uses the same in-place path: picking a different screen
+  re-captures and swaps the outbound track via `replaceVideoTrack` **without
+  leaving and rejoining the signaling room**, so it can never lose the session to
+  a `host-exists` rejection (the old code stopped the session and immediately
+  re-joined with the same code, racing ahead of the server-observed leave).
 
 - **Session recording.** The viewer can record the incoming remote `MediaStream`
   with the browser's `MediaRecorder` and save a downloadable **`.webm`**. Recording

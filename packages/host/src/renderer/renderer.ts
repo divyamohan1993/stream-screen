@@ -7,7 +7,7 @@
  * the main process for OS-level injection.
  */
 
-import { HostSession } from '../host-session.js';
+import { HostSession, type HostSessionOptions } from '../host-session.js';
 import { normalizeSources, pickDefaultSource, type CaptureSource } from '../capture.js';
 import type { StreamScreenHostApi } from '../preload.js';
 import type { FileMeta } from '@stream-screen/core';
@@ -18,21 +18,150 @@ declare global {
   }
 }
 
-const api = window.streamscreen;
+/** The boot config fields the controller needs to spin up / switch a session. */
+export interface SessionConfig {
+  signalingUrl: string;
+  code: string;
+  hostName: string;
+}
 
-const $code = document.getElementById('code') as HTMLDivElement;
-const $source = document.getElementById('source') as HTMLSelectElement;
-const $stats = document.getElementById('stats') as HTMLDivElement;
+/** A factory for {@link HostSession} (overridable in tests). */
+export type HostSessionFactory = (opts: HostSessionOptions) => HostSession;
 
-let session: HostSession | null = null;
-let sources: CaptureSource[] = [];
+const defaultHostSessionFactory: HostSessionFactory = (opts) => new HostSession(opts);
 
+/**
+ * Owns the single live {@link HostSession} for the host control window and the
+ * logic for starting it and changing its capture source.
+ *
+ * Pulled out of module scope (and away from direct DOM access) so the
+ * source-switch behavior is unit-testable without Electron or a DOM: tests
+ * construct a controller with a fake preload `api` and a fake session factory.
+ */
+export class SessionController {
+  private session: HostSession | null = null;
+
+  constructor(
+    private readonly api: StreamScreenHostApi,
+    private readonly onStatusText: (text: string) => void = () => {},
+    private readonly makeSession: HostSessionFactory = defaultHostSessionFactory,
+  ) {}
+
+  /** The current live session, or null. Exposed for assertions/teardown. */
+  get current(): HostSession | null {
+    return this.session;
+  }
+
+  /**
+   * Handle the operator picking a different capture source from the dropdown.
+   *
+   * CRITICAL: when a session is already live we switch the capture source IN
+   * PLACE on the existing {@link HostSession} (re-capture + replaceVideoTrack)
+   * rather than stopping and re-creating one with the same code. The old code
+   * did `session?.stop()` then immediately `new HostSession(...).start()`, but
+   * `stop()` only calls `WebSocket.close()` and returns BEFORE the signaling
+   * server has processed the host's departure — so the fresh join could race
+   * ahead of the server-observed leave and be REJECTED as `host-exists`
+   * (duplicate host codes are now rejected). The handler also ignored the
+   * returned promise, so a rejected re-join left the operator with NO advertised
+   * session after a source change. Switching in place keeps the room/code/socket
+   * joined and advertised the whole time, so the `host-exists` race cannot
+   * happen at all. There is no session time limit or usage cap anywhere here.
+   *
+   * If there is no live session yet (e.g. the very first selection, or after a
+   * prior failure left `session` null), we fall back to a full
+   * {@link startSession}. Both paths return the promise so the caller does not
+   * silently swallow a rejected join.
+   */
+  async changeSource(cfg: SessionConfig, sourceId: string): Promise<void> {
+    const current = this.session;
+    if (current) {
+      // In-place: no signaling leave/rejoin, so no host-exists race.
+      await current.switchSource(sourceId);
+      // Keep the main process's active-display mapping in sync. HostSession also
+      // fires onActiveDisplay, but call here too in case the source was already
+      // active and switchSource short-circuited.
+      this.api.setActiveDisplay(sourceId);
+      return;
+    }
+    // No live session — do a full start (and don't swallow its rejection).
+    await this.startSession(cfg, sourceId);
+  }
+
+  /**
+   * Start a fresh session for `sourceId`, tearing down any previous one first.
+   * Used for the very first capture and when no session is currently live.
+   */
+  async startSession(cfg: SessionConfig, sourceId: string): Promise<void> {
+    this.session?.stop();
+    // Inform the main process which display is shared so remote clicks land on
+    // the right monitor (multi-monitor / HiDPI coordinate mapping).
+    this.api.setActiveDisplay(sourceId);
+    const session = this.makeSession({
+      signalingUrl: cfg.signalingUrl,
+      code: cfg.code,
+      hostName: cfg.hostName,
+      sourceId,
+      getMonitors: () => this.api.getMonitors(),
+      onActiveDisplay: (id) => this.api.setActiveDisplay(id),
+      onFileReceived: (data, meta: FileMeta) => {
+        void this.api.saveFile({ name: meta.name, mime: meta.mime, data });
+      },
+      onChat: (text) => {
+        this.onStatusText(`Chat from viewer: ${text}`);
+      },
+      onInput: (e) => this.api.injectInput(e),
+      // Route the Ctrl+Alt+Del chord (detected in HostSession) through the combo
+      // path so the main process can invoke the real Windows SAS API (SendSAS)
+      // instead of replaying synthetic key presses the secure desktop ignores.
+      onCombo: (events) => this.api.injectCombo(events),
+      onState: (state) => {
+        this.api.reportStatus(state);
+        this.onStatusText(`Connection: ${state}`);
+      },
+      onDecision: (d, s) => {
+        this.onStatusText(
+          [
+            `Connection: live`,
+            `RTT ${s.rttMs.toFixed(0)} ms · loss ${s.lossPct.toFixed(1)}% · jitter ${s.jitterMs.toFixed(0)} ms`,
+            `${s.width}x${s.height} @ ${s.fps.toFixed(0)} fps`,
+            `Target ${(d.targetKbps / 1000).toFixed(1)} Mbps · ${d.maxFramerate} fps · scale ÷${d.scaleResolutionDownBy}`,
+            `Reason: ${d.reason}`,
+          ].join('\n'),
+        );
+        this.api.reportStatus(`${(d.targetKbps / 1000).toFixed(1)}Mbps`);
+      },
+    });
+    this.session = session;
+    await session.start();
+  }
+
+  /** Tear down the live session, if any. */
+  stop(): void {
+    this.session?.stop();
+  }
+}
+
+/**
+ * Wire the {@link SessionController} to the real DOM and preload bridge. Runs
+ * only in the actual renderer (where `window`/`document` exist); guarded so the
+ * module can be imported in a node test without crashing on missing globals.
+ */
 async function boot(): Promise<void> {
+  const api = window.streamscreen;
+  const $code = document.getElementById('code') as HTMLDivElement;
+  const $source = document.getElementById('source') as HTMLSelectElement;
+  const $stats = document.getElementById('stats') as HTMLDivElement;
+
+  const controller = new SessionController(api, (text) => {
+    $stats.textContent = text;
+  });
+
   const cfg = await api.getBootConfig();
   $code.textContent = cfg.code;
 
   const raw = await api.getSources();
-  sources = normalizeSources(raw);
+  const sources: CaptureSource[] = normalizeSources(raw);
   $source.innerHTML = '';
   for (const s of sources) {
     const opt = document.createElement('option');
@@ -43,61 +172,29 @@ async function boot(): Promise<void> {
   const def = pickDefaultSource(sources);
   if (def) $source.value = def.id;
 
+  const sessionCfg: SessionConfig = {
+    signalingUrl: cfg.signalingUrl,
+    code: cfg.code,
+    hostName: cfg.hostName,
+  };
+
   $source.addEventListener('change', () => {
-    void startSession(cfg.signalingUrl, cfg.code, cfg.hostName, $source.value);
+    void controller.changeSource(sessionCfg, $source.value).catch((err) => {
+      $stats.textContent = `Error: ${err instanceof Error ? err.message : String(err)}`;
+    });
   });
 
-  if (def) await startSession(cfg.signalingUrl, cfg.code, cfg.hostName, def.id);
+  window.addEventListener('beforeunload', () => controller.stop());
+
+  if (def) await controller.startSession(sessionCfg, def.id);
 }
 
-async function startSession(
-  signalingUrl: string,
-  code: string,
-  hostName: string,
-  sourceId: string,
-): Promise<void> {
-  session?.stop();
-  // Inform the main process which display is shared so remote clicks land on the
-  // right monitor (multi-monitor / HiDPI coordinate mapping).
-  api.setActiveDisplay(sourceId);
-  session = new HostSession({
-    signalingUrl,
-    code,
-    hostName,
-    sourceId,
-    getMonitors: () => api.getMonitors(),
-    onActiveDisplay: (id) => api.setActiveDisplay(id),
-    onFileReceived: (data, meta: FileMeta) => {
-      void api.saveFile({ name: meta.name, mime: meta.mime, data });
-    },
-    onChat: (text) => {
-      $stats.textContent = `Chat from viewer: ${text}`;
-    },
-    onInput: (e) => api.injectInput(e),
-    // Route the Ctrl+Alt+Del chord (detected in HostSession) through the combo
-    // path so the main process can invoke the real Windows SAS API (SendSAS)
-    // instead of replaying synthetic key presses the secure desktop ignores.
-    onCombo: (events) => api.injectCombo(events),
-    onState: (state) => {
-      api.reportStatus(state);
-      $stats.textContent = `Connection: ${state}`;
-    },
-    onDecision: (d, s) => {
-      $stats.textContent = [
-        `Connection: live`,
-        `RTT ${s.rttMs.toFixed(0)} ms · loss ${s.lossPct.toFixed(1)}% · jitter ${s.jitterMs.toFixed(0)} ms`,
-        `${s.width}x${s.height} @ ${s.fps.toFixed(0)} fps`,
-        `Target ${(d.targetKbps / 1000).toFixed(1)} Mbps · ${d.maxFramerate} fps · scale ÷${d.scaleResolutionDownBy}`,
-        `Reason: ${d.reason}`,
-      ].join('\n');
-      api.reportStatus(`${(d.targetKbps / 1000).toFixed(1)}Mbps`);
-    },
+// Only bootstrap against a real renderer DOM. In a node/unit-test import there
+// is no `window`/`document`, so we skip the side effects and just export the
+// testable SessionController above.
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  void boot().catch((err) => {
+    const $stats = document.getElementById('stats');
+    if ($stats) $stats.textContent = `Error: ${err instanceof Error ? err.message : String(err)}`;
   });
-  await session.start();
 }
-
-window.addEventListener('beforeunload', () => session?.stop());
-
-void boot().catch((err) => {
-  $stats.textContent = `Error: ${err instanceof Error ? err.message : String(err)}`;
-});
