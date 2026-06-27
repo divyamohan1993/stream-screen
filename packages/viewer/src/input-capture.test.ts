@@ -6,6 +6,7 @@ import {
   MOD_CTRL,
   MOD_META,
   MOD_SHIFT,
+  contentBox,
   mapButton,
   modsFrom,
   normalizePointer,
@@ -333,5 +334,176 @@ describe('InputCapture — event emission', () => {
     });
     await capture.applyClipboardFromHost('hello');
     expect(writeText).toHaveBeenCalledWith('hello');
+  });
+
+  // FINDING B regression: a drag that begins on the video but is RELEASED
+  // outside the element (over the toolbar / past the edge) must still forward an
+  // m-up, otherwise the host injector leaves the remote button held.
+  it('forwards m-up for a mouseup dispatched on document outside the video', () => {
+    video.dispatchEvent(new MouseEvent('mousedown', { clientX: 500, clientY: 250, button: 0 }));
+    // The release lands on the document, NOT on the video element (drag ended
+    // off-stage). The document-level fallback must still capture it.
+    document.dispatchEvent(new MouseEvent('mouseup', { clientX: 0, clientY: 0, button: 0 }));
+    expect(sent).toEqual([
+      { t: 'm-down', x: 0.5, y: 0.5, button: 0 },
+      { t: 'm-up', x: 0, y: 0, button: 0 },
+    ]);
+  });
+
+  it('does not double-send m-up when the release happens over the video (bubbles to document)', () => {
+    video.dispatchEvent(new MouseEvent('mousedown', { clientX: 500, clientY: 250, button: 0 }));
+    // A real release over the video both fires the element listener and bubbles
+    // to the document listener; only ONE m-up may be sent.
+    video.dispatchEvent(new MouseEvent('mouseup', { clientX: 500, clientY: 250, button: 0, bubbles: true }));
+    expect(sent.filter((e) => e.t === 'm-up')).toEqual([{ t: 'm-up', x: 0.5, y: 0.5, button: 0 }]);
+  });
+
+  it('ignores an outside mouseup with no matching pressed button', () => {
+    // No mousedown was forwarded for this button, so a stray document mouseup
+    // (e.g. interacting with the viewer UI) must NOT fabricate an m-up.
+    document.dispatchEvent(new MouseEvent('mouseup', { clientX: 0, clientY: 0, button: 0 }));
+    expect(sent).toEqual([]);
+  });
+
+  it('forwards the correct button for a multi-button drag released outside', () => {
+    video.dispatchEvent(new MouseEvent('mousedown', { clientX: 500, clientY: 250, button: 2 }));
+    document.dispatchEvent(new MouseEvent('mouseup', { clientX: -50, clientY: -50, button: 2 }));
+    expect(sent).toEqual([
+      { t: 'm-down', x: 0.5, y: 0.5, button: 2 },
+      { t: 'm-up', x: 0, y: 0, button: 2 },
+    ]);
+  });
+
+  it('stops capturing outside-release mouseups after detach', () => {
+    video.dispatchEvent(new MouseEvent('mousedown', { clientX: 500, clientY: 250, button: 0 }));
+    capture.detach();
+    sent = [];
+    document.dispatchEvent(new MouseEvent('mouseup', { clientX: 0, clientY: 0, button: 0 }));
+    expect(sent).toEqual([]);
+  });
+});
+
+describe('InputCapture — pointer-lock relative delta scaling (FINDING A)', () => {
+  let video: HTMLVideoElement;
+  let sent: InputEvent[];
+  let capture: InputCapture;
+  let clock: number;
+
+  beforeEach(() => {
+    sent = [];
+    clock = 0;
+    video = document.createElement('video');
+    // Remote screen is 1920x1080 intrinsic, but the element is RENDERED at half
+    // that size (960x540) — exactly the responsive/fullscreen mismatch the bug
+    // is about. Same aspect ratio so there is no letterboxing; the content box
+    // equals the CSS box (960x540).
+    video.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 960, height: 540, right: 960, bottom: 540, x: 0, y: 0, toJSON() {} }) as DOMRect;
+    Object.defineProperty(video, 'videoWidth', { value: 1920, configurable: true });
+    Object.defineProperty(video, 'videoHeight', { value: 1080, configurable: true });
+    document.body.appendChild(video);
+    capture = new InputCapture({
+      video,
+      send: (e) => sent.push(e),
+      moveThrottleMs: 0,
+      now: () => clock,
+    });
+    capture.attach();
+  });
+
+  afterEach(() => {
+    capture.detach();
+    video.remove();
+    Object.defineProperty(document, 'pointerLockElement', { value: null, configurable: true });
+  });
+
+  it('scales movementX/Y by the RENDERED content box, not the intrinsic size', () => {
+    // Engage pointer lock on the video.
+    Object.defineProperty(document, 'pointerLockElement', { value: video, configurable: true });
+    // Reset the accumulated lock position to a known origin so the delta is
+    // unambiguous: a free (unlocked) move at the top-left content corner.
+    Object.defineProperty(document, 'pointerLockElement', { value: null, configurable: true });
+    video.dispatchEvent(new MouseEvent('mousemove', { clientX: 0, clientY: 0 }));
+    sent = [];
+    Object.defineProperty(document, 'pointerLockElement', { value: video, configurable: true });
+
+    // movementX of 96 CSS px against the RENDERED 960px-wide box is 96/960 = 0.1
+    // of the host screen width — NOT 96/1920 = 0.05 (the intrinsic-size bug).
+    const move = new MouseEvent('mousemove', { clientX: 0, clientY: 0 });
+    Object.defineProperty(move, 'movementX', { value: 96, configurable: true });
+    Object.defineProperty(move, 'movementY', { value: 0, configurable: true });
+    video.dispatchEvent(move);
+
+    const last = sent.filter((e) => e.t === 'm-move').at(-1);
+    expect(last).toBeDefined();
+    if (last && last.t === 'm-move') {
+      expect(last.x).toBeCloseTo(0.1, 6);
+      expect(last.x).not.toBeCloseTo(0.05, 6);
+      expect(last.y).toBeCloseTo(0, 6);
+    }
+  });
+
+  it('scales vertical movement by the rendered content box height', () => {
+    Object.defineProperty(document, 'pointerLockElement', { value: null, configurable: true });
+    video.dispatchEvent(new MouseEvent('mousemove', { clientX: 0, clientY: 0 }));
+    sent = [];
+    Object.defineProperty(document, 'pointerLockElement', { value: video, configurable: true });
+
+    // movementY of 54 px against the rendered 540px-tall box is 54/540 = 0.1,
+    // not 54/1080 = 0.05.
+    const move = new MouseEvent('mousemove', { clientX: 0, clientY: 0 });
+    Object.defineProperty(move, 'movementX', { value: 0, configurable: true });
+    Object.defineProperty(move, 'movementY', { value: 54, configurable: true });
+    video.dispatchEvent(move);
+
+    const last = sent.filter((e) => e.t === 'm-move').at(-1);
+    if (last && last.t === 'm-move') {
+      expect(last.y).toBeCloseTo(0.1, 6);
+      expect(last.y).not.toBeCloseTo(0.05, 6);
+    }
+  });
+});
+
+describe('contentBox — rendered object-fit:contain rectangle', () => {
+  it('equals the CSS box when aspect ratios match', () => {
+    expect(
+      contentBox({
+        intrinsicWidth: 1920,
+        intrinsicHeight: 1080,
+        rect: { left: 0, top: 0, width: 960, height: 540 },
+      }),
+    ).toEqual({ left: 0, top: 0, width: 960, height: 540 });
+  });
+
+  it('shrinks height and centers vertically when letterboxed', () => {
+    // 1000x500 (2:1) in a 1000x1000 box → 1000x500 content, 250px top/bottom.
+    expect(
+      contentBox({
+        intrinsicWidth: 1000,
+        intrinsicHeight: 500,
+        rect: { left: 0, top: 0, width: 1000, height: 1000 },
+      }),
+    ).toEqual({ left: 0, top: 250, width: 1000, height: 500 });
+  });
+
+  it('shrinks width and centers horizontally when pillarboxed', () => {
+    // 500x1000 (1:2) in a 1000x1000 box → 500x1000 content, 250px left/right.
+    expect(
+      contentBox({
+        intrinsicWidth: 500,
+        intrinsicHeight: 1000,
+        rect: { left: 0, top: 0, width: 1000, height: 1000 },
+      }),
+    ).toEqual({ left: 250, top: 0, width: 500, height: 1000 });
+  });
+
+  it('returns null for degenerate geometry', () => {
+    expect(
+      contentBox({
+        intrinsicWidth: 0,
+        intrinsicHeight: 0,
+        rect: { left: 0, top: 0, width: 0, height: 0 },
+      }),
+    ).toBeNull();
   });
 });

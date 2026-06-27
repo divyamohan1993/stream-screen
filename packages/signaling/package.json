@@ -24,11 +24,11 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@stream-screen/core": "*",
     "bonjour-service": "^1.2.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@stream-screen/core": "*",
     "@types/node": "^20",
     "@types/ws": "^8.5.12",
     "tsx": "^4.19.0",

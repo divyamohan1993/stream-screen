@@ -61,6 +61,60 @@ export interface VideoGeometry {
 }
 
 /**
+ * The on-screen rectangle of the actually-displayed video pixels, accounting
+ * for `object-fit: contain` letter-/pillar-boxing. `width`/`height` are the
+ * RENDERED content-box size (the visible video rectangle, smaller than the
+ * element's CSS box when there are bars); `left`/`top` are its viewport origin.
+ * Returns `null` for degenerate geometry (zero intrinsic or box size).
+ */
+export interface ContentBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Compute the displayed content box of an `object-fit: contain` video: the
+ * sub-rectangle of the element's CSS box that the video pixels actually occupy
+ * after aspect-preserving scaling and centering. This is the single source of
+ * truth for BOTH absolute coordinate normalization (where in the content box a
+ * pointer is) AND relative/pointer-lock delta scaling (how big the content box
+ * is on screen). Returns `null` when geometry is degenerate.
+ */
+export function contentBox(geo: VideoGeometry): ContentBox | null {
+  const { rect, intrinsicWidth, intrinsicHeight } = geo;
+  if (
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    intrinsicWidth <= 0 ||
+    intrinsicHeight <= 0
+  ) {
+    return null;
+  }
+
+  // The video is drawn with object-fit: contain, so it is centered and scaled
+  // to fit while preserving aspect ratio. Compute the displayed content box.
+  const intrinsicAspect = intrinsicWidth / intrinsicHeight;
+  const boxAspect = rect.width / rect.height;
+
+  let width: number;
+  let height: number;
+  if (intrinsicAspect > boxAspect) {
+    // Constrained by width → pillarbox top/bottom margins.
+    width = rect.width;
+    height = rect.width / intrinsicAspect;
+  } else {
+    // Constrained by height → letterbox left/right margins.
+    height = rect.height;
+    width = rect.height * intrinsicAspect;
+  }
+  const left = rect.left + (rect.width - width) / 2;
+  const top = rect.top + (rect.height - height) / 2;
+  return { left, top, width, height };
+}
+
+/**
  * Convert a pointer position (client/viewport coordinates) to normalized
  * 0..1 coordinates of the remote screen, accounting for `object-fit: contain`
  * letter-/pillar-boxing so the cursor lands where the user actually points.
@@ -73,37 +127,10 @@ export function normalizePointer(
   clientY: number,
   geo: VideoGeometry,
 ): { x: number; y: number } {
-  const { rect, intrinsicWidth, intrinsicHeight } = geo;
-  if (
-    rect.width <= 0 ||
-    rect.height <= 0 ||
-    intrinsicWidth <= 0 ||
-    intrinsicHeight <= 0
-  ) {
-    return { x: 0, y: 0 };
-  }
-
-  // The video is drawn with object-fit: contain, so it is centered and scaled
-  // to fit while preserving aspect ratio. Compute the displayed content box.
-  const intrinsicAspect = intrinsicWidth / intrinsicHeight;
-  const boxAspect = rect.width / rect.height;
-
-  let contentWidth: number;
-  let contentHeight: number;
-  if (intrinsicAspect > boxAspect) {
-    // Constrained by width → pillarbox top/bottom margins.
-    contentWidth = rect.width;
-    contentHeight = rect.width / intrinsicAspect;
-  } else {
-    // Constrained by height → letterbox left/right margins.
-    contentHeight = rect.height;
-    contentWidth = rect.height * intrinsicAspect;
-  }
-  const offsetX = rect.left + (rect.width - contentWidth) / 2;
-  const offsetY = rect.top + (rect.height - contentHeight) / 2;
-
-  const x = clamp01((clientX - offsetX) / contentWidth);
-  const y = clamp01((clientY - offsetY) / contentHeight);
+  const box = contentBox(geo);
+  if (box === null) return { x: 0, y: 0 };
+  const x = clamp01((clientX - box.left) / box.width);
+  const y = clamp01((clientY - box.top) / box.height);
   return { x, y };
 }
 
@@ -199,11 +226,20 @@ export class InputCapture {
   /** Last pointer-lock-accumulated normalized position. */
   private lockX = 0.5;
   private lockY = 0.5;
+  /**
+   * Buttons currently pressed (DOM `MouseEvent.button` values) that we have
+   * forwarded an `m-down` for and not yet released. Tracks in-flight drags so a
+   * `mouseup` that lands OUTSIDE the video element (drag to the edge / over the
+   * toolbar) still produces the matching `m-up` instead of leaving the remote
+   * button held down.
+   */
+  private readonly pressed = new Set<number>();
 
   private readonly bound: {
     move: (e: MouseEvent) => void;
     down: (e: MouseEvent) => void;
     up: (e: MouseEvent) => void;
+    docUp: (e: MouseEvent) => void;
     wheel: (e: WheelEvent) => void;
     context: (e: MouseEvent) => void;
     keydown: (e: KeyboardEvent) => void;
@@ -221,6 +257,7 @@ export class InputCapture {
       move: (e) => this.onMove(e),
       down: (e) => this.onDown(e),
       up: (e) => this.onUp(e),
+      docUp: (e) => this.onDocUp(e),
       wheel: (e) => this.onWheel(e),
       context: (e) => e.preventDefault(),
       keydown: (e) => this.onKey(e, 'k-down'),
@@ -247,10 +284,16 @@ export class InputCapture {
     let x: number;
     let y: number;
     if (this.locked) {
-      // In pointer lock, accumulate relative motion against the intrinsic size.
-      const geo = this.geometry();
-      const w = geo.intrinsicWidth || 1;
-      const h = geo.intrinsicHeight || 1;
+      // In pointer lock, movementX/Y are CSS-pixel deltas from the LOCAL
+      // viewport. To map a delta onto the right fraction of the remote screen we
+      // must divide by the size the video is ACTUALLY RENDERED at on screen (the
+      // object-fit:contain content box) — not the remote's intrinsic pixel size,
+      // which would mis-scale whenever the video is shown larger/smaller than
+      // the remote desktop (responsive / fullscreen). This keeps relative motion
+      // consistent with absolute-mode normalization, which uses the same box.
+      const box = contentBox(this.geometry());
+      const w = box && box.width > 0 ? box.width : 1;
+      const h = box && box.height > 0 ? box.height : 1;
       this.lockX = clamp01(this.lockX + e.movementX / w);
       this.lockY = clamp01(this.lockY + e.movementY / h);
       x = this.lockX;
@@ -292,29 +335,9 @@ export class InputCapture {
    */
   private normalizedToClient(x: number, y: number): { x: number; y: number } {
     const geo = this.geometry();
-    const { rect, intrinsicWidth, intrinsicHeight } = geo;
-    if (
-      rect.width <= 0 ||
-      rect.height <= 0 ||
-      intrinsicWidth <= 0 ||
-      intrinsicHeight <= 0
-    ) {
-      return { x: rect.left, y: rect.top };
-    }
-    const intrinsicAspect = intrinsicWidth / intrinsicHeight;
-    const boxAspect = rect.width / rect.height;
-    let contentWidth: number;
-    let contentHeight: number;
-    if (intrinsicAspect > boxAspect) {
-      contentWidth = rect.width;
-      contentHeight = rect.width / intrinsicAspect;
-    } else {
-      contentHeight = rect.height;
-      contentWidth = rect.height * intrinsicAspect;
-    }
-    const offsetX = rect.left + (rect.width - contentWidth) / 2;
-    const offsetY = rect.top + (rect.height - contentHeight) / 2;
-    return { x: offsetX + clamp01(x) * contentWidth, y: offsetY + clamp01(y) * contentHeight };
+    const box = contentBox(geo);
+    if (box === null) return { x: geo.rect.left, y: geo.rect.top };
+    return { x: box.left + clamp01(x) * box.width, y: box.top + clamp01(y) * box.height };
   }
 
   private pointerPos(e: MouseEvent): { x: number; y: number } {
@@ -324,10 +347,31 @@ export class InputCapture {
 
   private onDown(e: MouseEvent): void {
     const { x, y } = this.pointerPos(e);
+    // Remember the raw DOM button so a release anywhere (even outside the video)
+    // can be matched and forwarded; see onDocUp.
+    this.pressed.add(e.button);
     this.send({ t: 'm-down', x, y, button: mapButton(e.button) });
   }
 
   private onUp(e: MouseEvent): void {
+    // Release on the video element itself: always forward, and clear the
+    // in-flight drag so the document-level fallback below doesn't double-send
+    // the same m-up as the event bubbles up to the document listener.
+    this.pressed.delete(e.button);
+    const { x, y } = this.pointerPos(e);
+    this.send({ t: 'm-up', x, y, button: mapButton(e.button) });
+  }
+
+  /**
+   * Document-level mouseup fallback. The element-level `mouseup` only fires when
+   * the release happens over the video; if the user presses inside the remote
+   * screen and releases after dragging OUTSIDE the element (dragging a remote
+   * window/selection to the edge or over the toolbar), the video never sees the
+   * release and the host injector would leave the button held. This catches that
+   * release for any button still recorded as pressed and forwards the m-up.
+   */
+  private onDocUp(e: MouseEvent): void {
+    if (!this.pressed.delete(e.button)) return;
     const { x, y } = this.pointerPos(e);
     this.send({ t: 'm-up', x, y, button: mapButton(e.button) });
   }
@@ -370,6 +414,9 @@ export class InputCapture {
     v.addEventListener('mouseup', this.bound.up);
     v.addEventListener('wheel', this.bound.wheel, { passive: false });
     v.addEventListener('contextmenu', this.bound.context);
+    // Document-level release fallback so a drag that ends OUTSIDE the video still
+    // forwards its m-up and never leaves the remote button held.
+    document.addEventListener('mouseup', this.bound.docUp);
     document.addEventListener('keydown', this.bound.keydown);
     document.addEventListener('keyup', this.bound.keyup);
   }
@@ -384,8 +431,10 @@ export class InputCapture {
     v.removeEventListener('mouseup', this.bound.up);
     v.removeEventListener('wheel', this.bound.wheel);
     v.removeEventListener('contextmenu', this.bound.context);
+    document.removeEventListener('mouseup', this.bound.docUp);
     document.removeEventListener('keydown', this.bound.keydown);
     document.removeEventListener('keyup', this.bound.keyup);
+    this.pressed.clear();
   }
 
   /** Request pointer lock on the video element (best-effort). */

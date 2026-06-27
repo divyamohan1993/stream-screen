@@ -55,6 +55,37 @@ export interface HostEntry {
   name: string;
 }
 
+/**
+ * The minimal {@link SignalingClient} surface {@link RemoteDesktopSession.connect}
+ * drives. Declaring it as an interface (rather than depending on the concrete
+ * class) lets tests inject a lightweight fake that can fire `joined`/`error`
+ * acknowledgements without a real WebSocket — see
+ * {@link SessionOptions.signalingClientFactory}.
+ */
+export interface SessionSignaling {
+  connect(): Promise<void>;
+  join(p: { room?: string; code?: string; role: string; name?: string }): void;
+  on(type: string, cb: (m: { type: string; message?: string }) => void): void;
+  off(type: string, cb: (m: { type: string; message?: string }) => void): void;
+  close(): void;
+}
+
+/**
+ * How long {@link RemoteDesktopSession.connect} waits for the signaling server's
+ * `joined` acknowledgement after sending `join`, before giving up. This is ONLY
+ * a connect handshake timeout — it is NOT a session time limit or usage cap;
+ * once connected the session runs indefinitely.
+ */
+export const JOIN_ACK_TIMEOUT_MS = 10_000;
+
+/** Thrown when the signaling server rejects the join (e.g. no-such-session). */
+export class JoinRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'JoinRejectedError';
+  }
+}
+
 /** Options for {@link RemoteDesktopSession}. */
 export interface SessionOptions {
   /**
@@ -88,6 +119,18 @@ export interface SessionOptions {
    * to `STREAMSCREEN_TOKEN`.
    */
   token?: string;
+  /**
+   * Injected factory that builds the signaling client used by {@link connect}.
+   * Defaults to constructing a real `@stream-screen/core` `SignalingClient`. FOR
+   * TESTS: lets a test supply a fake that fires `joined`/`error` acknowledgements
+   * so the connect handshake can be exercised without a WebSocket.
+   */
+  signalingClientFactory?: (url: string) => SessionSignaling;
+  /**
+   * Override the connect handshake timeout (ms). Purely the wait for the `joined`
+   * acknowledgement — NOT a session time limit. Defaults to {@link JOIN_ACK_TIMEOUT_MS}.
+   */
+  joinTimeoutMs?: number;
 }
 
 /** A captured frame: raw encoded image bytes plus its declared MIME type. */
@@ -318,12 +361,14 @@ export class RemoteDesktopSession {
 
     const ctor = await this.ensureRtc();
 
-    const signaling = new SignalingClient(this.signalingUrl);
+    const signaling: SessionSignaling = this.opts.signalingClientFactory
+      ? this.opts.signalingClientFactory(this.signalingUrl)
+      : new SignalingClient(this.signalingUrl);
     await signaling.connect();
 
     const peer = new Peer({
       role: 'viewer',
-      signaling,
+      signaling: signaling as unknown as SignalingClient,
       iceServers: this.opts.iceServers,
       rtcPeerConnection: ctor,
     });
@@ -334,11 +379,82 @@ export class RemoteDesktopSession {
     peer.onControl((m) => this.handleControl(m));
 
     await peer.start();
-    signaling.join({ code, role: 'viewer', name: this.opts.viewerName ?? 'streamscreen-ai' });
 
-    this.signaling = signaling;
+    // Send the join, then WAIT for the server's acknowledgement before reporting
+    // connected. The signaling server replies `joined` on success or `error`
+    // (e.g. message `no-such-session`) when the code names no live room. Without
+    // this handshake, connect() would resolve optimistically against an unjoined
+    // socket, so subsequent control calls would silently target nothing.
+    try {
+      await this.awaitJoinAck(signaling, code, () => {
+        signaling.join({
+          code,
+          role: 'viewer',
+          name: this.opts.viewerName ?? 'streamscreen-ai',
+        });
+      });
+    } catch (err) {
+      // Tear down the half-open connection so the session stays in a clean,
+      // disconnected state (connectedCode is never set on failure).
+      try {
+        peer.close();
+      } catch {
+        /* best-effort */
+      }
+      try {
+        signaling.close();
+      } catch {
+        /* best-effort */
+      }
+      throw err;
+    }
+
+    this.signaling = signaling as unknown as SignalingClient;
     this.peer = peer;
     this.connectedCode = code;
+  }
+
+  /**
+   * Resolve when the signaling server acknowledges our join with `joined`; reject
+   * if it replies `error` (e.g. `no-such-session`) or if no acknowledgement
+   * arrives within the handshake timeout. The `join` itself is sent via `sendJoin`
+   * AFTER the listeners are wired so the reply can never be missed. This is a
+   * connect-time handshake only — it imposes no session duration limit.
+   */
+  private awaitJoinAck(
+    signaling: SessionSignaling,
+    code: string,
+    sendJoin: () => void,
+  ): Promise<void> {
+    const timeoutMs = this.opts.joinTimeoutMs ?? JOIN_ACK_TIMEOUT_MS;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onJoined = (): void => finish();
+      const onError = (m: { type: string; message?: string }): void =>
+        finish(new JoinRejectedError(m.message ?? 'signaling join rejected'));
+      const finish = (err?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signaling.off('joined', onJoined);
+        signaling.off('error', onError);
+        if (err) reject(err);
+        else resolve();
+      };
+      const timer = setTimeout(
+        () =>
+          finish(
+            new JoinRejectedError(
+              `Timed out after ${timeoutMs}ms waiting for the signaling server to ` +
+                `acknowledge join for code "${code}".`,
+            ),
+          ),
+        timeoutMs,
+      );
+      signaling.on('joined', onJoined);
+      signaling.on('error', onError);
+      sendJoin();
+    });
   }
 
   /** Disconnect from the current session. No-op if not connected. */
