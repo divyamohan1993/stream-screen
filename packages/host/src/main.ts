@@ -37,6 +37,7 @@ import { basename } from 'node:path';
 import type { InputEvent, MonitorInfo } from '@stream-screen/core';
 import { InputInjector } from './input-injector.js';
 import { generateSessionCode } from './host-session.js';
+import { resolveAccessConfig, type AccessConfig } from './access-config.js';
 import {
   buildMonitorList,
   geometryForSource,
@@ -60,11 +61,22 @@ function resolveSignalingUrl(): string {
   return process.env.STREAMSCREEN_SIGNALING_URL ?? 'ws://127.0.0.1:8787';
 }
 
-/** The boot config for this run — the session code is fixed for the app's life. */
+/**
+ * The boot config for this run — the session code is fixed for the app's life.
+ *
+ * `accessMode`/`verifier` start at the safe default ('open', no verifier) and are
+ * finalized during {@link app.whenReady} by {@link resolveAccessConfig}, which
+ * reads STREAMSCREEN_ACCESS_MODE / STREAMSCREEN_PIN and (for PIN modes) builds
+ * the non-reversible verifier. The renderer reads the FINALIZED config via
+ * `ss:get-boot-config`, so the async resolution always completes before the
+ * renderer can fetch it.
+ */
 const bootConfig: HostBootConfig = {
   signalingUrl: resolveSignalingUrl(),
   code: process.env.STREAMSCREEN_CODE ?? generateSessionCode(6),
   hostName: process.env.STREAMSCREEN_HOST_NAME ?? hostname(),
+  accessMode: 'open',
+  verifier: null,
 };
 
 const injector = new InputInjector();
@@ -280,6 +292,26 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     await injector.init();
+
+    // Resolve the access-control configuration from the environment BEFORE the
+    // renderer can fetch the boot config. For PIN modes this builds the
+    // non-reversible verifier; for a misconfigured PIN mode it fails CLOSED to
+    // mode 'refuse' (we log the error loudly and the renderer refuses all
+    // viewers — never a silent downgrade to 'open').
+    const access: AccessConfig = await resolveAccessConfig({
+      mode: process.env.STREAMSCREEN_ACCESS_MODE,
+      pin: process.env.STREAMSCREEN_PIN,
+    });
+    bootConfig.accessMode = access.mode;
+    bootConfig.verifier = access.verifier;
+    if (access.error) {
+      console.error(`[StreamScreen Host] ACCESS CONFIG: ${access.error}`);
+    }
+    console.log(
+      `[StreamScreen Host] access mode: ${access.mode}` +
+        (access.requestedMode !== access.mode ? ` (requested "${access.requestedMode}")` : ''),
+    );
+
     registerIpc();
     createTray();
     createControlWindow();

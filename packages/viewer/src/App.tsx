@@ -13,10 +13,12 @@ import { Toolbar } from './components/Toolbar.js';
 import { StatsPanel } from './components/StatsPanel.js';
 import { ChatPanel } from './components/ChatPanel.js';
 import { FileTransferPanel } from './components/FileTransferPanel.js';
+import { AuthPrompt } from './components/AuthPrompt.js';
 import { VideoStage, type VideoStageHandle } from './components/VideoStage.js';
 import {
   ViewerSession,
   defaultSignalingUrl,
+  type AuthChallenge,
   type ChatEntry,
   type FileTransferEntry,
   type SessionState,
@@ -79,6 +81,14 @@ export function App(): React.JSX.Element {
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [activeMonitorId, setActiveMonitorId] = useState<string | null>(null);
 
+  // Connection consent / access PIN. `authChallenge` is set while the host's
+  // auth handshake is pending (null in 'open' mode); `authDenied` surfaces a
+  // reason-free denial with a retry; `authSubmitting` disables the field while a
+  // PIN proof is being derived/verified.
+  const [authChallenge, setAuthChallenge] = useState<AuthChallenge | null>(null);
+  const [authDenied, setAuthDenied] = useState(false);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+
   const sessionRef = useRef<ViewerSession | null>(null);
   const stageRef = useRef<VideoStageHandle>(null);
   const controllerRef = useRef(controllerForPreset('Auto'));
@@ -88,9 +98,15 @@ export function App(): React.JSX.Element {
 
   // Show the live stage once we've joined the room. Keep it up during a
   // reconnect so the user sees the (frozen) last frame plus the reconnecting
-  // pill rather than being bounced back to the connect screen.
+  // pill rather than being bounced back to the connect screen. The auth-gated
+  // states ('authenticating'/'denied') also live on the stage so the consent/PIN
+  // overlay renders above it while the video stays withheld.
   const onStage =
-    state === 'waiting-for-host' || state === 'connected' || state === 'reconnecting';
+    state === 'waiting-for-host' ||
+    state === 'connected' ||
+    state === 'reconnecting' ||
+    state === 'authenticating' ||
+    state === 'denied';
 
   /** Max number of latency samples retained for the sparkline. */
   const LATENCY_HISTORY_LIMIT = 60;
@@ -146,6 +162,9 @@ export function App(): React.JSX.Element {
       setMonitors([]);
       setActiveMonitorId(null);
       setLatencyHistory([]);
+      setAuthChallenge(null);
+      setAuthDenied(false);
+      setAuthSubmitting(false);
       const session = new ViewerSession({
         code,
         // When a discovered host was picked, connect to ITS signaling server
@@ -176,6 +195,25 @@ export function App(): React.JSX.Element {
           onMonitorSwitched: (id) => setActiveMonitorId(id),
           onFileTransfer: upsertTransfer,
           onFileReady: (data, meta) => downloadBytes(data, meta),
+          onAuthRequired: (challenge) => {
+            if (sessionRef.current !== session) return;
+            // A fresh challenge clears any prior denial and in-flight state.
+            setAuthChallenge(challenge);
+            setAuthDenied(false);
+            setAuthSubmitting(false);
+          },
+          onAuthResult: (ok) => {
+            if (sessionRef.current !== session) return;
+            setAuthSubmitting(false);
+            if (ok) {
+              // Authorized: drop the gate; the session releases the video and
+              // advances to 'connected'.
+              setAuthChallenge(null);
+              setAuthDenied(false);
+            } else {
+              setAuthDenied(true);
+            }
+          },
         },
       });
       sessionRef.current = session;
@@ -202,7 +240,23 @@ export function App(): React.JSX.Element {
     setMonitors([]);
     setActiveMonitorId(null);
     setLatencyHistory([]);
+    setAuthChallenge(null);
+    setAuthDenied(false);
+    setAuthSubmitting(false);
   }, [recorder]);
+
+  // Submit a PIN in response to the host's auth challenge. The session derives
+  // the proof and never stores the PIN; we only flip the submitting flag for UI.
+  const submitPin = useCallback((pin: string) => {
+    const session = sessionRef.current;
+    if (!session) return;
+    setAuthDenied(false);
+    setAuthSubmitting(true);
+    void session.submitPin(pin).catch(() => {
+      // Derivation/transport failure: drop the spinner so the user can retry.
+      setAuthSubmitting(false);
+    });
+  }, []);
 
   const sendInput = useCallback((e: InputEvent) => {
     sessionRef.current?.sendInput(e);
@@ -314,11 +368,17 @@ export function App(): React.JSX.Element {
           ? 'Waiting for the host to share their screen…'
           : state === 'reconnecting'
             ? 'Connection lost. Reconnecting…'
-            : state === 'disconnected'
-              ? 'Disconnected.'
-              : state === 'error'
-                ? `Connection error${error ? `: ${error}` : ''}.`
-                : 'Idle.';
+            : state === 'authenticating'
+              ? authChallenge?.needsPin
+                ? 'Authorization required. Enter the access PIN.'
+                : 'Waiting for the host to approve your connection…'
+              : state === 'denied'
+                ? 'Access denied.'
+                : state === 'disconnected'
+                  ? 'Disconnected.'
+                  : state === 'error'
+                    ? `Connection error${error ? `: ${error}` : ''}.`
+                    : 'Idle.';
 
   if (!onStage) {
     return (
@@ -373,6 +433,15 @@ export function App(): React.JSX.Element {
         muted={muted}
         volume={volume}
       >
+        {authChallenge && (state === 'authenticating' || state === 'denied') && (
+          <AuthPrompt
+            challenge={authChallenge}
+            denied={authDenied}
+            submitting={authSubmitting}
+            onSubmitPin={submitPin}
+            onCancel={disconnect}
+          />
+        )}
         {statsVisible && (
           <StatsPanel stats={stats} decision={decision} latencyHistory={latencyHistory} />
         )}

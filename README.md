@@ -91,6 +91,7 @@ What a modern remote desktop should have, and where StreamScreen stands:
 | Adaptive bitrate/quality ("auto-negotiate lag") | ✅ Implemented | AIMD over RTT/loss/jitter, ~2 Hz (500 ms); **fast-down / slow-up**, governed on **end-to-end** latency (viewer reports rtt+playout) |
 | Zero-config LAN discovery | ✅ Implemented | mDNS/DNS-SD (`_streamscreen._tcp`); advertises only codes of **live** host rooms |
 | Session codes (6–9 digits) | ✅ Implemented | Minted by host or signaling server |
+| **Connection consent + access PIN** | ✅ Implemented | Opt-in `prompt` / `pin` / `pin-and-prompt` modes; PBKDF2 verifier + HMAC challenge-response over DTLS with channel binding; per-peer lockout. Default `open` (code-only). See [Security](#security) |
 | End-to-end transport encryption | ✅ Implemented | DTLS-SRTP (WebRTC stack) |
 | Multiple viewers per host | ✅ Implemented | One host, N viewers per room |
 | Auto-reconnect signaling | ✅ Implemented | Exponential backoff, replays `join` |
@@ -266,6 +267,20 @@ STREAMSCREEN_SIGNALING_URL=ws://<server-ip>:8787 npm -w @stream-screen/host star
 - Remote input injection requires the optional native dep. If it's missing,
   the host still streams; it just logs a one-time warning and ignores input
   (graceful degradation, never a crash).
+- **Access control is opt-in.** By default the host runs in `open` mode (gated
+  only by the session code). Set `STREAMSCREEN_ACCESS_MODE` to `prompt` (require
+  a human Accept per viewer), `pin` (require a PIN proof, unattended), or
+  `pin-and-prompt` (both). PIN modes need `STREAMSCREEN_PIN` (≥6 chars, not
+  all-same / not sequential); a PIN mode without a valid PIN **fails closed** and
+  the host refuses all connections. The PIN is never stored or sent — only a
+  PBKDF2 verifier is kept, and viewers prove the PIN via an HMAC challenge-response
+  over the encrypted DTLS channel. See [Security](#security).
+
+  ```bash
+  # Unattended, PIN-protected host:
+  STREAMSCREEN_ACCESS_MODE=pin STREAMSCREEN_PIN=hunter2 \
+    npm -w @stream-screen/host start
+  ```
 - The host **never** quits on window close — clicking the control window's close
   button **hides it to the tray** (the main process intercepts `close` and calls
   `hide()` unless a real quit is in progress), so the renderer is **not**
@@ -692,6 +707,8 @@ Per-package tests can also be run directly, e.g.
 | `STREAMSCREEN_TOKEN` | signaling, ai | – | bearer token: signaling un-redacts `/api/sessions` codes for callers that present it; ai sends it. Legacy alias `STREAMSCREEN_REST_TOKEN` still accepted (canonical wins if both set) |
 | `STREAMSCREEN_ALLOWED_ORIGINS` | signaling | – | comma-separated WS Origin allowlist (or `*`); default accepts loopback/LAN/same-host |
 | `STREAMSCREEN_CODE` | host | minted | fixed session code |
+| `STREAMSCREEN_ACCESS_MODE` | host | `open` | access control: `open` (code only), `prompt` (human Accept), `pin` (PIN proof), `pin-and-prompt` (both). See [Security](#security) |
+| `STREAMSCREEN_PIN` | host | – | plaintext access PIN for `pin` / `pin-and-prompt` modes (≥6 chars, not all-same / not sequential); read once, never persisted. Stored only as a PBKDF2 verifier |
 | `STREAMSCREEN_AI_MODE` | ai | `mcp` | `rest` to run the REST API |
 | `STREAMSCREEN_AI_PORT` | ai | `8788` | REST port |
 | `VITE_SIGNALING_HTTP` | viewer | `http://localhost:8787` | dev proxy target |
@@ -711,6 +728,28 @@ monorepo, and the issue / pull-request templates under
 StreamScreen is LAN-first and peer-to-peer: media and input ride encrypted
 WebRTC (DTLS-SRTP) directly between peers with **no cloud relay**, gated by
 session codes. To report a vulnerability privately, see [SECURITY.md](./SECURITY.md).
+
+**Connection consent & access PIN (opt-in).** The default `open` mode gates
+sessions only by the numeric session code. Hosts that want more can set
+`STREAMSCREEN_ACCESS_MODE` to `prompt`, `pin`, or `pin-and-prompt`:
+
+- The session **code is addressing** (which room); the **PIN is the secret**
+  (who may connect). They compose.
+- The host stores only a **PBKDF2-HMAC-SHA256 verifier** (600k iterations,
+  16-byte salt, 32-byte key) — never the PIN, never a reversible form.
+- Viewers prove the PIN with an **HMAC challenge-response over the encrypted DTLS
+  data channel**, bound to a per-handshake nonce and a **channel binding** (the
+  sorted DTLS certificate fingerprints of both peers, so a re-terminating MITM
+  fails). The **signaling server never sees** the PIN, salt, nonces, or proof.
+- Constant-time comparison, reason-free failure, and **per-(source + peer)
+  lockout** with exponential backoff resist online brute force; the high KDF cost
+  resists offline brute force.
+- Everything **fails closed**: a PIN mode without a valid PIN refuses all
+  connections, an unanswered consent prompt auto-rejects, and decode errors count
+  as failures.
+
+Full details are in [SECURITY.md](./SECURITY.md) and
+[ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## License
 

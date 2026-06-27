@@ -46,12 +46,36 @@
         min-height: 80px;
       }
       .free { margin-top: 16px; font-size: 11px; color: #3fb950; text-align: center; }
+      .consent { margin-bottom: 16px; }
+      .consent:empty { display: none; }
+      .consent-card {
+        background: #161b22;
+        border: 1px solid #d29922;
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 8px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .consent-info { flex: 1; font-size: 13px; }
+      .consent-card button {
+        padding: 6px 12px;
+        border-radius: 6px;
+        border: 1px solid #30363d;
+        background: #21262d;
+        color: #e6edf3;
+        cursor: pointer;
+      }
+      .consent-card button:first-of-type { border-color: #3fb950; color: #3fb950; }
     </style>
   </head>
   <body>
     <h1>StreamScreen Host</h1>
     <div class="sub">Share this code with a viewer on the same network.</div>
     <div class="code" id="code">------</div>
+
+    <div class="consent" id="consent"></div>
 
     <label for="source">Screen to share</label>
     <select id="source"></select>

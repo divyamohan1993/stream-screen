@@ -182,7 +182,29 @@ export type ControlMessage =
   | { t: 'file-error'; id: string; message: string }
   | { t: 'audio'; enabled: boolean }
   | { t: 'quality'; preset: QualityPreset }
-  | { t: 'latency'; rttMs: number; playoutMs: number; fps?: number };
+  | { t: 'latency'; rttMs: number; playoutMs: number; fps?: number }
+  // ----- Connection-consent / access-PIN handshake (P2P over the encrypted
+  // control channel; the signaling server never sees any of these fields). -----
+  // Host -> viewer: present the challenge. `salt`/`nonceH` are base64 binary;
+  // `channelBinding` is the canonical DTLS-fingerprint binding both peers derive
+  // (see Peer.getChannelBinding). `mode` tells the viewer whether a PIN proof is
+  // expected, a human Accept, or both.
+  | {
+      t: 'auth-challenge';
+      v: 1;
+      nonceH: string;
+      salt: string;
+      iterations: number;
+      channelBinding: string;
+      mode: 'pin' | 'pin-and-prompt' | 'prompt';
+    }
+  // Viewer -> host: the response. `nonceV`/`proof` are base64 binary. `proof` is
+  // the HMAC over (domain || nonceH || nonceV || channelBinding); omitted/empty
+  // for prompt-only flows. `name` is an optional display name for the host UI.
+  | { t: 'auth-response'; v: 1; nonceV: string; proof: string; name?: string }
+  // Host -> viewer: the verdict. Intentionally REASON-FREE on failure so the
+  // host never tells an attacker whether the PIN, the proof, or consent failed.
+  | { t: 'auth-result'; v: 1; ok: boolean };
 
 /** Valid {@link ControlMessage.t} discriminants. */
 const CONTROL_TYPES = new Set<ControlMessage['t']>([
@@ -200,7 +222,13 @@ const CONTROL_TYPES = new Set<ControlMessage['t']>([
   'audio',
   'quality',
   'latency',
+  'auth-challenge',
+  'auth-response',
+  'auth-result',
 ]);
+
+/** Valid access modes for the auth handshake `mode` field. */
+const AUTH_MODES = new Set(['pin', 'pin-and-prompt', 'prompt']);
 
 /** Valid {@link QualityPreset} values. */
 const QUALITY_PRESETS = new Set<QualityPreset>(['auto', 'high', 'balanced', 'low']);
@@ -246,6 +274,25 @@ export function isControlMessage(v: unknown): v is ControlMessage {
       // Viewer -> host real-time telemetry: rttMs and playoutMs are required
       // finite numbers; fps is optional but must be a finite number if present.
       return isNum(o.rttMs) && isNum(o.playoutMs) && (o.fps === undefined || isNum(o.fps));
+    case 'auth-challenge':
+      return (
+        o.v === 1 &&
+        isStr(o.nonceH) &&
+        isStr(o.salt) &&
+        isNum(o.iterations) &&
+        isStr(o.channelBinding) &&
+        isStr(o.mode) &&
+        AUTH_MODES.has(o.mode)
+      );
+    case 'auth-response':
+      return (
+        o.v === 1 &&
+        isStr(o.nonceV) &&
+        isStr(o.proof) &&
+        (o.name === undefined || isStr(o.name))
+      );
+    case 'auth-result':
+      return o.v === 1 && typeof o.ok === 'boolean';
     default:
       return false;
   }

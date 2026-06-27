@@ -44,10 +44,19 @@
         createSender,
         createReceiver,
         ReceiverRouter,
+        deriveKey,
+        computeProof,
+        randomBytes,
+        toBase64,
+        fromBase64,
+        AUTH_DOMAIN,
       } from './core.bundle.js';
 
       const params = new URLSearchParams(location.search);
       const code = params.get('code') ?? '123456';
+      // The PIN the viewer presents. Only used to derive a proof over the
+      // encrypted control channel; the PIN itself never crosses the wire.
+      const viewerPin = params.get('pin') ?? '';
       const wsUrl = `ws://${location.host}`;
 
       const statusEl = document.getElementById('status');
@@ -64,6 +73,12 @@
         chats: [],
         monitors: [],
         monitorSwitched: null,
+        // --- Auth (access mode) state. ---
+        // Whether an auth-challenge was received and which mode it carried.
+        authChallenged: false,
+        authMode: null,
+        // Final verdict from the host: null (pending) | true (ok) | false (denied).
+        authResult: null,
       };
 
       // The most recent remote MediaStream (used for recording / track checks).
@@ -71,6 +86,61 @@
 
       const signaling = new SignalingClient(wsUrl);
       const peer = new Peer({ role: 'viewer', signaling });
+
+      // ---------------------------------------------------------------------
+      // Access-mode auth (connection consent + access PIN), viewer side.
+      //
+      // On an inbound auth-challenge the viewer derives its key from the PIN +
+      // the host's salt, then HMACs over (domain || nonceH || nonceV ||
+      // channelBinding) where channelBinding comes from peer.getChannelBinding()
+      // — the SAME canonical DTLS binding the host computes. The proof crosses
+      // ONLY the encrypted control data channel; the PIN never does, and the
+      // signaling server never sees any of these fields. For prompt-only mode
+      // there is no PIN, so an empty proof is sent and the host gates on consent.
+      // ---------------------------------------------------------------------
+      async function handleAuthChallenge(m, remoteId) {
+        // Ignore duplicate challenge resends (the host may resend until its first
+        // send lands on the just-opened control channel) — respond exactly once.
+        if (state.authChallenged) return;
+        state.authChallenged = true;
+        state.authMode = m.mode;
+        const nonceV = randomBytes(32);
+        const channelBinding = peer.getChannelBinding(remoteId);
+
+        let proofB64 = '';
+        if (m.mode === 'pin' || m.mode === 'pin-and-prompt') {
+          // Fail-closed: with no derivable binding we cannot bind the proof.
+          if (channelBinding) {
+            const key = await deriveKey(viewerPin, fromBase64(m.salt), m.iterations);
+            const proof = await computeProof(key, {
+              domain: AUTH_DOMAIN,
+              nonceH: fromBase64(m.nonceH),
+              nonceV,
+              channelBinding,
+            });
+            proofB64 = toBase64(proof);
+          }
+        }
+
+        // Record the exact secret material this viewer emitted on the DATA channel
+        // so the signaling-isolation spec can assert none crossed the WS relay.
+        window.__authSecrets = window.__authSecrets || {};
+        window.__authSecrets.pin = viewerPin;
+        window.__authSecrets.nonceV = toBase64(nonceV);
+        window.__authSecrets.proof = proofB64;
+        window.__authSecrets.channelBinding = channelBinding;
+
+        peer.sendControl(
+          {
+            t: 'auth-response',
+            v: 1,
+            nonceV: toBase64(nonceV),
+            proof: proofB64,
+            name: 'e2e-viewer',
+          },
+          remoteId,
+        );
+      }
 
       // --- Inbound file reception (host -> viewer), the reverse direction. ---
       // Mirrors the host page's receiver wiring: createReceiver does the
@@ -126,6 +196,11 @@
           ...state,
           chats: [...state.chats],
           monitors: state.monitors.map((m) => ({ ...m })),
+        }),
+        getAuthState: () => ({
+          authChallenged: state.authChallenged,
+          authMode: state.authMode,
+          authResult: state.authResult,
         }),
         getVideoSize: () => ({ width: video.videoWidth, height: video.videoHeight }),
         isVideoPlaying: () => video.videoWidth > 0 && video.videoHeight > 0 && !video.paused,
@@ -358,8 +433,14 @@
         ch.onopen = markOpen;
       });
 
-      peer.onControl((m) => {
+      peer.onControl((m, remoteId) => {
         switch (m.t) {
+          case 'auth-challenge':
+            void handleAuthChallenge(m, remoteId);
+            break;
+          case 'auth-result':
+            state.authResult = m.ok;
+            break;
           case 'chat':
             state.chats.push(m);
             break;

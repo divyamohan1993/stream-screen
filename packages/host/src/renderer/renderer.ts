@@ -10,8 +10,10 @@
 import { HostSession, type HostSessionOptions } from '../host-session.js';
 import { normalizeSources, pickDefaultSource, type CaptureSource } from '../capture.js';
 import { shouldStopOnLifecycle, type LifecycleReason } from '../window-lifecycle.js';
+import { ConsentManager, type PendingConsent } from '../consent-manager.js';
+import type { AccessMode } from '../access-config.js';
 import type { StreamScreenHostApi } from '../preload.js';
-import type { FileMeta } from '@stream-screen/core';
+import type { FileMeta, VerifierRecord } from '@stream-screen/core';
 
 declare global {
   interface Window {
@@ -24,6 +26,10 @@ export interface SessionConfig {
   signalingUrl: string;
   code: string;
   hostName: string;
+  /** Effective access mode ('open' default). */
+  accessMode?: AccessMode;
+  /** Host PIN verifier for 'pin'/'pin-and-prompt' modes; null otherwise. */
+  verifier?: VerifierRecord | null;
 }
 
 /** A factory for {@link HostSession} (overridable in tests). */
@@ -41,12 +47,33 @@ const defaultHostSessionFactory: HostSessionFactory = (opts) => new HostSession(
  */
 export class SessionController {
   private session: HostSession | null = null;
+  /**
+   * The consent core for human-Accept modes. Owned by the controller (not the
+   * session) so the consent UI can subscribe ONCE and survive source switches
+   * that recreate the session. Passed into every {@link HostSession} so its
+   * 'prompt'/'pin-and-prompt' gate resolves through the same manager the UI
+   * drives.
+   */
+  readonly consent: ConsentManager;
 
   constructor(
     private readonly api: StreamScreenHostApi,
     private readonly onStatusText: (text: string) => void = () => {},
     private readonly makeSession: HostSessionFactory = defaultHostSessionFactory,
-  ) {}
+    onConsentPending: (pending: PendingConsent[]) => void = () => {},
+  ) {
+    this.consent = new ConsentManager({ onPendingChange: onConsentPending });
+  }
+
+  /** Accept the oldest (or a specific) pending consent request. */
+  acceptConsent(requestId?: number, alsoAlways = false): boolean {
+    return this.consent.accept(requestId, alsoAlways);
+  }
+
+  /** Reject the oldest (or a specific) pending consent request. */
+  rejectConsent(requestId?: number): boolean {
+    return this.consent.reject(requestId);
+  }
 
   /** The current live session, or null. Exposed for assertions/teardown. */
   get current(): HostSession | null {
@@ -103,6 +130,15 @@ export class SessionController {
       code: cfg.code,
       hostName: cfg.hostName,
       sourceId,
+      // Access control: enforce the configured mode. 'open' (default) preserves
+      // the historical behavior. PIN modes use the verifier; prompt modes use the
+      // controller-owned ConsentManager so the consent UI drives the same gate.
+      accessMode: cfg.accessMode ?? 'open',
+      verifier: cfg.verifier ?? null,
+      consent: this.consent,
+      onAuthResult: (viewerId, ok) => {
+        this.onStatusText(ok ? `Viewer ${viewerId} authorized` : `Viewer ${viewerId} denied`);
+      },
       getMonitors: () => this.api.getMonitors(),
       onActiveDisplay: (id) => this.api.setActiveDisplay(id),
       onFileReceived: (data, meta: FileMeta) => {
@@ -189,10 +225,44 @@ async function boot(): Promise<void> {
   const $code = document.getElementById('code') as HTMLDivElement;
   const $source = document.getElementById('source') as HTMLSelectElement;
   const $stats = document.getElementById('stats') as HTMLDivElement;
+  const $consent = document.getElementById('consent') as HTMLDivElement | null;
 
-  const controller = new SessionController(api, (text) => {
-    $stats.textContent = text;
-  });
+  // Render the (thin) consent prompt for pending requests. All decision logic
+  // lives in the ConsentManager (pure, unit-tested); this only draws the list
+  // and wires Accept/Reject buttons + a per-request countdown.
+  const renderConsent = (pending: PendingConsent[]): void => {
+    if (!$consent) return;
+    $consent.innerHTML = '';
+    for (const req of pending) {
+      const card = document.createElement('div');
+      card.className = 'consent-card';
+      const label = req.peer.name ? `${req.peer.name} (${req.peer.peerId})` : req.peer.peerId;
+      const remainMs = Math.max(0, req.expiresAt - Date.now());
+      const info = document.createElement('div');
+      info.className = 'consent-info';
+      info.textContent = `Allow ${label}? (${Math.ceil(remainMs / 1000)}s)`;
+      const accept = document.createElement('button');
+      accept.textContent = 'Accept';
+      accept.addEventListener('click', () => controller.acceptConsent(req.requestId));
+      const reject = document.createElement('button');
+      reject.textContent = 'Reject';
+      reject.addEventListener('click', () => controller.rejectConsent(req.requestId));
+      card.append(info, accept, reject);
+      $consent.appendChild(card);
+    }
+  };
+
+  const controller = new SessionController(
+    api,
+    (text) => {
+      $stats.textContent = text;
+    },
+    defaultHostSessionFactory,
+    renderConsent,
+  );
+
+  // Tick the countdown ~1Hz while any request is pending.
+  setInterval(() => renderConsent(controller.consent.pending), 1000);
 
   const cfg = await api.getBootConfig();
   $code.textContent = cfg.code;
@@ -213,6 +283,8 @@ async function boot(): Promise<void> {
     signalingUrl: cfg.signalingUrl,
     code: cfg.code,
     hostName: cfg.hostName,
+    accessMode: cfg.accessMode,
+    verifier: cfg.verifier,
   };
 
   $source.addEventListener('change', () => {

@@ -48,8 +48,10 @@ const STATE_LABEL: Record<SessionState, string> = {
   connecting: 'connecting',
   'waiting-for-host': 'waiting',
   reconnecting: 'reconnecting…',
+  authenticating: 'authorizing…',
   connected: 'connected',
   disconnected: 'disconnected',
+  denied: 'access denied',
   error: 'error',
 };
 

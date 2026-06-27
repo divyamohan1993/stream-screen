@@ -16,6 +16,7 @@ that **there are no time limits or usage caps anywhere in the system.**
 - [Session features over the control & file channels](#session-features-over-the-control--file-channels)
 - [AI control layer (MCP + REST)](#ai-control-layer-mcp--rest)
 - [Security model](#security-model)
+  - [Connection consent & access PIN](#connection-consent--access-pin)
 - [No-limits guarantee](#no-limits-guarantee)
 
 ---
@@ -570,7 +571,12 @@ StreamScreen is **LAN-first** and trades WAN reach for simplicity and privacy.
   keystrokes. There is no third-party server in the data path.
 - **Session gating.** A session is gated by a **6–9 digit numeric code**. Viewers
   must target an existing room; unknown codes are rejected (`no-such-session`).
-  Codes are minted with platform crypto where available.
+  Codes are minted with platform crypto where available. The code is **addressing**
+  (which room), not a secret — for a real secret, layer on the access PIN below.
+- **Connection consent & access PIN (opt-in).** Beyond the code, the host can
+  require a human **Accept** and/or a low-entropy **PIN** that the viewer proves
+  knowledge of, P2P over the encrypted DTLS channel. Default is `open` (code
+  only). See [Connection consent & access PIN](#connection-consent--access-pin).
 - **Identity within a room.** The server assigns each peer an authoritative id
   and overwrites the `from` field on every relayed message, so peers in a room
   cannot impersonate one another during signaling.
@@ -593,11 +599,90 @@ StreamScreen is **LAN-first** and trades WAN reach for simplicity and privacy.
   recognised rather than rejected. This keeps the zero-config and documented
   dev-viewer flows working without configuration while blocking cross-site
   public pages.
-- **Threat model & limits.** The code gates *access*, but a short numeric code is
-  not a substitute for network-level isolation on hostile networks. There is no
-  built-in authentication beyond the code and no audit log. For untrusted
-  networks, place StreamScreen behind a VPN/firewall (WAN/VPN traversal is on the
-  roadmap; STUN/TURN hooks already exist in `Peer`).
+- **Threat model & limits.** The code gates *addressing*; for authentication on
+  hostile networks enable the access PIN and/or consent prompt below. Even so, a
+  short numeric code is not a substitute for network-level isolation. There is no
+  audit log yet. For untrusted networks, place StreamScreen behind a VPN/firewall
+  (WAN/VPN traversal is on the roadmap; STUN/TURN hooks already exist in `Peer`).
+
+### Connection consent & access PIN
+
+This is an **opt-in** layer (default `open` preserves the historical code-only
+behavior) selected by `STREAMSCREEN_ACCESS_MODE`:
+
+| Mode | Human Accept | PIN proof |
+|---|---|---|
+| `open` *(default)* | – | – |
+| `prompt` | required | – |
+| `pin` | – | required |
+| `pin-and-prompt` | required | required |
+
+Design principle: the **session code is addressing** (route the viewer to a
+room); the **PIN is the secret** (authorize who connects). They compose.
+
+**Zero-trust signaling.** The signaling server is a pure relay. It **never** sees
+the PIN, the verifier, the salt, the nonces, or the proof. All verification
+happens **peer-to-peer over the encrypted DTLS data channel** (`control`).
+
+**Modules.** The cryptographic core is `packages/core/src/crypto-auth.ts` (runs
+identically in `node:crypto` and browser WebCrypto, **zero new deps**). The host
+wiring is `packages/host/src/`: `access-config.ts` (env → resolved config +
+verifier), `auth-verifier.ts` (verify gated by lockout), `lockout-tracker.ts`
+(exponential backoff), `consent-manager.ts` (human Accept). The channel binding
+comes from `Peer.getChannelBinding` in `packages/core/src/peer.ts`, and the wire
+messages are the `auth-challenge` / `auth-response` / `auth-result` variants of
+`ControlMessage` in `packages/core/src/protocol.ts`.
+
+**KDF & verifier.** The host derives a key with **PBKDF2-HMAC-SHA256**,
+**600,000** iterations, a random **16-byte** salt, **32-byte** output (OWASP 2025
+guidance). It persists only the **verifier** (`{alg, iterations, salt, key}`,
+base64) — never the PIN. The plaintext PIN cannot be recovered without
+brute-forcing the KDF, and the high iteration count makes that infeasible
+offline even if the verifier leaked.
+
+**Challenge-response handshake** (host = H, viewer = V):
+
+```
+H → V   auth-challenge { nonceH, salt, iterations, channelBinding, mode }
+V → H   auth-response  { nonceV, proof, name? }
+H → V   auth-result    { ok }            (reason-free on failure)
+```
+
+The proof is:
+
+```
+proof = HMAC-SHA256( derivedKey,
+                     "streamscreen-auth-v1" || nonceH || nonceV || channelBinding )
+```
+
+V derives `derivedKey` from the PIN it holds plus the salt; H recomputes the
+expected HMAC from its stored verifier and **constant-time** compares
+(`crypto.timingSafeEqual`, with a non-short-circuiting JS fallback in the
+browser). The per-handshake `nonceH` makes proofs non-replayable across
+challenges. The `auth-result` is deliberately **reason-free** so a failure never
+tells an attacker whether the PIN, the proof, or consent was wrong.
+
+**Channel binding (anti-MITM).** `channelBinding` is the **canonical (sorted)
+concatenation of every `a=fingerprint:` value from both peers' SDP**. Each peer
+sees the same offer+answer, so both compute the identical string *without*
+exchanging it. A MITM that re-terminates DTLS presents a different certificate
+fingerprint → a different binding → a non-matching proof. Binding fails closed
+(empty binding when descriptions are unavailable or the connection is ambiguous).
+
+**Lockout (online brute-force defense).** Because the PIN is low-entropy,
+`lockout-tracker.ts` rate-limits per **(source identity + peer id)**: after a
+threshold of consecutive failures (default 5) the key is locked with
+**exponential backoff** (base 1s, doubling, capped ~30 min). A locked key is
+rejected **before any KDF/HMAC runs**, so an attacker can never make the host burn
+PBKDF2 CPU. Success resets the key; keys are isolated so one client cannot lock
+out another. State is in-memory in v1 (cleared on restart; persistence is a noted
+follow-up).
+
+**Fail-closed.** A PIN mode requested without a valid `STREAMSCREEN_PIN` resolves
+to an internal `refuse` mode and rejects **all** connections (never a silent
+downgrade to `open`). An unanswered consent prompt auto-rejects after a per-request
+timeout (default 30s — a bound on one prompt, **not** a session time limit). Any
+decode/compute error counts as a failed attempt.
 
 ---
 

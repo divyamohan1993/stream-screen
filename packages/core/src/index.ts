@@ -12,3 +12,4 @@ export * from './signaling-client.js';
 export * from './adaptive.js';
 export * from './input-codec.js';
 export * from './file-transfer.js';
+export * from './crypto-auth.js';

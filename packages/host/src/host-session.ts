@@ -19,12 +19,16 @@
 
 import {
   AdaptiveController,
+  AUTH_DOMAIN,
   createSender,
   CTRL_ALT_DEL,
   FileTransferManager,
   KEY_MODS,
+  NONCE_BYTES,
   Peer,
+  randomBytes,
   SignalingClient,
+  toBase64,
   type AdaptiveDecision,
   type AdaptiveStats,
   type ControlMessage,
@@ -34,8 +38,18 @@ import {
   type MonitorInfo,
   type QualityPreset,
   type SignalMessage,
+  type VerifierRecord,
 } from '@stream-screen/core';
 import { getDisplayStream, streamHasAudio, type CaptureConstraints } from './capture.js';
+import {
+  challengeModeOf,
+  modeRequiresPin,
+  modeRequiresPrompt,
+  type AccessMode,
+} from './access-config.js';
+import { AuthVerifier } from './auth-verifier.js';
+import { ConsentManager, type PeerInfo } from './consent-manager.js';
+import { LockoutTracker } from './lockout-tracker.js';
 
 /**
  * Pure detector: is this single inbound {@link InputEvent} the Ctrl+Alt+Del
@@ -218,6 +232,35 @@ export interface HostSessionOptions {
    * {@link JOIN_ACK_TIMEOUT_MS}.
    */
   joinTimeoutMs?: number;
+  /**
+   * The EFFECTIVE access mode (from access-config). Defaults to 'open', which
+   * preserves the historical behavior EXACTLY: media attaches immediately and
+   * input flows with no consent prompt and no PIN. In any non-'open' mode a
+   * viewer is gated until AUTHORIZED (see the auth flow in {@link start}).
+   * 'refuse' refuses ALL viewers (fail-closed for a misconfigured PIN mode).
+   */
+  accessMode?: AccessMode;
+  /**
+   * The host's PIN verifier (salt + PBKDF2-derived key). REQUIRED for the 'pin'
+   * and 'pin-and-prompt' modes; null/absent otherwise. Never contains the PIN.
+   */
+  verifier?: VerifierRecord | null;
+  /**
+   * The {@link ConsentManager} backing the 'prompt' / 'pin-and-prompt' human
+   * Accept. Injected so the UI (and tests) can drive accept/reject. If omitted
+   * in a prompt mode, a default manager with a 30s fail-closed timeout is used.
+   */
+  consent?: ConsentManager;
+  /**
+   * The {@link LockoutTracker} for online brute-force defense. Injected so tests
+   * can use a fast clock; defaults to a tracker with the standard thresholds.
+   */
+  lockout?: LockoutTracker;
+  /**
+   * Observe authorization lifecycle for a viewer (UI/telemetry). Fired with the
+   * final verdict once a viewer is authorized or denied in a non-'open' mode.
+   */
+  onAuthResult?: (viewerId: string, ok: boolean) => void;
 }
 
 /**
@@ -267,9 +310,62 @@ export class HostSession {
    */
   private readonly viewerLatency = new Map<string, { rttMs: number; playoutMs: number }>();
 
+  // ----- Connection-consent / access-PIN state -----
+  /** Effective access mode for this session ('open' = no gating). */
+  private readonly accessMode: AccessMode;
+  /** Host PIN verifier (PIN modes only); never the plaintext PIN. */
+  private readonly verifier: VerifierRecord | null;
+  /** Online-brute-force lockout tracker (PIN modes). */
+  private readonly lockout: LockoutTracker;
+  /** Human-Accept consent core (prompt modes). */
+  private readonly consent: ConsentManager;
+  /** Verifies viewer proofs against the verifier, gated by the lockout. */
+  private readonly authVerifier: AuthVerifier;
+  /**
+   * Set of viewer ids that are AUTHORIZED (passed the required PIN/consent for
+   * the active mode). In 'open' mode every viewer is implicitly authorized and
+   * this set is unused. Input from a non-authorized viewer is dropped, and the
+   * shared media stream is not attached until the FIRST viewer authorizes.
+   */
+  private readonly authorizedViewers = new Set<string>();
+  /**
+   * Per-viewer host nonce (base64-decoded) issued in the auth-challenge, kept
+   * until that viewer's auth-response is verified. Binds a proof to the specific
+   * challenge so a captured proof cannot be replayed against a fresh nonce.
+   */
+  private readonly pendingChallenges = new Map<string, Uint8Array>();
+  /**
+   * Whether the shared media stream has been attached to the peer yet. In
+   * non-'open' modes we delay {@link Peer.attachStream} until the first viewer
+   * is authorized, so an unauthorized viewer never triggers media negotiation.
+   */
+  private streamAttached = false;
+
   constructor(opts: HostSessionOptions) {
     this.opts = opts;
     this.activeSourceId = opts.sourceId;
+    this.accessMode = opts.accessMode ?? 'open';
+    this.verifier = opts.verifier ?? null;
+    this.lockout = opts.lockout ?? new LockoutTracker();
+    this.consent = opts.consent ?? new ConsentManager();
+    this.authVerifier = new AuthVerifier(this.lockout);
+  }
+
+  /** The effective access mode in force for this session. */
+  get currentAccessMode(): AccessMode {
+    return this.accessMode;
+  }
+
+  /** The consent manager (so the renderer/main can drive accept/reject). */
+  get consentManager(): ConsentManager {
+    return this.consent;
+  }
+
+  /** True if `viewerId` is currently authorized to receive media + drive input. */
+  isAuthorized(viewerId: string): boolean {
+    // 'open' mode: every connected viewer is implicitly authorized (legacy).
+    if (this.accessMode === 'open') return true;
+    return this.authorizedViewers.has(viewerId);
   }
 
   /** The source id currently being shared. */
@@ -371,12 +467,23 @@ export class HostSession {
       // Surface viewer connect/disconnect to the host UI. A viewer leaving also
       // drops its per-viewer file manager so a stale partial transfer is not kept.
       signaling.on('peer-joined', (msg) => {
-        if (msg.role === 'viewer' && msg.from) this.opts.onViewerJoined?.(msg.from);
+        if (msg.role === 'viewer' && msg.from) {
+          this.opts.onViewerJoined?.(msg.from);
+          // In a non-'open' mode, begin the access handshake for this viewer.
+          // The challenge is sent over the (encrypted) control data channel — NOT
+          // over signaling — so the secret/nonce never transit the relay. We start
+          // it after a short turn so the control channel has a chance to open; if
+          // it is not yet open the send is a no-op and the viewer (which knows the
+          // mode is gated) will not be authorized — fail-closed.
+          if (this.accessMode !== 'open') this.beginAuth(msg.from, msg.name);
+        }
       });
       signaling.on('peer-left', (msg) => {
         if (!msg.from) return;
         this.fileManagers.delete(msg.from);
         this.viewerLatency.delete(msg.from);
+        this.authorizedViewers.delete(msg.from);
+        this.pendingChallenges.delete(msg.from);
         if (msg.role === 'viewer') this.opts.onViewerLeft?.(msg.from);
       });
 
@@ -393,13 +500,20 @@ export class HostSession {
         signaling.join({ code: this.opts.code, role: 'host', name: this.opts.hostName });
       });
 
-      // Only AFTER a confirmed join do we attach media and start the session.
       // Tell the encoder this is screen content: optimize for sharp static text
       // over motion smoothness. Without this hint the encoder treats it as camera
       // video and blurs text. Paired with degradationPreference 'maintain-resolution'
       // in Peer.applyDecisionTo, the pipeline drops framerate before resolution.
       for (const t of stream.getVideoTracks()) hintScreenContent(t);
-      peer.attachStream(stream);
+
+      // ACCESS GATING. In the DEFAULT 'open' mode we attach media immediately —
+      // exactly the historical behavior (code-gated only). In any non-'open' mode
+      // we DELAY attachStream until a viewer is AUTHORIZED (see ensureStreamAttached,
+      // called from the auth flow), so an unauthorized viewer never triggers media
+      // negotiation and never sees the screen. 'refuse' never attaches at all.
+      if (this.accessMode === 'open') {
+        this.ensureStreamAttached();
+      }
 
       this.startAdaptiveLoop();
     } catch (err) {
@@ -478,11 +592,187 @@ export class HostSession {
    * unchanged (forward the event to {@link HostSessionOptions.onInput}).
    */
   private routeInput(e: InputEvent, viewerId: string): void {
+    // ACCESS GATING: in any non-'open' mode, DROP every input event from a viewer
+    // that is not yet authorized. This is the fail-closed default — a viewer that
+    // has not passed the required PIN/consent for the active mode can never drive
+    // the host's input, even if the data channel is somehow open. 'open' mode
+    // authorizes everyone (legacy behavior), so this never blocks there.
+    if (!this.isAuthorized(viewerId)) return;
     if (this.opts.onCombo && isCtrlAltDelKeyDown(e)) {
       this.opts.onCombo(CTRL_ALT_DEL, viewerId);
       return; // suppress the synthetic per-key replay of the Ctrl+Alt+Del chord
     }
     this.opts.onInput(e, viewerId);
+  }
+
+  /**
+   * Idempotently attach the captured stream to the peer. Called immediately in
+   * 'open' mode, and lazily on the FIRST viewer authorization in non-'open'
+   * modes. Attaching is a session-wide operation (the Peer replays media to
+   * every connection), so we do it exactly once.
+   */
+  private ensureStreamAttached(): void {
+    if (this.streamAttached) return;
+    const peer = this.peer;
+    const stream = this.stream;
+    if (!peer || !stream) return;
+    peer.attachStream(stream);
+    this.streamAttached = true;
+  }
+
+  /**
+   * Lockout/consent identity for a viewer. The renderer has no raw source IP, so
+   * the DTLS CHANNEL BINDING (stable per DTLS session, distinct per transport)
+   * serves as the network-source surrogate in the lockout key, combined with the
+   * signaling peer id. A re-terminated-DTLS MITM gets a different binding (and a
+   * failing proof anyway), so this is a sound, fail-closed identity.
+   */
+  private lockoutKeyFor(viewerId: string, channelBinding: string): {
+    ip: string;
+    peerId: string;
+  } {
+    return { ip: channelBinding || 'unknown', peerId: viewerId };
+  }
+
+  /**
+   * Begin the access handshake for a freshly-joined viewer in a non-'open' mode.
+   *
+   * - 'refuse': never authorize (a misconfigured PIN mode); send a failure and
+   *   leave the viewer un-attached. Fail-closed.
+   * - 'prompt': no PIN — run the {@link ConsentManager} only; on Accept,
+   *   authorize + attach; otherwise deny.
+   * - 'pin' / 'pin-and-prompt': send an auth-challenge with a fresh host nonce
+   *   plus the verifier's salt/iterations and the canonical channel binding. The
+   *   viewer replies with an auth-response handled in {@link handleControl}.
+   *
+   * The challenge/consent run over the encrypted control channel; signaling
+   * never carries any secret.
+   */
+  private beginAuth(viewerId: string, name?: string): void {
+    const peer = this.peer;
+    if (!peer) return;
+
+    // Fail-closed: a PIN mode without a verifier (should not happen — config
+    // refuses to enter the mode — but be defensive) refuses the viewer.
+    if (this.accessMode === 'refuse' || (modeRequiresPin(this.accessMode) && !this.verifier)) {
+      peer.sendControl({ t: 'auth-result', v: 1, ok: false }, viewerId);
+      this.opts.onAuthResult?.(viewerId, false);
+      return;
+    }
+
+    if (this.accessMode === 'prompt') {
+      // Prompt-only: ask the host human. The channel binding still identifies the
+      // transport for the consent record.
+      const cb = peer.getChannelBinding(viewerId);
+      void this.runConsentThenAuthorize(viewerId, { peerId: viewerId, name, channelBinding: cb });
+      return;
+    }
+
+    // PIN modes: issue the challenge. verifier is guaranteed present here.
+    const record = this.verifier!;
+    const nonceH = randomBytes(NONCE_BYTES);
+    this.pendingChallenges.set(viewerId, nonceH);
+    const challengeMode = challengeModeOf(this.accessMode);
+    if (!challengeMode) return; // unreachable for pin modes
+    peer.sendControl(
+      {
+        t: 'auth-challenge',
+        v: 1,
+        nonceH: toBase64(nonceH),
+        salt: record.salt,
+        iterations: record.iterations,
+        channelBinding: peer.getChannelBinding(viewerId),
+        mode: challengeMode,
+      },
+      viewerId,
+    );
+  }
+
+  /**
+   * Run the human-Accept consent for a viewer and, on accept, authorize +
+   * attach. On reject/timeout, deny (send a reason-free failure). Shared by the
+   * 'prompt' path and the second stage of 'pin-and-prompt'.
+   */
+  private async runConsentThenAuthorize(viewerId: string, peerInfo: PeerInfo): Promise<void> {
+    const decision = await this.consent.request(peerInfo);
+    if (decision === 'accept') {
+      this.authorizeViewer(viewerId);
+    } else {
+      this.denyViewer(viewerId);
+    }
+  }
+
+  /**
+   * Handle a viewer's auth-response in a PIN mode: check lockout + verify the
+   * proof against the host nonce and channel binding. On a valid proof, if the
+   * mode also requires a human Accept ('pin-and-prompt') run the consent gate;
+   * otherwise authorize directly. On any failure, bump the lockout and deny.
+   */
+  private async handleAuthResponse(
+    m: Extract<ControlMessage, { t: 'auth-response' }>,
+    viewerId: string,
+  ): Promise<void> {
+    const peer = this.peer;
+    if (!peer) return;
+    if (!modeRequiresPin(this.accessMode) || !this.verifier) {
+      // Unexpected auth-response (mode needs no PIN); ignore — fail-closed.
+      return;
+    }
+    const nonceH = this.pendingChallenges.get(viewerId);
+    if (!nonceH) {
+      // No outstanding challenge for this viewer — never issued one or already
+      // consumed. Reject without running the KDF.
+      this.denyViewer(viewerId);
+      return;
+    }
+
+    const channelBinding = peer.getChannelBinding(viewerId);
+    const outcome = await this.authVerifier.verify({
+      record: this.verifier,
+      proof: m.proof,
+      nonceH,
+      nonceV: m.nonceV,
+      channelBinding,
+      domain: AUTH_DOMAIN,
+      key: this.lockoutKeyFor(viewerId, channelBinding),
+    });
+
+    if (!outcome.ok) {
+      // The host nonce is single-use: drop it so a retry must await a fresh
+      // challenge (issued only on a fresh join). Bump already happened in verify.
+      this.pendingChallenges.delete(viewerId);
+      this.denyViewer(viewerId);
+      return;
+    }
+
+    // Proof valid. Consume the nonce.
+    this.pendingChallenges.delete(viewerId);
+
+    if (modeRequiresPrompt(this.accessMode)) {
+      // 'pin-and-prompt': also require a human Accept.
+      await this.runConsentThenAuthorize(viewerId, {
+        peerId: viewerId,
+        name: m.name,
+        channelBinding,
+      });
+      return;
+    }
+    this.authorizeViewer(viewerId);
+  }
+
+  /** Mark a viewer authorized: attach media (once) + accept input + ack. */
+  private authorizeViewer(viewerId: string): void {
+    this.authorizedViewers.add(viewerId);
+    this.ensureStreamAttached();
+    this.peer?.sendControl({ t: 'auth-result', v: 1, ok: true }, viewerId);
+    this.opts.onAuthResult?.(viewerId, true);
+  }
+
+  /** Deny a viewer: send a reason-free failure; never attach media or input. */
+  private denyViewer(viewerId: string): void {
+    this.authorizedViewers.delete(viewerId);
+    this.peer?.sendControl({ t: 'auth-result', v: 1, ok: false }, viewerId);
+    this.opts.onAuthResult?.(viewerId, false);
   }
 
   /**
@@ -510,6 +800,21 @@ export class HostSession {
    * monitor-switched) go back to the requesting viewer specifically.
    */
   private async handleControl(m: ControlMessage, viewerId: string): Promise<void> {
+    // AUTH FRAMES are handled regardless of authorization state — they ARE the
+    // authorization. An auth-response from a viewer drives the PIN verification.
+    if (m.t === 'auth-response') {
+      await this.handleAuthResponse(m, viewerId);
+      return;
+    }
+    // auth-challenge / auth-result are host->viewer only; ignore if a viewer
+    // sends them (a malformed/hostile peer).
+    if (m.t === 'auth-challenge' || m.t === 'auth-result') return;
+
+    // ACCESS GATING: in a non-'open' mode, ignore ALL other control frames from a
+    // viewer that is not yet authorized (file transfer, monitor switch, quality,
+    // chat, etc). They must pass the access gate first. Fail-closed.
+    if (!this.isAuthorized(viewerId)) return;
+
     // Let the originating viewer's file manager observe its control frames.
     this.fileManagerFor(viewerId).onControl(m);
     switch (m.t) {
@@ -825,6 +1130,11 @@ export class HostSession {
     this.signaling = null;
     this.fileManagers.clear();
     this.viewerLatency.clear();
+    this.authorizedViewers.clear();
+    this.pendingChallenges.clear();
+    this.consent.clear();
+    this.lockout.clear();
+    this.streamAttached = false;
     this.consecutiveIncreases = 0;
     this.started = false;
   }

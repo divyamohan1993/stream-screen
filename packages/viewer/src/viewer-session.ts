@@ -4,6 +4,13 @@ import {
   isValidSessionCode,
   createSender,
   FileTransferManager,
+  AUTH_DOMAIN,
+  deriveKey,
+  computeProof,
+  fromBase64,
+  toBase64,
+  randomBytes,
+  NONCE_BYTES,
   type AdaptiveStats,
   type InputEvent,
   type SignalMessage,
@@ -28,9 +35,32 @@ export type SessionState =
   | 'connecting'
   | 'waiting-for-host'
   | 'reconnecting'
+  | 'authenticating'
   | 'connected'
   | 'disconnected'
+  | 'denied'
   | 'error';
+
+/**
+ * Access mode advertised by the host in an {@link AuthChallenge}. `'open'` is
+ * the absence of a challenge (no auth) — it never appears in a challenge frame
+ * and so is intentionally NOT part of this union.
+ */
+export type AuthMode = 'prompt' | 'pin' | 'pin-and-prompt';
+
+/**
+ * What the viewer must do to satisfy the host's inbound auth challenge.
+ * Surfaced to the UI so it can render the right affordance:
+ *  - `'prompt'`: a non-interactive "waiting for host approval" notice; the host
+ *    operator must Accept. No PIN field — the viewer sends no proof.
+ *  - `'pin'` / `'pin-and-prompt'`: a PIN entry field; on submit the viewer
+ *    derives the proof and sends an `auth-response`.
+ */
+export interface AuthChallenge {
+  mode: AuthMode;
+  /** True when a PIN proof is required (`'pin'` / `'pin-and-prompt'`). */
+  needsPin: boolean;
+}
 
 /** A chat message as surfaced to the UI (origin + text + timestamp). */
 export interface ChatEntry {
@@ -72,6 +102,19 @@ export interface ViewerSessionHandlers {
   onFileTransfer?: (entry: FileTransferEntry) => void;
   /** An inbound file completed and is ready to download. */
   onFileReady?: (data: Uint8Array, meta: FileMeta) => void;
+  /**
+   * The host requires authorization before the session may proceed (an inbound
+   * `auth-challenge` arrived). The UI shows the appropriate consent/PIN
+   * affordance. Fires again on a fresh challenge after a denial (retry). Never
+   * fires in `'open'` access mode (no challenge is sent).
+   */
+  onAuthRequired?: (challenge: AuthChallenge) => void;
+  /**
+   * The host returned its auth verdict. `ok:true` ⇒ the session proceeds and the
+   * (possibly already-arrived) video is released; `ok:false` ⇒ access denied,
+   * the UI offers a retry. Reason-free by protocol design.
+   */
+  onAuthResult?: (ok: boolean) => void;
 }
 
 /** Options for opening a viewer session. */
@@ -175,6 +218,31 @@ export class ViewerSession {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Guards against overlapping rebuilds while one is already in flight. */
   private rebuilding = false;
+  /**
+   * The most recent inbound `auth-challenge`, retained so {@link submitPin} can
+   * derive the proof against the host's salt/nonce/iterations/channelBinding.
+   * Cleared once consumed (a response is sent) or on teardown.
+   */
+  private pendingChallenge:
+    | Extract<ControlMessage, { t: 'auth-challenge' }>
+    | null = null;
+  /**
+   * True once the host has required authorization (a challenge arrived) and we
+   * are not yet authorized. While set, the session is GATED: the remote video is
+   * withheld and the lifecycle is held at `authenticating` (never `connected`)
+   * until an `auth-result{ok:true}` arrives. In `'open'` mode no challenge ever
+   * arrives, so this stays false and behavior is unchanged.
+   */
+  private authRequired = false;
+  /** True once the host returned `auth-result{ok:true}`; ungates the session. */
+  private authorized = false;
+  /**
+   * A remote stream that arrived BEFORE authorization completed. Held back (not
+   * surfaced to the UI) until `auth-result{ok:true}` so unauthorized video is
+   * never rendered, then released. In `'open'` mode streams pass straight
+   * through and this stays null.
+   */
+  private pendingStream: MediaStream | null = null;
 
   constructor(opts: ViewerSessionOptions) {
     this.opts = opts;
@@ -184,6 +252,17 @@ export class ViewerSession {
   /** Current lifecycle state. */
   get currentState(): SessionState {
     return this.state;
+  }
+
+  /**
+   * The auth challenge the session is currently awaiting a response to, if any —
+   * e.g. so the UI can decide whether to render a PIN field. `null` in `'open'`
+   * mode and once authorization has completed.
+   */
+  get currentAuthChallenge(): AuthChallenge | null {
+    const c = this.pendingChallenge;
+    if (!c) return null;
+    return { mode: c.mode, needsPin: c.mode === 'pin' || c.mode === 'pin-and-prompt' };
   }
 
   /**
@@ -358,10 +437,17 @@ export class ViewerSession {
     this.peer = peer;
 
     peer.on('track', (_track: MediaStreamTrack, stream: MediaStream) => {
-      if (stream) {
-        this.stream = stream;
-        this.handlers.onStream?.(stream);
+      if (!stream) return;
+      this.stream = stream;
+      // GATING: if the host required auth and we are not yet authorized, withhold
+      // the video — never render an unauthorized stream. Hold it until
+      // `auth-result{ok:true}` releases it. In `'open'` mode (no challenge,
+      // authRequired stays false) the stream passes straight through.
+      if (this.authRequired && !this.authorized) {
+        this.pendingStream = stream;
+        return;
       }
+      this.handlers.onStream?.(stream);
     });
 
     peer.on('state', (connState: RTCPeerConnectionState) => {
@@ -407,7 +493,15 @@ export class ViewerSession {
     switch (connState) {
       case 'connected':
         this.clearReconnectTimer();
-        this.setState('connected');
+        // GATING: if the host required auth and we are not yet authorized, hold
+        // the lifecycle at `authenticating` rather than reporting `connected`.
+        // The auth handshake runs over the control channel that opens with this
+        // connection; only `auth-result{ok:true}` advances us to `connected`.
+        if (this.authRequired && !this.authorized) {
+          this.setState('authenticating');
+        } else {
+          this.setState('connected');
+        }
         break;
       case 'disconnected':
         // Don't tear down yet: most blips (WiFi roam, brief AP loss) recover.
@@ -466,6 +560,14 @@ export class ViewerSession {
     this.rebuilding = true;
     this.clearReconnectTimer();
     this.setState('reconnecting', 'Reconnecting…');
+    // A fresh peer means the host re-runs its auth handshake from scratch. Reset
+    // the gate so an authorized prior session can't bypass re-authorization on
+    // the rebuilt connection; the host's new challenge re-arms it. (In `'open'`
+    // mode no challenge arrives, so this is a no-op for the lifecycle.)
+    this.authRequired = false;
+    this.authorized = false;
+    this.pendingChallenge = null;
+    this.pendingStream = null;
     try {
       // Closing the old peer fires `closed`; `rebuilding` guards it from being
       // mistaken for a user-initiated teardown.
@@ -549,6 +651,8 @@ export class ViewerSession {
     this.signaling?.close();
     this.signaling = null;
     this.stream = null;
+    this.pendingStream = null;
+    this.pendingChallenge = null;
   }
 
   private startStatsLoop(): void {
@@ -660,9 +764,120 @@ export class ViewerSession {
           status: 'active',
         });
         break;
+      case 'auth-challenge':
+        this.onAuthChallenge(m);
+        break;
+      case 'auth-result':
+        this.onAuthResult(m.ok);
+        break;
       default:
         break;
     }
+  }
+
+  /**
+   * Handle an inbound `auth-challenge`: the host requires authorization before
+   * the session may proceed. Mark the session GATED, retain the challenge so a
+   * subsequent {@link submitPin} can derive the proof, surface the right UI
+   * affordance, and (defensively) hold the lifecycle at `authenticating` even if
+   * we already reached the peer `connected` state.
+   *
+   * For a `'prompt'`-only challenge there is no PIN: the host operator must
+   * Accept, so we immediately send a proof-less `auth-response` carrying only our
+   * display name and wait for the verdict. For `'pin'`/`'pin-and-prompt'` we wait
+   * for the user to enter the PIN via {@link submitPin}.
+   */
+  private onAuthChallenge(m: Extract<ControlMessage, { t: 'auth-challenge' }>): void {
+    if (this.closed) return;
+    this.authRequired = true;
+    this.authorized = false;
+    this.pendingChallenge = m;
+    const needsPin = m.mode === 'pin' || m.mode === 'pin-and-prompt';
+    // Hold the lifecycle at `authenticating` (the control channel only opens
+    // after the peer connects, so we are typically already at `connected` here
+    // in the gated sense; surface the gate explicitly).
+    this.setState('authenticating');
+    this.handlers.onAuthRequired?.({ mode: m.mode, needsPin });
+    if (!needsPin) {
+      // Prompt-only: no secret to prove. Send a proof-less response so the host
+      // can associate our display name; the human Accept drives the verdict.
+      this.peer?.sendControl({
+        t: 'auth-response',
+        v: 1,
+        nonceV: toBase64(randomBytes(NONCE_BYTES)),
+        proof: '',
+        name: this.opts.name ?? 'web-viewer',
+      });
+    }
+  }
+
+  /**
+   * Handle the host's `auth-result` verdict. On success ungate the session:
+   * release any video that arrived while gated and advance to `connected`. On
+   * failure surface `denied`; the UI may call {@link submitPin} again once a
+   * fresh challenge arrives (or re-use the retained challenge).
+   */
+  private onAuthResult(ok: boolean): void {
+    if (this.closed) return;
+    this.handlers.onAuthResult?.(ok);
+    if (ok) {
+      this.authorized = true;
+      this.pendingChallenge = null;
+      this.setState('connected');
+      // Release any stream that arrived while we were gated.
+      if (this.pendingStream) {
+        const s = this.pendingStream;
+        this.pendingStream = null;
+        this.handlers.onStream?.(s);
+      }
+    } else {
+      // Access denied. Stay gated; keep the challenge so a retry can reuse the
+      // host's salt/nonce/binding without waiting for a new challenge frame.
+      this.authorized = false;
+      this.setState('denied', 'Access denied.');
+    }
+  }
+
+  /**
+   * Submit a user-entered PIN in response to the pending `auth-challenge`. Derives
+   * the PBKDF2 key from the host's salt/iterations, computes the bound proof
+   * (domain ‖ nonceH ‖ a fresh nonceV ‖ the LOCALLY-computed DTLS channel
+   * binding), and sends the `auth-response`. The PIN is used only to derive the
+   * proof and is NEVER stored — the local string goes out of scope as soon as the
+   * key is derived.
+   *
+   * The channel binding is recomputed locally via {@link Peer.getChannelBinding}
+   * so it matches the host's value without ever transiting signaling; a binding
+   * mismatch (e.g. a re-terminated-DTLS MITM) yields a proof the host rejects.
+   *
+   * No-op if there is no pending challenge or it is prompt-only.
+   */
+  async submitPin(pin: string): Promise<void> {
+    const challenge = this.pendingChallenge;
+    const peer = this.peer;
+    if (!challenge || !peer) return;
+    if (challenge.mode !== 'pin' && challenge.mode !== 'pin-and-prompt') return;
+    const salt = fromBase64(challenge.salt);
+    const nonceH = fromBase64(challenge.nonceH);
+    const nonceV = randomBytes(NONCE_BYTES);
+    // Derive then immediately drop the PIN reference (never persisted anywhere).
+    const key = await deriveKey(pin, salt, challenge.iterations);
+    const channelBinding = peer.getChannelBinding();
+    const proof = await computeProof(key, {
+      domain: AUTH_DOMAIN,
+      nonceH,
+      nonceV,
+      channelBinding,
+    });
+    // The challenge has been consumed; a denial will resend a fresh one (or the
+    // UI may resubmit if the host reuses the same challenge).
+    peer.sendControl({
+      t: 'auth-response',
+      v: 1,
+      nonceV: toBase64(nonceV),
+      proof: toBase64(proof),
+      name: this.opts.name ?? 'web-viewer',
+    });
   }
 
   /** Send an input event to the host (no-op if the channel is not open). */
@@ -809,6 +1024,8 @@ export class ViewerSession {
     this.signaling?.close();
     this.signaling = null;
     this.stream = null;
+    this.pendingStream = null;
+    this.pendingChallenge = null;
     // `force`: `closed` was set at the top of this method, but this terminal
     // 'disconnected' emission is the intentional one for a user-initiated teardown.
     this.setState('disconnected', undefined, true);

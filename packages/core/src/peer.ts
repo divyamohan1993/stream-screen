@@ -785,6 +785,44 @@ export class Peer {
     return { rttMs: s.rttMs, playoutMs: s.playoutMs ?? 0, fps: s.fps };
   }
 
+  /**
+   * Compute the DTLS channel-binding string for a connection, used by the
+   * connection-consent / access-PIN handshake to bind the auth proof to THIS
+   * encrypted transport.
+   *
+   * It parses every `a=fingerprint:` line from both the local and remote SDP,
+   * extracts the hex fingerprint values, sorts them canonically, and joins them
+   * with `|`. Because the set of fingerprints is identical on both peers (each
+   * sees the other's offer/answer), and the result is sorted, the host and the
+   * viewer compute the SAME string — without exchanging it. A man-in-the-middle
+   * that re-terminates DTLS would present different fingerprints, so its binding
+   * (and therefore the auth proof it could relay) would not match.
+   *
+   * Returns `''` when descriptions are unavailable (binding cannot be formed),
+   * or when `remoteId` names no connection / is ambiguous (omitted with multiple
+   * connections). The caller treats an empty binding as fail-closed.
+   */
+  getChannelBinding(remoteId?: string): string {
+    const conns = [...this.targetConnections(remoteId)];
+    if (conns.length !== 1) return '';
+    const pc = conns[0].pc;
+    return Peer.channelBindingFromSdp(pc.localDescription?.sdp, pc.remoteDescription?.sdp);
+  }
+
+  /**
+   * Derive the canonical channel binding from two SDP blobs. Static + pure so it
+   * can be unit-tested and so both peers (which see the same two descriptions in
+   * swapped local/remote roles) produce an identical value. Returns `''` if
+   * fewer than two fingerprints are present.
+   */
+  static channelBindingFromSdp(a: string | undefined, b: string | undefined): string {
+    const fps = [...extractFingerprints(a), ...extractFingerprints(b)];
+    if (fps.length < 2) return '';
+    // Canonical: sort so ordering/role is irrelevant. Dedupe is intentionally
+    // NOT applied — a degenerate identical pair still yields a stable value.
+    return fps.sort().join('|');
+  }
+
   /** Combine per-connection snapshots into the worst-case view across viewers. */
   private aggregateStats(snapshots: AdaptiveStats[]): AdaptiveStats {
     if (snapshots.length === 1) return snapshots[0];
@@ -1027,4 +1065,24 @@ export class Peer {
 /** Coerce an unknown stats field to a finite number (0 otherwise). */
 function numOf(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+/**
+ * Extract the hex fingerprint values from every `a=fingerprint:<hash> <hex>`
+ * line in an SDP blob, normalized to lowercase. Order of appearance is
+ * preserved; the caller sorts. Returns `[]` for missing/empty SDP.
+ *
+ * The full `<hash> <hex>` token would also be unambiguous, but the hex value
+ * alone is what uniquely identifies the DTLS certificate, and using it keeps the
+ * binding stable across hash-algorithm label casing differences between stacks.
+ */
+function extractFingerprints(sdp: string | undefined): string[] {
+  if (!sdp) return [];
+  const out: string[] = [];
+  const re = /^a=fingerprint:(\S+)\s+(\S+)/gim;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sdp)) !== null) {
+    out.push(`${m[1].toLowerCase()} ${m[2].toLowerCase()}`);
+  }
+  return out;
 }

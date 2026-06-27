@@ -7,8 +7,9 @@
  */
 
 import { contextBridge, ipcRenderer } from 'electron';
-import type { InputEvent, MonitorInfo } from '@stream-screen/core';
+import type { InputEvent, MonitorInfo, VerifierRecord } from '@stream-screen/core';
 import type { DisplayGeometry } from './monitor.js';
+import type { AccessMode } from './access-config.js';
 
 /** A capturable desktop source as surfaced from the main process. */
 export interface RawSource {
@@ -42,6 +43,19 @@ export interface HostBootConfig {
   signalingUrl: string;
   code: string;
   hostName: string;
+  /**
+   * The EFFECTIVE access mode the session must enforce. 'open' (default) keeps
+   * the historical no-prompt/no-PIN behavior; 'refuse' means a misconfigured PIN
+   * mode — the renderer must refuse all connections (fail-closed).
+   */
+  accessMode: AccessMode;
+  /**
+   * The host PIN verifier (salt + PBKDF2-derived key) for 'pin'/'pin-and-prompt'
+   * modes; null otherwise. NEVER contains the plaintext PIN. It is safe to hand
+   * to the renderer: it is non-reversible and is the same material the host would
+   * use to recompute the expected proof.
+   */
+  verifier: VerifierRecord | null;
 }
 
 /** The API exposed on `window.streamscreen` in the renderer. */

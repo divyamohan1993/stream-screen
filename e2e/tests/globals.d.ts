@@ -19,6 +19,21 @@ interface LatencyReport {
   fps?: number;
 }
 
+/** Host-side auth (access mode) observation surface. */
+interface HostAuthState {
+  accessMode: string;
+  authByPeer: Record<string, 'pending' | 'ok' | 'denied'>;
+  authAttempts: number;
+  streamAttached: boolean;
+}
+
+/** Viewer-side auth (access mode) observation surface. */
+interface ViewerAuthState {
+  authChallenged: boolean;
+  authMode: 'pin' | 'pin-and-prompt' | 'prompt' | null;
+  authResult: boolean | null;
+}
+
 /** The live outbound video sender's first-encoding parameters (off the real RTCRtpSender). */
 interface VideoSenderParams {
   maxBitrate: number | null;
@@ -67,6 +82,7 @@ declare global {
       getActiveMonitor(): string;
       getReceivedFiles(): ReceivedFile[];
       getReceivedLatency(): LatencyReport[];
+      getAuthState(): HostAuthState;
       setAutoAdaptive(enabled: boolean): void;
       getVideoSenderParams(): VideoSenderParams | null;
       driveAdaptive(statsSeq: AdaptiveStats[]): Promise<DriveAdaptiveResult>;
@@ -80,6 +96,7 @@ declare global {
     };
     __viewer: {
       getState(): ViewerState;
+      getAuthState(): ViewerAuthState;
       getVideoSize(): { width: number; height: number };
       isVideoPlaying(): boolean;
       getDecodedFrameCount(): number;
@@ -125,6 +142,18 @@ declare global {
     };
     __hostError?: string;
     __viewerError?: string;
+    /** Exact auth secret material a fixture emitted on the DATA channel (test only). */
+    __authSecrets?: {
+      pin?: string;
+      salt?: string | null;
+      verifierKey?: string | null;
+      nonceH?: string;
+      nonceV?: string;
+      proof?: string;
+      channelBinding?: string;
+    };
+    /** All WebSocket text frames this page sent/received (signaling-isolation spec). */
+    __wsFrames?: { dir: 'send' | 'recv'; data: string }[];
   }
 }
 
