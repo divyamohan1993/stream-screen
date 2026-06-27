@@ -59,6 +59,9 @@ export function App(): React.JSX.Element {
   const [decision, setDecision] = useState<AdaptiveDecision | null>(null);
   const [preset, setPreset] = useState<QualityPreset>('Auto');
   const [statsVisible, setStatsVisible] = useState(true);
+  // Rolling end-to-end interactive latency history (rtt + playout), newest last,
+  // for the StatsPanel sparkline. Capped so it never grows unbounded.
+  const [latencyHistory, setLatencyHistory] = useState<number[]>([]);
 
   // Audio (A)
   const [muted, setMuted] = useState(true);
@@ -89,10 +92,23 @@ export function App(): React.JSX.Element {
   const onStage =
     state === 'waiting-for-host' || state === 'connected' || state === 'reconnecting';
 
+  /** Max number of latency samples retained for the sparkline. */
+  const LATENCY_HISTORY_LIMIT = 60;
+
   const handleStats = useCallback((s: AdaptiveStats) => {
     setStats(s);
     if (s.width > 0 || s.fps > 0 || s.availableKbps > 0) {
       setDecision(controllerRef.current.update(s));
+    }
+    // Track end-to-end interactive latency (network rtt + receiver playout) for
+    // the sparkline. Only record real samples (a frame is flowing).
+    if (s.rttMs > 0 || (s.playoutMs ?? 0) > 0) {
+      const latency = s.rttMs + (s.playoutMs ?? 0);
+      setLatencyHistory((prev) => {
+        const next = prev.length >= LATENCY_HISTORY_LIMIT ? prev.slice(1) : prev.slice();
+        next.push(latency);
+        return next;
+      });
     }
   }, []);
 
@@ -129,6 +145,7 @@ export function App(): React.JSX.Element {
       setTransfers([]);
       setMonitors([]);
       setActiveMonitorId(null);
+      setLatencyHistory([]);
       const session = new ViewerSession({
         code,
         // When a discovered host was picked, connect to ITS signaling server
@@ -184,6 +201,7 @@ export function App(): React.JSX.Element {
     setTransfers([]);
     setMonitors([]);
     setActiveMonitorId(null);
+    setLatencyHistory([]);
   }, [recorder]);
 
   const sendInput = useCallback((e: InputEvent) => {
@@ -285,16 +303,41 @@ export function App(): React.JSX.Element {
     if (!onStage && recorder.recording) recorder.stop();
   }, [onStage, recorder]);
 
+  // Human-readable connection status announced to assistive technology via an
+  // aria-live region whenever the session state changes.
+  const connectionStatus =
+    state === 'connected'
+      ? 'Connected to host.'
+      : state === 'connecting'
+        ? 'Connecting to host…'
+        : state === 'waiting-for-host'
+          ? 'Waiting for the host to share their screen…'
+          : state === 'reconnecting'
+            ? 'Connection lost. Reconnecting…'
+            : state === 'disconnected'
+              ? 'Disconnected.'
+              : state === 'error'
+                ? `Connection error${error ? `: ${error}` : ''}.`
+                : 'Idle.';
+
   if (!onStage) {
     return (
       <div className="app">
-        <ConnectScreen onConnect={connect} error={error} connecting={state === 'connecting'} />
+        <span className="sr-only" role="status" aria-live="polite">
+          {connectionStatus}
+        </span>
+        <main aria-label="Connect to a host">
+          <ConnectScreen onConnect={connect} error={error} connecting={state === 'connecting'} />
+        </main>
       </div>
     );
   }
 
   return (
     <div className="app">
+      <span className="sr-only" role="status" aria-live="polite">
+        {connectionStatus}
+      </span>
       <Toolbar
         state={state}
         preset={preset}
@@ -330,7 +373,9 @@ export function App(): React.JSX.Element {
         muted={muted}
         volume={volume}
       >
-        {statsVisible && <StatsPanel stats={stats} decision={decision} />}
+        {statsVisible && (
+          <StatsPanel stats={stats} decision={decision} latencyHistory={latencyHistory} />
+        )}
         <div className="side-panels">
           {chatVisible && (
             <ChatPanel

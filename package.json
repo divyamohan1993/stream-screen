@@ -3,6 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "description": "StreamScreen — self-hosted, LAN-first, always-free, unlimited-time peer-to-peer remote desktop for Windows over WebRTC.",
+  "license": "MIT",
+  "author": "divyamohan1993 <divyamohan1993@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/divyamohan1993/stream-screen.git"
+  },
   "workspaces": [
     "packages/*",
     "e2e"

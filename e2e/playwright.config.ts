@@ -2,12 +2,20 @@ import { defineConfig } from '@playwright/test';
 import { existsSync } from 'node:fs';
 
 /**
- * Resolve the pre-installed Chromium binary shipped in this container. We never
- * run `playwright install` here — the browser is already on disk under
- * /opt/pw-browsers. Prefer the stable symlink, then fall back to the versioned
- * path so the suite keeps working if the revision changes.
+ * Resolve a Chromium binary in a way that works BOTH locally and in CI.
+ *
+ * Locally, this container ships a pre-installed Chromium under /opt/pw-browsers
+ * and we never run `playwright install` — so when that path exists we point
+ * Playwright straight at the on-disk binary.
+ *
+ * In CI (GitHub Actions) /opt/pw-browsers does not exist; the workflow runs
+ * `npx playwright install --with-deps chromium`, so we return `null` here and
+ * let Playwright resolve its own default-installed Chromium.
  */
-function resolveChromium(): string {
+function resolveChromium(): string | null {
+  // Only honour the pre-installed container browser when it is actually present.
+  if (!existsSync('/opt/pw-browsers')) return null;
+
   const candidates = [
     '/opt/pw-browsers/chromium/chromium',
     '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
@@ -16,9 +24,11 @@ function resolveChromium(): string {
     if (existsSync(c)) return c;
   }
   throw new Error(
-    `e2e: could not find a pre-installed Chromium under /opt/pw-browsers (looked at: ${candidates.join(', ')})`,
+    `e2e: /opt/pw-browsers exists but no Chromium binary was found there (looked at: ${candidates.join(', ')})`,
   );
 }
+
+const chromiumPath = resolveChromium();
 
 const PORT = Number(process.env.PORT ?? 8787);
 const BASE_URL = `http://localhost:${PORT}`;
@@ -40,7 +50,9 @@ export default defineConfig({
     // set `headless: false` to stop Playwright from adding `--headless=old`.
     headless: false,
     launchOptions: {
-      executablePath: resolveChromium(),
+      // Use the pre-installed container Chromium when available; otherwise omit
+      // executablePath so Playwright uses its own default-installed browser (CI).
+      ...(chromiumPath ? { executablePath: chromiumPath } : {}),
       args: [
         '--headless=new',
         '--no-sandbox',

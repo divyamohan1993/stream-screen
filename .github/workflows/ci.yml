@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build, unit tests, e2e
+    runs-on: ubuntu-latest
+    env:
+      # Don't pull the Electron binary in CI — we never launch the Electron app
+      # here, we only build/typecheck it and run unit tests.
+      ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm run test --workspaces --if-present
+
+      - name: Install Playwright Chromium (CI default location)
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end tests
+        run: npm run e2e

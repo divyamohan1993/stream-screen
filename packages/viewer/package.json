@@ -4,6 +4,12 @@
   "type": "module",
   "private": true,
   "description": "StreamScreen web viewer: WebRTC remote screen, input capture, live adaptive stats dashboard. Any browser; also the AI-friendly surface. Always free, no time limits, no bitrate caps.",
+  "license": "MIT",
+  "author": "divyamohan1993 <divyamohan1993@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/divyamohan1993/stream-screen.git"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",

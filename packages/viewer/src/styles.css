@@ -4,9 +4,14 @@
   --bg-elev-2: #1c2230;
   --border: #262d3d;
   --text: #e6e9ef;
-  --text-dim: #9aa3b2;
+  /* Dimmed secondary text. Brightened from #9aa3b2 to #aab3c4 so it clears WCAG
+     AA (>=4.5:1) on the elevated panel backgrounds (#141822 / #1c2230), not just
+     on the darkest base background. */
+  --text-dim: #aab3c4;
   --accent: #4f8cff;
-  --accent-dim: #2d5bb0;
+  /* Used as a button/background fill behind white text; darkened slightly from
+     #2d5bb0 to #2a519c so #fff text on it clears WCAG AA. */
+  --accent-dim: #2a519c;
   --good: #3ecf8e;
   --warn: #f6c453;
   --bad: #ff5c6c;
@@ -128,6 +133,59 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/* Visible keyboard focus for ALL interactive controls. A clearly visible focus
+   ring is required for keyboard operability (WCAG 2.4.7). Scoped to
+   :focus-visible so it only shows for keyboard/programmatic focus, not mouse. */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible,
+[role='button']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* The session-code/signaling inputs already restyle their border on focus; add
+   the accent outline too so keyboard focus is unmistakable. */
+.code-input:focus-visible,
+.signaling-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--accent);
+}
+
+/* Visually hidden, but available to assistive technology. Used for aria-live
+   status regions and field labels/descriptions that aid screen readers without
+   altering the visual design. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Form field labels on the connect screen. */
+.field-label {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  margin-bottom: -0.5rem;
+}
+
+/* Panel headings (Chat / Files) styled to match the previous inline span. */
+.panel-title {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -162,6 +220,12 @@ button.primary:hover:not(:disabled) {
   letter-spacing: 0.08em;
   color: var(--text-dim);
   margin: 0 0 0.5rem;
+}
+
+.host-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
 
 .host-row {
@@ -379,6 +443,35 @@ button.danger:hover:not(:disabled) {
 }
 .stat-row .v.bad {
   color: var(--bad);
+}
+
+/* ---- Latency sparkline ---- */
+.stat-sparkline {
+  margin: 0.25rem 0 0.35rem;
+}
+
+.stat-sparkline .sparkline-svg {
+  display: block;
+  width: 100%;
+  height: 32px;
+  overflow: visible;
+}
+
+.stat-sparkline .sparkline-line {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* The text summary doubles as the accessible fallback; keep it compact and dim
+   so it reads as a caption under the chart without competing with the rows. */
+.stat-sparkline .sparkline-summary {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  line-height: 1.25;
 }
 
 .decision-reason {

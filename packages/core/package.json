@@ -3,6 +3,12 @@
   "version": "0.1.0",
   "type": "module",
   "description": "StreamScreen shared protocol types, WebRTC peer wrapper, adaptive engine, and input codec. Pure TypeScript — runs in browser and node, no native deps.",
+  "license": "MIT",
+  "author": "divyamohan1993 <divyamohan1993@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/divyamohan1993/stream-screen.git"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {

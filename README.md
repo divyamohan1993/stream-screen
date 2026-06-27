@@ -1,5 +1,8 @@
 # StreamScreen
 
+[![CI](https://github.com/divyamohan1993/stream-screen/actions/workflows/ci.yml/badge.svg)](https://github.com/divyamohan1993/stream-screen/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 **A free, unlimited-time, no-limits LAN remote desktop for Windows — over WebRTC.**
 
 StreamScreen lets you view and control another Windows PC on your Wi‑Fi/LAN, live
@@ -695,9 +698,26 @@ Per-package tests can also be run directly, e.g.
 
 ---
 
+## Contributing
+
+Contributions are welcome — bug reports, features, docs, and tests. See
+[CONTRIBUTING.md](./CONTRIBUTING.md) for how to build, test, and run the
+monorepo, and the issue / pull-request templates under
+[`.github/`](./.github). Please also read the
+[Code of Conduct](./CODE_OF_CONDUCT.md).
+
+## Security
+
+StreamScreen is LAN-first and peer-to-peer: media and input ride encrypted
+WebRTC (DTLS-SRTP) directly between peers with **no cloud relay**, gated by
+session codes. To report a vulnerability privately, see [SECURITY.md](./SECURITY.md).
+
 ## License
 
-Free and self-hosted. StreamScreen imposes **no time limits, no usage caps, no
+StreamScreen is released under the [MIT License](./LICENSE) —
+© 2026 divyamohan1993.
+
+It is free and self-hosted, and imposes **no time limits, no usage caps, no
 bitrate ceilings, and no accounts** — by design and in code. See
 [ARCHITECTURE.md](./ARCHITECTURE.md#no-limits-guarantee).
 </content>

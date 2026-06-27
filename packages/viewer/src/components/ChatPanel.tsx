@@ -20,12 +20,19 @@ export interface ChatPanelProps {
 export function ChatPanel({ messages, onSend, onClose }: ChatPanelProps): React.JSX.Element {
   const [draft, setDraft] = useState('');
   const listRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   // Keep the newest message in view.
   useEffect(() => {
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
+
+  // Move keyboard focus into the panel when it opens so it's immediately usable
+  // and the tab order is logical.
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -36,16 +43,16 @@ export function ChatPanel({ messages, onSend, onClose }: ChatPanelProps): React.
   };
 
   return (
-    <div className="chat-panel" aria-label="Chat">
+    <section className="chat-panel" role="region" aria-label="Chat">
       <div className="chat-header">
-        <span>Chat</span>
+        <h2 className="panel-title">Chat</h2>
         {onClose && (
           <button type="button" className="chat-close" onClick={onClose} aria-label="Close chat">
             ×
           </button>
         )}
       </div>
-      <div className="chat-messages" ref={listRef} role="log" aria-live="polite">
+      <div className="chat-messages" ref={listRef} role="log" aria-live="polite" aria-label="Chat messages">
         {messages.length === 0 && <div className="chat-empty">No messages yet.</div>}
         {messages.map((m, i) => (
           <div key={`${m.ts}-${i}`} className={m.from === 'me' ? 'chat-msg me' : 'chat-msg host'}>
@@ -56,6 +63,7 @@ export function ChatPanel({ messages, onSend, onClose }: ChatPanelProps): React.
       </div>
       <form className="chat-input" onSubmit={submit}>
         <input
+          ref={inputRef}
           type="text"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
@@ -63,10 +71,10 @@ export function ChatPanel({ messages, onSend, onClose }: ChatPanelProps): React.
           aria-label="Chat message"
           maxLength={2000}
         />
-        <button type="submit" disabled={sanitizeChat(draft).length === 0}>
+        <button type="submit" disabled={sanitizeChat(draft).length === 0} aria-label="Send chat message">
           Send
         </button>
       </form>
-    </div>
+    </section>
   );
 }

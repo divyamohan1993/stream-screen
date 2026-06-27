@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { FileTransferEntry } from '../viewer-session.js';
 
 /** Props for {@link FileTransferPanel}. */
@@ -36,6 +36,12 @@ export function FileTransferPanel({
 }: FileTransferPanelProps): React.JSX.Element {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dropRef = useRef<HTMLDivElement>(null);
+
+  // Move keyboard focus into the panel when it opens (logical tab order).
+  useEffect(() => {
+    dropRef.current?.focus();
+  }, []);
 
   const sendFiles = useCallback(
     (files: FileList | File[] | null) => {
@@ -55,9 +61,9 @@ export function FileTransferPanel({
   );
 
   return (
-    <div className="file-panel" aria-label="File transfer">
+    <section className="file-panel" role="region" aria-label="File transfer">
       <div className="file-header">
-        <span>Files</span>
+        <h2 className="panel-title">Files</h2>
         {onClose && (
           <button type="button" className="file-close" onClick={onClose} aria-label="Close files">
             ×
@@ -66,6 +72,7 @@ export function FileTransferPanel({
       </div>
 
       <div
+        ref={dropRef}
         className={dragging ? 'file-drop dragging' : 'file-drop'}
         onDragOver={(e) => {
           e.preventDefault();
@@ -95,25 +102,44 @@ export function FileTransferPanel({
         />
       </div>
 
-      <div className="file-list">
+      <div className="file-list" role="list" aria-label="File transfers" aria-live="polite">
         {transfers.length === 0 && <div className="file-empty">No transfers.</div>}
-        {transfers.map((t) => (
-          <div key={t.id} className={`file-item ${t.status}`}>
-            <div className="file-item-head">
-              <span className="file-dir">{t.direction === 'out' ? '↑' : '↓'}</span>
-              <span className="file-name">{t.name || t.id}</span>
-              <span className="file-size">{t.size > 0 ? formatBytes(t.size) : ''}</span>
+        {transfers.map((t) => {
+          const pct = percent(t);
+          const name = t.name || t.id;
+          const dir = t.direction === 'out' ? 'Sending' : 'Receiving';
+          return (
+            <div
+              key={t.id}
+              className={`file-item ${t.status}`}
+              role="listitem"
+              aria-label={`${dir} ${name}, ${t.status}, ${pct}%`}
+            >
+              <div className="file-item-head">
+                <span className="file-dir" aria-hidden="true">
+                  {t.direction === 'out' ? '↑' : '↓'}
+                </span>
+                <span className="file-name">{name}</span>
+                <span className="file-size">{t.size > 0 ? formatBytes(t.size) : ''}</span>
+              </div>
+              <div
+                className="file-progress-bar"
+                role="progressbar"
+                aria-valuenow={pct}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-label={`${name} progress`}
+              >
+                <div className="file-progress-fill" style={{ width: `${pct}%` }} />
+              </div>
+              <span className="file-status">
+                {t.status}
+                {t.error ? ` — ${t.error}` : ''}
+              </span>
             </div>
-            <div className="file-progress-bar">
-              <div className="file-progress-fill" style={{ width: `${percent(t)}%` }} />
-            </div>
-            <span className="file-status">
-              {t.status}
-              {t.error ? ` — ${t.error}` : ''}
-            </span>
-          </div>
-        ))}
+          );
+        })}
       </div>
-    </div>
+    </section>
   );
 }

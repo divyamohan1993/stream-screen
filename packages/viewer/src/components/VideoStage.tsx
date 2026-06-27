@@ -117,7 +117,17 @@ export const VideoStage = forwardRef<VideoStageHandle, VideoStageProps>(function
   );
 
   return (
-    <div className="stage-wrap" ref={wrapRef}>
+    <main
+      className="stage-wrap"
+      ref={wrapRef}
+      aria-label="Remote screen"
+      aria-describedby="stage-video-desc"
+    >
+      <p id="stage-video-desc" className="sr-only">
+        Live remote desktop video from the host. Click or focus this area, then use your
+        mouse and keyboard to control the remote computer. Captions are not available for a
+        live screen share.
+      </p>
       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
       <video
         ref={videoRef}
@@ -125,15 +135,17 @@ export const VideoStage = forwardRef<VideoStageHandle, VideoStageProps>(function
         autoPlay
         playsInline
         tabIndex={0}
+        aria-label="Remote screen video"
+        aria-describedby="stage-video-desc"
       />
       {/* Zero-latency local cursor overlay; hidden until the first mousemove. */}
       <div ref={cursorRef} className="local-cursor" style={{ display: 'none' }} aria-hidden="true" />
       {!stream && (
-        <div className="stage-overlay">
+        <div className="stage-overlay" role="status" aria-live="polite">
           {connected ? 'Connected — waiting for the host screen…' : 'Waiting for host…'}
         </div>
       )}
       {children}
-    </div>
+    </main>
   );
 });

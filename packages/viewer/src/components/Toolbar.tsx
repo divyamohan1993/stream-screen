@@ -98,12 +98,14 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
           : 'state-pill';
 
   return (
-    <div className="toolbar">
+    <header className="toolbar" role="toolbar" aria-label="Session controls">
       <span className="brand">StreamScreen</span>
-      <span className={pillClass}>{STATE_LABEL[state]}</span>
+      <span className={pillClass} role="status" aria-live="polite" aria-label={`Connection status: ${STATE_LABEL[state]}`}>
+        {STATE_LABEL[state]}
+      </span>
       <span className="free-badge">unlimited · free</span>
 
-      <span className="spacer" />
+      <span className="spacer" aria-hidden="true" />
 
       <div className="preset-group" role="group" aria-label="Quality preset">
         {QUALITY_PRESETS.map((p) => (
@@ -112,6 +114,8 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
             type="button"
             className={p === preset ? 'active' : ''}
             onClick={() => onPreset(p)}
+            aria-pressed={p === preset}
+            aria-label={`Quality preset ${p}`}
           >
             {p}
           </button>
@@ -154,14 +158,15 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
         disabled={!recordingSupported}
         title={recordingSupported ? 'Start/stop recording' : 'Recording unsupported'}
         aria-pressed={recording}
+        aria-label={recording ? 'Stop recording' : 'Start recording'}
       >
         {recording ? '⏹ Stop rec' : '⏺ Record'}
       </button>
 
-      <button type="button" onClick={onCtrlAltDel} title="Send Ctrl+Alt+Del">
+      <button type="button" onClick={onCtrlAltDel} title="Send Ctrl+Alt+Del" aria-label="Send Ctrl+Alt+Del">
         Ctrl+Alt+Del
       </button>
-      <button type="button" onClick={onWinKey} title="Send Windows key">
+      <button type="button" onClick={onWinKey} title="Send Windows key" aria-label="Send Windows key">
         Win
       </button>
 
@@ -171,6 +176,7 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
         onClick={onToggleChat}
         aria-pressed={chatVisible}
         title="Toggle chat"
+        aria-label="Toggle chat panel"
       >
         Chat
       </button>
@@ -180,22 +186,29 @@ export function Toolbar(props: ToolbarProps): React.JSX.Element {
         onClick={onToggleFiles}
         aria-pressed={filesVisible}
         title="Toggle file transfer"
+        aria-label="Toggle file transfer panel"
       >
         Files
       </button>
 
-      <button type="button" onClick={onTogglePointerLock} title="Toggle pointer lock">
+      <button type="button" onClick={onTogglePointerLock} title="Toggle pointer lock" aria-label="Toggle pointer lock">
         Pointer lock
       </button>
-      <button type="button" onClick={onToggleFullscreen} title="Toggle fullscreen">
+      <button type="button" onClick={onToggleFullscreen} title="Toggle fullscreen" aria-label="Toggle fullscreen">
         Fullscreen
       </button>
-      <button type="button" onClick={onToggleStats} title="Toggle stats panel">
+      <button
+        type="button"
+        onClick={onToggleStats}
+        title="Toggle stats panel"
+        aria-pressed={statsVisible}
+        aria-label="Toggle stats panel"
+      >
         {statsVisible ? 'Hide stats' : 'Show stats'}
       </button>
-      <button type="button" className="danger" onClick={onDisconnect}>
+      <button type="button" className="danger" onClick={onDisconnect} aria-label="Disconnect from host">
         Disconnect
       </button>
-    </div>
+    </header>
   );
 }

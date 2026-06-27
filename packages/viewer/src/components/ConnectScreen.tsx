@@ -106,11 +106,18 @@ export function ConnectScreen({
         — no accounts, no relay, no time limits, no bitrate caps.
       </p>
 
-      <div className="connect-card">
+      <div className="connect-card" role="region" aria-label="Join a session">
+        <label className="field-label" htmlFor="session-code">
+          Session code
+        </label>
         <input
           ref={inputRef}
+          id="session-code"
+          name="session-code"
           className="code-input"
+          type="text"
           inputMode="numeric"
+          pattern="[0-9]*"
           autoComplete="off"
           placeholder="000000"
           maxLength={9}
@@ -120,16 +127,32 @@ export function ConnectScreen({
             if (e.key === 'Enter') submit();
           }}
           aria-label="Session code"
+          aria-describedby="session-code-hint"
         />
         <button className="primary" type="button" disabled={!valid || connecting} onClick={submit}>
           {connecting ? 'Connecting…' : 'Connect'}
         </button>
-        {error ? <p className="error-text">{error}</p> : null}
-        {!error && !valid && code.length > 0 ? (
-          <p className="hint">Codes are 6 to 9 digits.</p>
+        {error ? (
+          <p className="error-text" role="alert">
+            {error}
+          </p>
         ) : null}
+        {!error && !valid && code.length > 0 ? (
+          <p className="hint" id="session-code-hint" role="status">
+            Codes are 6 to 9 digits.
+          </p>
+        ) : (
+          <span id="session-code-hint" className="sr-only">
+            Enter the 6 to 9 digit code shown on the host.
+          </span>
+        )}
 
+        <label className="field-label" htmlFor="signaling-server">
+          Signaling server (optional)
+        </label>
         <input
+          id="signaling-server"
+          name="signaling-server"
           className="signaling-input"
           type="text"
           autoComplete="off"
@@ -143,15 +166,18 @@ export function ConnectScreen({
             if (e.key === 'Enter') submit();
           }}
           aria-label="Signaling server"
+          aria-describedby="signaling-server-hint"
         />
-        <p className="hint">
+        <p className="hint" id="signaling-server-hint">
           Leave blank to use this page&apos;s server. To connect to a host on
           another machine, enter its address (e.g. <code>192.168.1.10:8787</code>{' '}
           or <code>ws://192.168.1.10:8787</code>).
         </p>
       </div>
 
-      <DiscoveryList onPick={pick} />
+      <nav aria-label="Discovered LAN hosts">
+        <DiscoveryList onPick={pick} />
+      </nav>
     </div>
   );
 }

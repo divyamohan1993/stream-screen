@@ -38,25 +38,40 @@ export function DiscoveryList({ onPick, refreshMs = 4000 }: DiscoveryListProps):
 
   return (
     <div className="discovery">
-      <h3>LAN hosts {loading ? '· scanning…' : `· ${hosts.length} found`}</h3>
+      <h3 id="discovery-heading">
+        LAN hosts {loading ? '· scanning…' : `· ${hosts.length} found`}
+      </h3>
       {hosts.length === 0 && !loading && (
-        <p className="hint">No hosts discovered. Enter a code manually above.</p>
+        <p className="hint" role="status">
+          No hosts discovered. Enter a code manually above.
+        </p>
       )}
-      {hosts.map((h) => (
-        <div className="host-row" key={`${h.code}-${h.address ?? ''}-${h.port}`}>
-          <div className="meta">
-            <span className="name">{h.hostName || 'StreamScreen host'}</span>
-            <span className="sub">
-              code {h.code}
-              {h.address ? ` · ${h.address}:${h.port}` : ` · :${h.port}`} · {h.viewers} viewer
-              {h.viewers === 1 ? '' : 's'}
-            </span>
-          </div>
-          <button type="button" onClick={() => onPick(h)}>
-            Connect
-          </button>
-        </div>
-      ))}
+      {hosts.length > 0 && (
+        <ul className="host-list" aria-labelledby="discovery-heading">
+          {hosts.map((h) => {
+            const name = h.hostName || 'StreamScreen host';
+            return (
+              <li className="host-row" key={`${h.code}-${h.address ?? ''}-${h.port}`}>
+                <div className="meta">
+                  <span className="name">{name}</span>
+                  <span className="sub">
+                    code {h.code}
+                    {h.address ? ` · ${h.address}:${h.port}` : ` · :${h.port}`} · {h.viewers} viewer
+                    {h.viewers === 1 ? '' : 's'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onPick(h)}
+                  aria-label={`Connect to ${name}${h.code ? `, code ${h.code}` : ''}`}
+                >
+                  Connect
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }
