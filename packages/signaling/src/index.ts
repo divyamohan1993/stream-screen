@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * @stream-screen/signaling — entrypoint.
  *
@@ -50,6 +51,12 @@ export interface StartOptions {
   hostName?: string;
   /** Disable mDNS advertisement/discovery entirely. */
   disableDiscovery?: boolean;
+  /**
+   * Trust a reverse proxy's `X-Forwarded-For` header for the join-failure
+   * throttle. Off by default (direct LAN deployments). When unset, falls back
+   * to the `STREAMSCREEN_TRUST_PROXY` env flag.
+   */
+  trustProxy?: boolean;
 }
 
 /**
@@ -71,6 +78,10 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
   //                                 always redacted.
   const allowedOrigins = parseList(process.env.STREAMSCREEN_ALLOWED_ORIGINS);
   const restToken = process.env.STREAMSCREEN_REST_TOKEN || undefined;
+  // STREAMSCREEN_TRUST_PROXY: opt in to honoring X-Forwarded-For for the
+  // join-failure throttle (only when behind a TRUSTED reverse proxy). Off by
+  // default so direct LAN clients cannot spoof XFF to evade the throttle.
+  const trustProxy = opts.trustProxy ?? parseBool(process.env.STREAMSCREEN_TRUST_PROXY);
 
   // Build HTTP (REST) first, then attach WS to it so they share a port.
   const http = createRestServer({
@@ -80,7 +91,7 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
     allowedOrigins,
     token: restToken,
   });
-  const signaling = new SignalingServer({ server: http, allowedOrigins });
+  const signaling = new SignalingServer({ server: http, allowedOrigins, trustProxy });
 
   await new Promise<void>((resolve, reject) => {
     http.once('error', reject);
@@ -141,6 +152,15 @@ function parseList(raw: string | undefined): string[] | undefined {
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
   return items.length > 0 ? items : undefined;
+}
+
+/**
+ * Parse a boolean-ish env flag. Truthy values: `1`, `true`, `yes`, `on`
+ * (case-insensitive). Everything else (including unset) is false.
+ */
+function parseBool(raw: string | undefined): boolean {
+  if (!raw) return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
 function addressPort(server: import('node:http').Server): number | undefined {

@@ -104,6 +104,24 @@ export interface SignalingServerOptions {
   maxJoinFailures?: number;
   /** Sliding window (ms) for {@link maxJoinFailures}. */
   joinFailWindowMs?: number;
+  /**
+   * Whether to trust a reverse proxy's `X-Forwarded-For` header when deriving
+   * the remote address used for the join-failure throttle.
+   *
+   * StreamScreen is a LAN-DIRECT service: clients connect straight to the TCP
+   * socket, so the only trustworthy source identity is the real TCP peer
+   * (`req.socket.remoteAddress`). `X-Forwarded-For` is client-supplied and
+   * trivially forgeable, so an attacker on the LAN could rotate it on every
+   * request to never accumulate failures against a single key and defeat the
+   * brute-force throttle.
+   *
+   * - `false` (DEFAULT) -> IGNORE `X-Forwarded-For`; always key the throttle on
+   *   the real TCP peer address. Safe default for direct LAN deployments.
+   * - `true`            -> the server sits behind a TRUSTED reverse proxy that
+   *   sets `X-Forwarded-For`; the left-most entry is honored as the client
+   *   address (falling back to the socket peer when absent).
+   */
+  trustProxy?: boolean;
 }
 
 const DEFAULT_HEARTBEAT_MS = 30_000;
@@ -158,6 +176,7 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
   private readonly maxViewersPerRoom: number;
   private readonly maxJoinFailures: number;
   private readonly joinFailWindowMs: number;
+  private readonly trustProxy: boolean;
   /** Sliding-window failed-join counters, keyed by remote address. */
   private readonly joinFailures = new Map<string, { count: number; first: number }>();
   private heartbeat?: ReturnType<typeof setInterval>;
@@ -171,6 +190,7 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
     this.maxViewersPerRoom = opts.maxViewersPerRoom ?? DEFAULT_MAX_VIEWERS_PER_ROOM;
     this.maxJoinFailures = opts.maxJoinFailures ?? DEFAULT_MAX_JOIN_FAILURES;
     this.joinFailWindowMs = opts.joinFailWindowMs ?? DEFAULT_JOIN_FAIL_WINDOW_MS;
+    this.trustProxy = opts.trustProxy ?? false;
 
     // Resolve the Origin policy once. `['*']` is an explicit allow-all opt-out;
     // an empty/undefined list means "non-browser clients only".
@@ -310,7 +330,7 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
   private onConnection(socket: WebSocket, req: IncomingMessage): void {
     // Peer is unregistered until it sends a valid `join`.
     let peer: Peer | undefined;
-    const remoteAddr = remoteAddress(req);
+    const remoteAddr = remoteAddress(req, this.trustProxy);
 
     // Bound idle un-authenticated sockets: if no valid `join` arrives within
     // the deadline, close the socket so it cannot be parked indefinitely.
@@ -661,15 +681,26 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
 }
 
 /**
- * Best-effort remote address for throttling. Trusts `x-forwarded-for` only as a
- * fallback (this is a LAN-direct service, not behind a proxy), otherwise uses
- * the socket peer address. Returns 'unknown' if neither is available so the
- * throttle still groups anonymous sockets rather than disabling itself.
+ * Best-effort remote address used to key the brute-force join throttle.
+ *
+ * SECURITY: by default we use the REAL TCP peer (`req.socket.remoteAddress`) and
+ * IGNORE the client-supplied `X-Forwarded-For` header entirely. StreamScreen is
+ * a LAN-direct service, so XFF is attacker-controlled — honoring it would let a
+ * caller rotate the header on every request to dodge the per-source throttle
+ * (each spoofed value gets its own fresh failure budget). Only when the server
+ * is EXPLICITLY configured to sit behind a trusted reverse proxy
+ * (`trustProxy: true`) do we honor the left-most XFF entry as the client
+ * address, falling back to the socket peer when XFF is absent. Returns 'unknown'
+ * if no address is available so the throttle still groups anonymous sockets
+ * rather than disabling itself.
  */
-function remoteAddress(req: IncomingMessage): string {
-  const xff = req.headers['x-forwarded-for'];
-  if (typeof xff === 'string' && xff.length > 0) {
-    return xff.split(',')[0]!.trim();
+function remoteAddress(req: IncomingMessage, trustProxy: boolean): string {
+  if (trustProxy) {
+    const xff = req.headers['x-forwarded-for'];
+    if (typeof xff === 'string' && xff.length > 0) {
+      const first = xff.split(',')[0]!.trim();
+      if (first) return first;
+    }
   }
   return req.socket?.remoteAddress ?? 'unknown';
 }

@@ -74,6 +74,10 @@ async function startSession(
       $stats.textContent = `Chat from viewer: ${text}`;
     },
     onInput: (e) => api.injectInput(e),
+    // Route the Ctrl+Alt+Del chord (detected in HostSession) through the combo
+    // path so the main process can invoke the real Windows SAS API (SendSAS)
+    // instead of replaying synthetic key presses the secure desktop ignores.
+    onCombo: (events) => api.injectCombo(events),
     onState: (state) => {
       api.reportStatus(state);
       $stats.textContent = `Connection: ${state}`;

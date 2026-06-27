@@ -16,6 +16,8 @@
  * Always free, no time limits, no bitrate caps.
  */
 
+import { pathToFileURL } from 'node:url';
+
 import { startMcpServer } from './mcp-server.js';
 import { startRestApi } from './rest-api.js';
 
@@ -43,14 +45,29 @@ export async function main(): Promise<void> {
   }
 }
 
-// Run only when invoked directly (not when imported).
-const invokedDirectly = (() => {
-  const entry = process.argv[1];
+/**
+ * Decide whether this module is the process entrypoint (i.e. it was run
+ * directly, not merely imported by another package).
+ *
+ * Importing `@stream-screen/ai` must NEVER start the MCP/REST server as a side
+ * effect — doing so would take over stdio. We therefore require an exact match
+ * between the resolved CLI entry (`process.argv[1]`, normalized to a file URL)
+ * and this module's own URL. No `endsWith('index.js')` heuristic: an importing
+ * app's entrypoint is very commonly named `index.js`, which would spuriously
+ * start the server.
+ *
+ * @param entry    The CLI entrypoint path (typically `process.argv[1]`).
+ * @param moduleUrl This module's URL (typically `import.meta.url`).
+ */
+export function isDirectRun(
+  entry: string | undefined,
+  moduleUrl: string,
+): boolean {
   if (!entry) return false;
-  return import.meta.url === new URL(`file://${entry}`).href || entry.endsWith('index.js');
-})();
+  return pathToFileURL(entry).href === moduleUrl;
+}
 
-if (invokedDirectly) {
+if (isDirectRun(process.argv[1], import.meta.url)) {
   main().catch((err) => {
     // eslint-disable-next-line no-console
     console.error('[streamscreen-ai] fatal:', err);

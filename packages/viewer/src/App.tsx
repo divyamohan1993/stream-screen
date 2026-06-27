@@ -208,8 +208,18 @@ export function App(): React.JSX.Element {
 
   const onVolume = useCallback((v: number) => {
     setVolume(v);
-    // Adjusting volume above zero implies the user wants to hear audio.
-    if (v > 0) setMuted(false);
+    // Adjusting volume above zero implies the user wants to hear audio. If we
+    // were muted, a prior `toggleMute` told the host to disable its audio track
+    // ({t:'audio',enabled:false}); flipping only the local `muted` flag here
+    // would leave the UI unmuted while the host track stays disabled and the
+    // session silent. So when unmuting via the slider, also re-enable the host
+    // audio track ({t:'audio',enabled:true}) to keep UI and host in sync.
+    if (v > 0) {
+      setMuted((m) => {
+        if (m) sessionRef.current?.setAudioEnabled(true);
+        return false;
+      });
+    }
   }, []);
 
   // Recording (D)

@@ -161,6 +161,16 @@ Key points:
 - **Keepalive != timeout.** A WebSocket ping/pong heartbeat reaps *dead* sockets
   (crashed peer, dropped Wi‑Fi) so `peer-left` fires promptly. It never ends a
   *healthy* session. See [No-limits guarantee](#no-limits-guarantee).
+- **Brute-force join throttle.** Repeated failed `join`s are rate-limited per
+  source within a sliding window. The throttle key is the real TCP peer
+  (`req.socket.remoteAddress`); the client-supplied `X-Forwarded-For` header is
+  ignored by default since this is a LAN-direct service and XFF is forgeable
+  (rotating it would dodge the per-source budget). Set `STREAMSCREEN_TRUST_PROXY`
+  (or `trustProxy: true`) only when behind a trusted reverse proxy to honor the
+  left-most XFF entry as the client address.
+- **Executable bin.** The signaling entrypoint (`src/index.ts`) begins with a
+  `#!/usr/bin/env node` shebang so the `streamscreen-signaling` bin
+  (package.json `bin` → `dist/index.js`) runs directly on Unix.
 
 ---
 
@@ -257,6 +267,14 @@ flowchart LR
   browser would intercept — **Ctrl+Alt+Del**, Win, Alt+Tab, Win+R, Win+D, Alt+F4,
   Esc — replay correctly on the host injector. These pure builders are
   unit-tested without the native library.
+- **Ctrl+Alt+Del → SAS.** The chord arrives over the input channel as ordinary
+  key events, but a synthetic Ctrl+Alt+Del is ignored by the Windows Secure
+  Attention Sequence (SAS) on the secure desktop. `HostSession` detects the
+  chord's signature (a `Delete` key-down with both Ctrl and Alt held) and routes
+  it to the real `SendSAS` API (`input-injector.ts`) instead of replaying the
+  keys, suppressing the synthetic Delete replay. Software-initiated SAS requires
+  the host's `SoftwareSASGeneration` group policy to be enabled; without it
+  `SendSAS` no-ops and the host falls back to the synthetic chord.
 - **Wire codec** (`core/input-codec.ts`) is compact JSON with coordinates rounded
   to 4 decimals (sub-pixel on 4K) to keep pointer-move spam small; it is pure and
   round-trip safe, with an exhaustiveness guard so a new event variant fails to

@@ -14,6 +14,7 @@ describe('signaling package.json runtime deps', () => {
   const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
     dependencies?: Record<string, string>;
     devDependencies?: Record<string, string>;
+    bin?: Record<string, string>;
   };
 
   it('declares @stream-screen/core under dependencies', () => {
@@ -29,5 +30,44 @@ describe('signaling package.json runtime deps', () => {
     if (inDev) {
       expect(inRuntime).toBe(true);
     }
+  });
+});
+
+/**
+ * Regression guard for the executable bin: package.json exposes dist/index.js as
+ * the `streamscreen-signaling` command. On Unix the OS execs that file via its
+ * shebang, so dist/index.js MUST begin with `#!/usr/bin/env node` or running the
+ * installed bin fails ("cannot execute binary file" / syntax error). TypeScript
+ * preserves a first-line shebang in src/index.ts into the emitted dist file, so
+ * we assert the source first line is exactly the shebang AND the bin mapping
+ * points at dist/index.js. If a built dist/index.js exists, we also assert it
+ * starts with the shebang.
+ */
+describe('signaling executable bin shebang', () => {
+  const SHEBANG = '#!/usr/bin/env node';
+  const srcPath = fileURLToPath(new URL('../src/index.ts', import.meta.url));
+  const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
+  const distPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { bin?: Record<string, string> };
+
+  it('starts src/index.ts with the node shebang on the very first line', () => {
+    const firstLine = readFileSync(srcPath, 'utf8').split('\n', 1)[0];
+    expect(firstLine).toBe(SHEBANG);
+  });
+
+  it('maps the streamscreen-signaling bin to dist/index.js', () => {
+    expect(pkg.bin?.['streamscreen-signaling']).toBe('dist/index.js');
+  });
+
+  it('emits the shebang as the first line of the built dist/index.js (when built)', () => {
+    let built: string;
+    try {
+      built = readFileSync(distPath, 'utf8');
+    } catch {
+      // Not built in this run; the source + bin assertions above are the
+      // deterministic guard. Skip the built-artifact check.
+      return;
+    }
+    expect(built.split('\n', 1)[0]).toBe(SHEBANG);
   });
 });

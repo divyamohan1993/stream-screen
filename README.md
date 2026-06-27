@@ -340,6 +340,19 @@ file-transfer signaling) and a reliable binary `file` channel (the file bytes).
   cumulative modifier bitmask, sent over the input channel and replayed by the
   host injector.
 
+  **Ctrl+Alt+Del routing (Windows SAS).** The Ctrl+Alt+Del chord arrives over the
+  ordinary input channel as individual key events, but a synthetic Ctrl+Alt+Del is
+  *ignored* by the Windows **Secure Attention Sequence (SAS)** on the secure
+  desktop. The host therefore detects the chord (a `Delete` key-down with both
+  Ctrl and Alt held) in `HostSession` and routes it to the real `SendSAS` API
+  (`input-injector.ts`) instead of replaying the keys. **Requirement:**
+  software-initiated SAS requires the **`SoftwareSASGeneration`** group policy to
+  be enabled on the host (Computer Configuration → Administrative Templates →
+  Windows Components → Windows Logon Options → *Disable or enable software Secure
+  Attention Sequence* → **Enabled / Services and Ease of Access applications**).
+  Without that policy `SendSAS` no-ops and the host falls back to the synthetic
+  chord (still useful for in-app shortcuts and relaxed/kiosk configs).
+
 > Unlike AnyDesk — which gates file transfer, session recording, and even some
 > input behind paid tiers and the ~15-minute free cutoff — every feature here is
 > free, self-hosted, and never times out or meters usage.

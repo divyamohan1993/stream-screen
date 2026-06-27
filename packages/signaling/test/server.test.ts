@@ -4,9 +4,9 @@ import type { SignalMessage } from '@stream-screen/core';
 import { SignalingServer, generateCode } from '../src/server.js';
 
 /** Open a ws client and resolve once connected. */
-function connect(port: number): Promise<WebSocket> {
+function connect(port: number, headers?: Record<string, string>): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`, headers ? { headers } : undefined);
     ws.once('open', () => resolve(ws));
     ws.once('error', reject);
   });
@@ -274,6 +274,78 @@ describe('SignalingServer', () => {
       ws.close();
     } finally {
       await strict.close();
+    }
+  });
+
+  it('keys the join throttle on the TCP peer, IGNORING spoofed X-Forwarded-For (default)', async () => {
+    // Default config: trustProxy is OFF. An attacker rotating X-Forwarded-For on
+    // every connection shares one real socket.remoteAddress (127.0.0.1), so the
+    // throttle MUST count them as the SAME source and still reach the cap.
+    const strict = new SignalingServer({
+      port: 0,
+      heartbeatMs: 0,
+      maxJoinFailures: 3,
+      joinFailWindowMs: 60_000,
+    });
+    try {
+      const p = strict.port;
+      // 3 failed joins, each from a connection carrying a DIFFERENT forged XFF.
+      for (let i = 0; i < 3; i++) {
+        const ws = await connect(p, { 'x-forwarded-for': `203.0.113.${i}` });
+        send(ws, { type: 'join', role: 'viewer', code: '000001' });
+        const err = await nextMessage(ws, 'error');
+        expect(['no-such-session', 'too-many-attempts']).toContain(err.message);
+        ws.close();
+      }
+      // A 4th connection with yet another distinct forged XFF must STILL be
+      // throttled, because the XFF is ignored and the socket peer is the key.
+      const ws = await connect(p, { 'x-forwarded-for': '203.0.113.99' });
+      send(ws, { type: 'join', role: 'viewer', code: '000001' });
+      const err = await nextMessage(ws, 'error');
+      expect(err.message).toBe('too-many-attempts');
+      ws.close();
+    } finally {
+      await strict.close();
+    }
+  });
+
+  it('honors left-most X-Forwarded-For per source when trustProxy is enabled', async () => {
+    // trustProxy ON: the server sits behind a trusted reverse proxy, so distinct
+    // X-Forwarded-For client addresses are distinct throttle keys. Repeated
+    // failures under ONE XFF reach the cap, while a DIFFERENT XFF still has a
+    // fresh budget — proving XFF is honored as the key.
+    const proxied = new SignalingServer({
+      port: 0,
+      heartbeatMs: 0,
+      maxJoinFailures: 3,
+      joinFailWindowMs: 60_000,
+      trustProxy: true,
+    });
+    try {
+      const p = proxied.port;
+      const attacker = '198.51.100.7';
+      // Exhaust attacker's budget across 3 separate connections (same XFF).
+      for (let i = 0; i < 3; i++) {
+        const ws = await connect(p, { 'x-forwarded-for': attacker });
+        send(ws, { type: 'join', role: 'viewer', code: '000001' });
+        const err = await nextMessage(ws, 'error');
+        expect(['no-such-session', 'too-many-attempts']).toContain(err.message);
+        ws.close();
+      }
+      // The 4th attempt under the SAME XFF is throttled.
+      const blocked = await connect(p, { 'x-forwarded-for': attacker });
+      send(blocked, { type: 'join', role: 'viewer', code: '000001' });
+      expect((await nextMessage(blocked, 'error')).message).toBe('too-many-attempts');
+      blocked.close();
+
+      // A DIFFERENT XFF is a different source -> NOT throttled (gets the oracle
+      // 'no-such-session' rather than 'too-many-attempts').
+      const fresh = await connect(p, { 'x-forwarded-for': '198.51.100.250' });
+      send(fresh, { type: 'join', role: 'viewer', code: '000001' });
+      expect((await nextMessage(fresh, 'error')).message).toBe('no-such-session');
+      fresh.close();
+    } finally {
+      await proxied.close();
     }
   });
 

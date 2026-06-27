@@ -20,7 +20,9 @@
 import {
   AdaptiveController,
   createSender,
+  CTRL_ALT_DEL,
   FileTransferManager,
+  KEY_MODS,
   Peer,
   SignalingClient,
   type AdaptiveDecision,
@@ -32,6 +34,24 @@ import {
   type QualityPreset,
 } from '@stream-screen/core';
 import { getDisplayStream, streamHasAudio, type CaptureConstraints } from './capture.js';
+
+/**
+ * Pure detector: is this single inbound {@link InputEvent} the Ctrl+Alt+Del
+ * chord's signature — a key-DOWN for Delete with BOTH Ctrl and Alt held?
+ *
+ * Kept inline (rather than importing the equivalent `isCtrlAltDelCombo` from
+ * input-injector) so this renderer-side module never statically pulls in the
+ * main-process injector, which imports `node:child_process` and the optional
+ * native nut.js types. The renderer bundle (esbuild, platform 'browser') would
+ * fail to resolve those Node builtins. Mirrors input-injector's
+ * `isCtrlAltDelCombo` for a single event; both accept `Delete`/`NumpadDecimal`.
+ */
+export function isCtrlAltDelKeyDown(e: InputEvent): boolean {
+  if (e.t !== 'k-down') return false;
+  if (e.code !== 'Delete' && e.code !== 'NumpadDecimal') return false;
+  const mods = e.mods | 0;
+  return (mods & KEY_MODS.ctrl) !== 0 && (mods & KEY_MODS.alt) !== 0;
+}
 
 /** How often the adaptive loop samples stats and re-negotiates (ms). */
 export const ADAPTIVE_INTERVAL_MS = 1000;
@@ -79,6 +99,22 @@ export interface HostSessionOptions {
    * or arbitrate input from multiple simultaneous controllers.
    */
   onInput: (e: InputEvent, viewerId: string) => void;
+  /**
+   * Forward a special-key CHORD (an ordered InputEvent list) to the main process
+   * for atomic injection via the combo/SAS path. In the app this is
+   * `window.streamscreen.injectCombo`; tests inject a spy.
+   *
+   * This exists so the host can route the Ctrl+Alt+Del chord — which arrives over
+   * the ordinary input channel as individual InputEvents — to the real Windows
+   * Secure Attention Sequence (SAS) API instead of replaying synthetic key
+   * presses, which the kernel ignores for the secure desktop. See the routing in
+   * {@link start}. If omitted, the chord falls back to per-event {@link onInput}.
+   *
+   * NOTE: software-initiated SAS on Windows requires the "SoftwareSASGeneration"
+   * group policy to be enabled on the host; otherwise SendSAS no-ops (see
+   * input-injector `sendSAS`). Routing is still correct regardless of policy.
+   */
+  onCombo?: (events: InputEvent[], viewerId: string) => void;
   /** Optional observer for each adaptive decision (e.g. to update the UI). */
   onDecision?: (d: AdaptiveDecision, s: AdaptiveStats) => void;
   /** Optional observer for peer connection-state changes. */
@@ -214,7 +250,7 @@ export class HostSession {
     });
     this.peer = peer;
 
-    peer.onInput((e, viewerId) => this.opts.onInput(e, viewerId));
+    peer.onInput((e, viewerId) => this.routeInput(e, viewerId));
     if (this.opts.onState) {
       peer.on('state', (...args: unknown[]) => {
         this.opts.onState?.(String(args[0]));
@@ -255,6 +291,38 @@ export class HostSession {
     peer.attachStream(this.stream);
 
     this.startAdaptiveLoop();
+  }
+
+  /**
+   * Route a single inbound {@link InputEvent} from `viewerId`.
+   *
+   * Almost everything flows straight to {@link HostSessionOptions.onInput} for
+   * per-event OS injection. The ONE exception is the Ctrl+Alt+Del chord: the
+   * viewer toolbar's SAS button (and the AI `press_combo`) emit the chord over
+   * the ordinary input channel as individual key events, but Ctrl+Alt+Del
+   * replayed as synthetic key presses is IGNORED by the Windows Secure Attention
+   * Sequence (SAS) on the secure desktop. So when we see the chord's signature —
+   * a `k-down` for Delete with BOTH Ctrl and Alt held — we route the canonical
+   * {@link CTRL_ALT_DEL} sequence to the combo/SAS path ({@link
+   * HostSessionOptions.onCombo}, wired to the main process's SendSAS) EXACTLY
+   * ONCE and SUPPRESS the synthetic per-key replay of that Delete event. The
+   * paired modifier/Delete `k-up`s (mods no longer hold Ctrl+Alt on release, or
+   * carry no Delete) flow through normally and harmlessly.
+   *
+   * Software-initiated SAS on Windows requires the "SoftwareSASGeneration" group
+   * policy to be enabled on the host; without it SendSAS no-ops (documented in
+   * input-injector and the README). Routing is correct either way; with the
+   * policy off the combo path simply falls back to the synthetic replay.
+   *
+   * If no {@link HostSessionOptions.onCombo} is provided we leave behavior
+   * unchanged (forward the event to {@link HostSessionOptions.onInput}).
+   */
+  private routeInput(e: InputEvent, viewerId: string): void {
+    if (this.opts.onCombo && isCtrlAltDelKeyDown(e)) {
+      this.opts.onCombo(CTRL_ALT_DEL, viewerId);
+      return; // suppress the synthetic per-key replay of the Ctrl+Alt+Del chord
+    }
+    this.opts.onInput(e, viewerId);
   }
 
   /**
