@@ -3,6 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <title>StreamScreen e2e — host</title>
+    <!-- Empty inline favicon: stops Chromium from auto-requesting /favicon.ico,
+         which the fixture server has no file for and answers with a 404 (noise). -->
+    <link rel="icon" href="data:," />
     <style>
       body { margin: 0; font-family: monospace; background: #111; color: #0f0; }
       #lastInput { padding: 8px; white-space: pre; }

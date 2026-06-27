@@ -82,8 +82,15 @@ test('viewer can enumerate monitors and switch the active monitor at runtime', a
       .toBe(target.id);
 
     // Video keeps flowing after the in-place track replacement (no renegotiation).
-    const size = await viewer.evaluate(() => window.__viewer.getVideoSize());
-    expect(size.width).toBeGreaterThan(0);
+    // The swap can momentarily reset the remote video's reported dimensions while
+    // the new track's first frame propagates, so poll for readiness rather than
+    // sampling once — we still prove video survived the switch.
+    await expect
+      .poll(async () => (await viewer.evaluate(() => window.__viewer.getVideoSize())).width, {
+        message: 'video should keep flowing after the monitor switch (remote width > 0)',
+        timeout: 15_000,
+      })
+      .toBeGreaterThan(0);
   } finally {
     await hostCtx.close();
     await viewerCtx.close();

@@ -68,8 +68,14 @@ test('host and viewer establish a real WebRTC session with live video', async ({
       })
       .toBeGreaterThan(0);
 
-    const size = await viewer.evaluate(() => window.__viewer.getVideoSize());
-    expect(size.height).toBeGreaterThan(0);
+    // Height is sampled separately, so poll it too rather than assuming it is
+    // already populated from the width poll above (avoids a same-intent race).
+    await expect
+      .poll(async () => (await viewer.evaluate(() => window.__viewer.getVideoSize())).height, {
+        message: 'remote video height should be > 0',
+        timeout: 30_000,
+      })
+      .toBeGreaterThan(0);
 
     // Host frame counter advances (the screen is genuinely streaming).
     const f1 = await host.evaluate(() => window.__host.getFrame());

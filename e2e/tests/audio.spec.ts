@@ -72,9 +72,16 @@ test('viewer receives a live system-audio track from the host', async ({ browser
     await viewer.evaluate(() => window.__viewer.setMuted(false));
     await expect.poll(async () => (await audioInfo(viewer)).enabled).toBe(true);
 
-    // The audio track did not knock out the video — both arrived.
-    const size = await viewer.evaluate(() => window.__viewer.getVideoSize());
-    expect(size.width).toBeGreaterThan(0);
+    // The audio track did not knock out the video — both arrived. Poll for the
+    // remote video to become ready (metadata populated) rather than sampling
+    // once: the size can be 0 for a beat after `connected` while the first
+    // frame's dimensions propagate, which is a timing race, not video loss.
+    await expect
+      .poll(async () => (await viewer.evaluate(() => window.__viewer.getVideoSize())).width, {
+        message: 'video should survive audio negotiation (remote width > 0)',
+        timeout: 15_000,
+      })
+      .toBeGreaterThan(0);
   } finally {
     await hostCtx.close();
     await viewerCtx.close();

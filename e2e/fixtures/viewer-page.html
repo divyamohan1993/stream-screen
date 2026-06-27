@@ -3,6 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <title>StreamScreen e2e — viewer</title>
+    <!-- Empty inline favicon: stops Chromium from auto-requesting /favicon.ico,
+         which the fixture server has no file for and answers with a 404 (noise). -->
+    <link rel="icon" href="data:," />
     <style>
       body { margin: 0; font-family: monospace; background: #000; color: #0ff; }
       #status { padding: 8px; }
