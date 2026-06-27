@@ -166,7 +166,7 @@ export class Discovery {
 }
 
 /** Map a discovered Bonjour service to a {@link DiscoveredHost}. */
-function serviceToHost(service: Service): DiscoveredHost | undefined {
+export function serviceToHost(service: Service): DiscoveredHost | undefined {
   if (!service || typeof service.port !== 'number') return undefined;
   const txt = (service.txt ?? {}) as Record<string, unknown>;
   const hostName =

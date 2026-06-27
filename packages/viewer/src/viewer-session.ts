@@ -289,16 +289,24 @@ export class ViewerSession {
   }
 
   /**
-   * Tear down the dead peer and stand up a fresh one over the still-live
-   * signaling client, then re-join the room so the host re-offers. The
-   * SignalingClient already reconnects+replays its own join with backoff, so the
-   * room membership is intact; we only need a new WebRTC peer. Idempotent while a
-   * rebuild is in flight.
+   * Tear down the dead peer and stand up a fresh one, rebuilding signaling
+   * membership so the host re-offers to the new peer.
+   *
+   * The old signaling socket is still `join`ed to the room from the perspective
+   * of the SignalingServer, which rejects a second `join` on the same socket as
+   * `already-joined` — so simply calling `join()` again would never trigger a
+   * fresh host offer. Instead we CLOSE the existing SignalingClient and open a
+   * brand-new one, then `join()` on the fresh socket. The host therefore observes
+   * `peer-left` (old socket closed) followed by a fresh `peer-joined` and emits a
+   * new offer to our rebuilt peer.
+   *
+   * This is a transparent recovery, NOT a session end: the grace timer that
+   * triggers it must never tear the session down. Idempotent while a rebuild is
+   * in flight.
    */
   private async rebuildPeer(): Promise<void> {
     if (this.closed || this.rebuilding) return;
-    const signaling = this.signaling;
-    if (!signaling) return;
+    if (!this.signaling) return;
     this.rebuilding = true;
     this.clearReconnectTimer();
     this.setState('reconnecting', 'Reconnecting…');
@@ -307,9 +315,25 @@ export class ViewerSession {
       // mistaken for a user-initiated teardown.
       this.peer?.close();
       this.peer = null;
+
+      // Close the stale, already-joined signaling socket and open a fresh one so
+      // the host sees peer-left then peer-joined and re-offers. Re-using the same
+      // socket would be rejected as `already-joined` and the rebuilt peer would
+      // never receive a new offer.
+      this.signaling?.close();
+      const signaling = new SignalingClient(this.opts.signalingUrl);
+      this.signaling = signaling;
+      signaling.on('error', (m: SignalMessage) => {
+        this.setState('error', m.message ?? 'Signaling error');
+      });
+      signaling.on('peer-left', () => {
+        if (!this.closed) this.setState('waiting-for-host', 'Host left the session.');
+      });
+
       const peer = this.buildPeer(signaling);
+      await signaling.connect();
       await peer.start();
-      // Re-announce ourselves so the host emits a fresh offer to the new peer.
+      // Announce ourselves on the fresh socket so the host emits a new offer.
       signaling.join({ code: this.opts.code, role: 'viewer', name: this.opts.name ?? 'web-viewer' });
     } catch (err) {
       this.setState('error', err instanceof Error ? err.message : 'Reconnection failed');

@@ -23,7 +23,7 @@ import { createRestServer } from './rest.js';
 
 export { SignalingServer, generateCode } from './server.js';
 export type { SignalingServerOptions } from './server.js';
-export { Discovery, SERVICE_TYPE, SERVICE_PROTOCOL } from './discovery.js';
+export { Discovery, serviceToHost, SERVICE_TYPE, SERVICE_PROTOCOL } from './discovery.js';
 export type {
   AdvertiseOptions,
   BrowseOptions,
@@ -35,6 +35,12 @@ export type { RestDeps } from './rest.js';
 export interface StreamScreenSignaling {
   signaling: SignalingServer;
   discovery: Discovery;
+  /**
+   * The session code minted at startup and published in the mDNS advertisement.
+   * The host should join the WS room with this code so that a discovered host
+   * resolves to a real, connectable session.
+   */
+  sessionCode: string;
   port: number;
   close(): Promise<void>;
 }
@@ -44,6 +50,12 @@ export interface StartOptions {
   hostName?: string;
   /** Disable mDNS advertisement/discovery entirely. */
   disableDiscovery?: boolean;
+  /**
+   * Explicit session code to advertise (must be a valid 6–9 digit code). When
+   * omitted, a fresh code is minted at startup. Publishing this in the mDNS TXT
+   * record is what makes a discovered host one-tap connectable.
+   */
+  code?: string;
 }
 
 /**
@@ -86,8 +98,16 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
 
   const boundPort = addressPort(http) ?? port;
 
+  // Mint the session code up front so the mDNS advertisement can carry a VALID,
+  // connectable code from the very first packet. Without this the TXT record has
+  // no `code`, every discovered host surfaces `code:''`, and the viewer's
+  // one-tap connect is rejected (not a 6–9 digit code) — forcing manual entry.
+  // The host should join the WS room with this same code so discovery resolves
+  // to a real session (see `sessionCode` on the returned handle).
+  const sessionCode = opts.code ?? signaling.mintCode();
+
   if (!opts.disableDiscovery) {
-    const ok = discovery.advertise({ hostName, port: boundPort });
+    const ok = discovery.advertise({ hostName, port: boundPort, code: sessionCode });
     if (!ok) {
       console.warn('[signaling] mDNS unavailable; LAN auto-discovery disabled (manual code entry still works).');
     }
@@ -98,6 +118,7 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
   return {
     signaling,
     discovery,
+    sessionCode,
     port: boundPort,
     async close() {
       discovery.destroy();

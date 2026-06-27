@@ -160,6 +160,9 @@ describe('InputCapture — event emission', () => {
       ({ left: 0, top: 0, width: 1000, height: 500, right: 1000, bottom: 500, x: 0, y: 0, toJSON() {} }) as DOMRect;
     Object.defineProperty(video, 'videoWidth', { value: 1000, configurable: true });
     Object.defineProperty(video, 'videoHeight', { value: 500, configurable: true });
+    // Connect to the document so events dispatched on the stage bubble to the
+    // document-level key listeners (mirrors the real DOM tree).
+    document.body.appendChild(video);
     capture = new InputCapture({
       video,
       send: (e) => sent.push(e),
@@ -171,6 +174,7 @@ describe('InputCapture — event emission', () => {
 
   afterEach(() => {
     capture.detach();
+    video.remove();
   });
 
   it('emits a normalized m-move on mousemove', () => {
@@ -214,6 +218,73 @@ describe('InputCapture — event emission', () => {
       { t: 'k-down', code: 'KeyA', key: 'a', mods: MOD_CTRL | MOD_SHIFT },
       { t: 'k-up', code: 'KeyA', key: 'a', mods: 0 },
     ]);
+  });
+
+  it('ignores keydown/keyup whose target is an editable element (chat box / inputs)', () => {
+    // Regression for CODEX P2: document-level key listeners also fire while the
+    // user types in the viewer's own UI. A keystroke targeting an <input> must
+    // NOT be forwarded to the host and must NOT be preventDefault'd, so local
+    // editing keeps working.
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    try {
+      const down = new KeyboardEvent('keydown', { code: 'KeyH', key: 'h', bubbles: true, cancelable: true });
+      input.dispatchEvent(down);
+      const up = new KeyboardEvent('keyup', { code: 'KeyH', key: 'h', bubbles: true, cancelable: true });
+      input.dispatchEvent(up);
+      // Not forwarded to the host…
+      expect(sent).toEqual([]);
+      // …and not preventDefault'd, so the character still lands in the field.
+      expect(down.defaultPrevented).toBe(false);
+      expect(up.defaultPrevented).toBe(false);
+    } finally {
+      input.remove();
+    }
+  });
+
+  it('ignores keydown targeting a contenteditable element', () => {
+    const editable = document.createElement('div');
+    editable.setAttribute('contenteditable', 'true');
+    // jsdom doesn't fully implement contenteditable focus; force the flag.
+    Object.defineProperty(editable, 'isContentEditable', { value: true, configurable: true });
+    document.body.appendChild(editable);
+    try {
+      const down = new KeyboardEvent('keydown', { code: 'KeyX', key: 'x', bubbles: true, cancelable: true });
+      editable.dispatchEvent(down);
+      expect(sent).toEqual([]);
+      expect(down.defaultPrevented).toBe(false);
+    } finally {
+      editable.remove();
+    }
+  });
+
+  it('forwards and preventDefaults a keydown targeting the video stage', () => {
+    const down = new KeyboardEvent('keydown', {
+      code: 'KeyA',
+      key: 'a',
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    // Target the video stage directly (real remote-control keystroke).
+    video.dispatchEvent(down);
+    expect(sent).toEqual([{ t: 'k-down', code: 'KeyA', key: 'a', mods: MOD_CTRL | MOD_ALT }]);
+    expect(down.defaultPrevented).toBe(true);
+  });
+
+  it('still forwards the Ctrl+Alt+Del combo keystrokes from the stage', () => {
+    const del = new KeyboardEvent('keydown', {
+      code: 'Delete',
+      key: 'Delete',
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    video.dispatchEvent(del);
+    expect(sent).toEqual([{ t: 'k-down', code: 'Delete', key: 'Delete', mods: MOD_CTRL | MOD_ALT }]);
+    expect(del.defaultPrevented).toBe(true);
   });
 
   it('stops emitting after detach', () => {

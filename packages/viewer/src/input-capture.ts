@@ -115,6 +115,23 @@ function clamp01(n: number): number {
 }
 
 /**
+ * Whether a keyboard event's target is an editable element of the viewer UI
+ * (an `<input>`, `<textarea>`, `<select>`, or any `contenteditable` host).
+ * Keystrokes aimed at these belong to the local field, not the remote host, so
+ * they must not be captured/forwarded or have their default prevented.
+ */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (target === null || typeof HTMLElement === 'undefined' || !(target instanceof HTMLElement)) {
+    return false;
+  }
+  const tag = target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  // `isContentEditable` is true for the element and any descendant of a
+  // contenteditable host; it also covers the document-wide designMode case.
+  return target.isContentEditable;
+}
+
+/**
  * Normalize a wheel event's deltas into a device-pixel-ish scroll amount,
  * independent of `deltaMode` (pixel / line / page). Lines are treated as ~16px
  * and pages as the visible content height (or a sane fallback).
@@ -328,7 +345,13 @@ export class InputCapture {
   }
 
   private onKey(e: KeyboardEvent, t: 'k-down' | 'k-up'): void {
-    // Don't intercept browser-level shortcuts while not focused on the stage.
+    // The keydown/keyup listeners live on `document`, so they also fire when the
+    // user is typing into the viewer's own UI (the chat box, the code input,
+    // etc.). Those keystrokes belong to the local field, not the remote host:
+    // forwarding them would type into the remote machine AND preventDefault would
+    // break local editing. Ignore any event whose target is an editable element
+    // and let the browser handle it normally.
+    if (isEditableTarget(e.target)) return;
     e.preventDefault();
     this.send({ t, code: e.code, key: e.key, mods: modsFrom(e) });
   }

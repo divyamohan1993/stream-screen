@@ -167,10 +167,14 @@ Key points:
 ## LAN discovery (mDNS)
 
 The signaling server advertises a `_streamscreen._tcp` service over mDNS/DNS-SD
-(Bonjour/Avahi) carrying the host name, signaling port, and (optionally) the
-session code in TXT records. Any machine on the same LAN can browse for these and
-present a one-tap list of nearby hosts — **zero configuration, no cloud, no
-accounts.**
+(Bonjour/Avahi) carrying the host name, signaling port, and the session code in
+TXT records. The code is minted at startup and published in the advertisement so
+a discovered host resolves to a real, connectable session — making the list
+genuinely one-tap. Any machine on the same LAN can browse for these and present a
+one-tap list of nearby hosts — **zero configuration, no cloud, no accounts.** If
+a host ever advertises an empty/invalid code (e.g. an mDNS race before it is
+ready), the viewer prefills the field and waits for confirmation instead of
+auto-connecting with a bad code.
 
 mDNS is **best-effort and fully guarded**: on locked-down networks or sandboxes
 where UDP multicast is blocked, advertise/browse degrade to graceful no-ops
@@ -309,7 +313,9 @@ flowchart LR
   (`id, name, primary, width, height`). The viewer requests the list, picks a
   display, and the host swaps the outbound video track **in place**
   (`replaceTrack`) — no SDP renegotiation, no session teardown — then acks
-  `monitor-switched`.
+  `monitor-switched`. Only the *previous* tracks are stopped; the newly swapped-in
+  track is kept live, so the viewer sees the new monitor instead of a frozen
+  frame.
 - **File transfer.** `FileTransferManager` (`core/src/file-transfer.ts`) is a
   pure, DOM-free chunker/reassembler. The sender emits `file-offer`, awaits
   `file-accept`, streams 16 KiB chunks each prefixed with an 8-byte

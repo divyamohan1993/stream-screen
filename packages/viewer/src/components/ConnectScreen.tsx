@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { isValidSessionCode } from '@stream-screen/core';
 import { DiscoveryList } from './DiscoveryList.js';
 import type { DiscoveredHost } from '../discovery-client.js';
@@ -24,6 +24,7 @@ export function ConnectScreen({
   connecting,
 }: ConnectScreenProps): React.JSX.Element {
   const [code, setCode] = useState('');
+  const inputRef = useRef<HTMLInputElement>(null);
   const valid = isValidSessionCode(code);
 
   const submit = (): void => {
@@ -31,8 +32,19 @@ export function ConnectScreen({
   };
 
   const pick = (host: DiscoveredHost): void => {
-    setCode(host.code);
-    if (!connecting) onConnect(host.code);
+    // Defense-in-depth for the discovery-code issue: a discovered host may
+    // advertise an empty/invalid code (mDNS race, host not yet ready). Never
+    // auto-connect with a bad code — that just produces a confusing failure.
+    // Instead prefill whatever was advertised and focus the field so the user can
+    // type/confirm the real code. Only auto-connect when the code is genuinely
+    // valid (6–9 digits).
+    const advertised = (host.code ?? '').replace(/\D/g, '').slice(0, 9);
+    setCode(advertised);
+    if (isValidSessionCode(advertised)) {
+      if (!connecting) onConnect(advertised);
+    } else {
+      inputRef.current?.focus();
+    }
   };
 
   return (
@@ -45,6 +57,7 @@ export function ConnectScreen({
 
       <div className="connect-card">
         <input
+          ref={inputRef}
           className="code-input"
           inputMode="numeric"
           autoComplete="off"

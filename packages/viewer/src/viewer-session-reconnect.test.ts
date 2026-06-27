@@ -47,18 +47,27 @@ class FakePeer {
 
 class FakeSignaling {
   joins = 0;
+  connects = 0;
+  closed = false;
   on(): void {}
-  async connect(): Promise<void> {}
+  async connect(): Promise<void> {
+    this.connects++;
+  }
   join(): void {
     this.joins++;
   }
-  close(): void {}
+  close(): void {
+    this.closed = true;
+  }
 }
 
+/** Every SignalingClient ever constructed, in order. */
+let signalingInstances: FakeSignaling[] = [];
 let lastSignaling: FakeSignaling | null = null;
 const SignalingProxy = class extends FakeSignaling {
   constructor() {
     super();
+    signalingInstances.push(this);
     lastSignaling = this;
   }
 };
@@ -89,6 +98,7 @@ describe('ViewerSession reconnection', () => {
   beforeEach(() => {
     FakePeer.instances = [];
     FakePeer.current = null;
+    signalingInstances = [];
     lastSignaling = null;
     vi.useFakeTimers();
   });
@@ -120,15 +130,42 @@ describe('ViewerSession reconnection', () => {
   it('rebuilds the peer when the grace timer expires', async () => {
     const { session } = await connected({ reconnectGraceMs: 3000 });
     const first = FakePeer.current!;
-    const joinsBefore = lastSignaling!.joins;
     first.emitState('disconnected');
     await vi.advanceTimersByTimeAsync(3000);
-    // Old peer closed, a fresh peer built + started, and we re-joined the room.
+    // Old peer closed, a fresh peer built + started, and we re-joined the room
+    // on a fresh signaling socket.
     expect(first.closed).toBe(true);
     expect(FakePeer.instances).toHaveLength(2);
     expect(FakePeer.current!.started).toBe(true);
-    expect(lastSignaling!.joins).toBe(joinsBefore + 1);
+    expect(lastSignaling!.joins).toBe(1);
     expect(session.currentState).toBe('reconnecting');
+  });
+
+  it('closes+reopens the signaling socket on rebuild (not a re-join on the same socket)', async () => {
+    // Regression for CODEX P2: re-joining the SAME already-joined socket is
+    // rejected by the server as `already-joined`, so the host never re-offers to
+    // the rebuilt peer. The reconnect path must CLOSE the old SignalingClient and
+    // open a fresh one, then join on that, so the host sees peer-left then a fresh
+    // peer-joined and re-offers.
+    await connected({ reconnectGraceMs: 3000 });
+    const firstSignaling = signalingInstances[0]!;
+    expect(signalingInstances).toHaveLength(1);
+    expect(firstSignaling.joins).toBe(1);
+    expect(firstSignaling.closed).toBe(false);
+
+    FakePeer.current!.emitState('disconnected');
+    await vi.advanceTimersByTimeAsync(3000);
+
+    // The original socket was closed, NOT re-joined a second time.
+    expect(firstSignaling.closed).toBe(true);
+    expect(firstSignaling.joins).toBe(1);
+    // A brand-new SignalingClient was constructed, (re)connected, and joined once.
+    expect(signalingInstances).toHaveLength(2);
+    const secondSignaling = signalingInstances[1]!;
+    expect(secondSignaling).not.toBe(firstSignaling);
+    expect(secondSignaling.connects).toBe(1);
+    expect(secondSignaling.joins).toBe(1);
+    expect(secondSignaling.closed).toBe(false);
   });
 
   it('rebuilds immediately on a hard failed state', async () => {

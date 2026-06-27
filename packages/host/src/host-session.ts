@@ -280,19 +280,33 @@ export class HostSession {
     // Carry the screen-content hint onto the swapped-in track too.
     hintScreenContent(videoTrack);
 
+    // Snapshot the OLD video tracks BEFORE replaceVideoTrack runs. The Peer
+    // shares the very same MediaStream object we passed to attachStream, and
+    // replaceVideoTrack mutates it in place — adding `videoTrack` and removing
+    // the previous ones. If we read this.stream.getVideoTracks() AFTER the
+    // swap, it would contain the new active track, and stopping those would end
+    // the replacement track (freezing the viewer). Capture the originals first.
+    const oldVideoTracks = this.stream
+      ? this.stream.getVideoTracks().filter((t) => t !== videoTrack)
+      : [];
+
     const replaced = await peer.replaceVideoTrack(videoTrack);
     if (!replaced) {
       videoTrack.stop();
       return;
     }
 
-    // Stop the old video track(s) and adopt the new one into our stream record.
+    // Stop ONLY the old video track(s) — never the new active `videoTrack`.
+    // replaceVideoTrack has already adopted `videoTrack` into the shared stream;
+    // ensure it is present without re-adding (and without touching the new one).
     if (this.stream) {
-      for (const t of this.stream.getVideoTracks()) {
+      for (const t of oldVideoTracks) {
         this.stream.removeTrack(t);
         t.stop();
       }
-      this.stream.addTrack(videoTrack);
+      if (!this.stream.getVideoTracks().includes(videoTrack)) {
+        this.stream.addTrack(videoTrack);
+      }
     } else {
       this.stream = next;
     }
