@@ -168,11 +168,18 @@ Key points:
 
 The signaling server advertises a `_streamscreen._tcp` service over mDNS/DNS-SD
 (Bonjour/Avahi) carrying the host name, signaling port, and the session code in
-TXT records. The code is minted at startup and published in the advertisement so
-a discovered host resolves to a real, connectable session — making the list
-genuinely one-tap. Any machine on the same LAN can browse for these and present a
-one-tap list of nearby hosts — **zero configuration, no cloud, no accounts.** If
-a host ever advertises an empty/invalid code (e.g. an mDNS race before it is
+TXT records. **Discovery is truthful: it advertises the codes of ACTUAL live host
+rooms, never a placeholder minted at startup with no host behind it.** The server
+re-syncs the advertised set from `SignalingServer.listSessions()` whenever a host
+joins (room becomes live ⇒ publish that code) or leaves (room reaped ⇒ withdraw
+it), via a `sessions-changed` event; multiple concurrent hosts each get their own
+advertisement, and only valid 6–9 digit codes are published. The Electron host
+makes this work end-to-end: it connects to the signaling server (LAN-local by
+default) and joins a room with a stable code (`STREAMSCREEN_CODE` or generated),
+so its session goes live and its code is advertised. Net effect: every discovered
+code maps to a joinable live host room. Any machine on the same LAN can browse for
+these and present a one-tap list — **zero configuration, no cloud, no accounts.**
+If a host ever advertises an empty/invalid code (e.g. an mDNS race before it is
 ready), the viewer prefills the field and waits for confirmation instead of
 auto-connecting with a bad code.
 
@@ -327,8 +334,12 @@ flowchart LR
   incoming remote `MediaStream` yields a downloadable `.webm`. Nothing is uploaded
   and there is no length cap.
 - **Chat & quality.** Chat is timestamped text either direction; `quality` lets a
-  viewer (or AI agent) pin a preset that the host applies on top of the adaptive
-  loop (`auto` returns control to the AIMD engine).
+  viewer (or AI agent) pin a preset that the host actually honors: a
+  `{t:'quality',preset}` control message re-bounds the `AdaptiveController` to the
+  preset's `maxKbps` ceiling (`high`/`balanced`/`low` step it progressively down),
+  so the AIMD loop can never ramp the stream above the chosen ceiling. `auto`
+  restores the full adaptive range. This only uses the public controller bounds —
+  nothing in `@stream-screen/core` changes, and there is no timer or usage cap.
 
 None of these features introduce a timer, a usage counter, or a cap — they obey
 the [No-limits guarantee](#no-limits-guarantee) like the rest of the system.
@@ -358,7 +369,11 @@ Tools: `list_hosts`, `connect`, `disconnect`, `screenshot`, `ocr_screen`,
 session-feature tools `list_monitors`, `switch_monitor`, `send_chat`,
 `set_quality`, `send_keys` (arbitrary chord), and `press_combo` (named combos
 incl. Ctrl+Alt+Del) — every one generated from the same `tools.ts` registry that
-drives the MCP and REST surfaces, so they cannot drift. The node WebRTC
+drives the MCP and REST surfaces, so they cannot drift. `list_hosts` is backed by
+the signaling server's **REST API over HTTP** (`GET /api/discover`, falling back
+to `/api/sessions`; the HTTP base is derived from the signaling WS URL or set via
+`STREAMSCREEN_SIGNALING_HTTP_URL`), since the WS server has no `hosts` request —
+so every code it returns maps to a live, joinable room. The node WebRTC
 runtime and OCR engine are optional dynamic imports; when missing, the server and
 its schemas stay valid and only the affected calls return a clear error.
 Screenshots are produced by converting raw I420 frames to PNG with a

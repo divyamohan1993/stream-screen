@@ -29,6 +29,7 @@ import {
   type FileMeta,
   type InputEvent,
   type MonitorInfo,
+  type QualityPreset,
 } from '@stream-screen/core';
 import { getDisplayStream, streamHasAudio, type CaptureConstraints } from './capture.js';
 
@@ -120,7 +121,14 @@ export interface HostSessionOptions {
  */
 export class HostSession {
   private readonly opts: HostSessionOptions;
-  private readonly controller = new AdaptiveController();
+  /**
+   * The adaptive controller. NOT readonly: a viewer `{t:'quality',preset}` swaps
+   * it for one bounded to the preset's ceiling so the preset actually changes the
+   * stream (see {@link applyQualityPreset}). 'auto' restores the full range.
+   */
+  private controller = new AdaptiveController();
+  /** The currently-applied quality preset (defaults to full-range adaptive). */
+  private qualityPreset: QualityPreset = 'auto';
   private signaling: SignalingClient | null = null;
   private peer: Peer | null = null;
   private stream: MediaStream | null = null;
@@ -151,6 +159,40 @@ export class HostSession {
   /** The most recent adaptive decision, or null before the first tick. */
   get currentDecision(): AdaptiveDecision | null {
     return this.lastDecision;
+  }
+
+  /** The quality preset currently in effect ('auto' = full-range adaptive). */
+  get currentPreset(): QualityPreset {
+    return this.qualityPreset;
+  }
+
+  /**
+   * Re-bound the adaptive controller to a viewer-selected quality preset.
+   *
+   * Without this, a `{t:'quality',preset}` control message was acknowledged by
+   * the protocol but never wired to the encoder — the adaptive loop kept ramping
+   * toward the default 40 Mbps ceiling regardless of what the viewer chose.
+   *
+   * The preset maps to a `maxKbps` CEILING that bounds the AIMD engine: because
+   * {@link AdaptiveController.update} clamps every decision to `[minKbps,maxKbps]`,
+   * a lower ceiling forces a lower target bitrate (and, via the engine's
+   * bitrate-derived framerate/scale, a lighter stream) on subsequent ticks.
+   *
+   * - 'auto'     → full adaptive range (no artificial ceiling); the unlimited mode.
+   * - 'high'     → generous ceiling, still well below auto's max.
+   * - 'balanced' → mid ceiling.
+   * - 'low'      → tight ceiling for constrained links.
+   *
+   * This edits NOTHING in @stream-screen/core — it only uses the public
+   * {@link AdaptiveController} constructor and its existing bounds. The new
+   * controller starts at the engine's conservative baseline and re-ramps within
+   * the preset ceiling on subsequent ticks. There is no time limit or usage cap
+   * anywhere here.
+   */
+  applyQualityPreset(preset: QualityPreset): void {
+    this.qualityPreset = preset;
+    const { minKbps, maxKbps } = qualityBounds(preset);
+    this.controller = new AdaptiveController({ minKbps, maxKbps });
   }
 
   /**
@@ -256,6 +298,9 @@ export class HostSession {
         break;
       case 'audio':
         this.setAudioEnabled(m.enabled);
+        break;
+      case 'quality':
+        this.applyQualityPreset(m.preset);
         break;
       default:
         break;
@@ -422,6 +467,31 @@ export class HostSession {
     this.signaling = null;
     this.fileManagers.clear();
     this.started = false;
+  }
+}
+
+/**
+ * Map a {@link QualityPreset} to AdaptiveController bounds (kbps).
+ *
+ * The CEILING (`maxKbps`) is what actually throttles the stream: the AIMD engine
+ * can never ramp a decision above it. Presets step the ceiling down progressively
+ * so 'low' produces a strictly lower target bitrate than 'balanced' < 'high' <
+ * 'auto'. 'auto' keeps the engine's full, unlimited adaptive range.
+ *
+ * Exported for unit testing the monotonic ordering of the ceilings.
+ */
+export function qualityBounds(preset: QualityPreset): { minKbps: number; maxKbps: number } {
+  switch (preset) {
+    case 'high':
+      return { minKbps: 300, maxKbps: 12_000 };
+    case 'balanced':
+      return { minKbps: 300, maxKbps: 4_000 };
+    case 'low':
+      return { minKbps: 300, maxKbps: 1_200 };
+    case 'auto':
+    default:
+      // Full adaptive range — matches AdaptiveController's defaults (40 Mbps).
+      return { minKbps: 300, maxKbps: 40_000 };
   }
 }
 

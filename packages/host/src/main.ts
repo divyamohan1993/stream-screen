@@ -238,6 +238,15 @@ if (!gotLock) {
     createTray();
     createControlWindow();
 
+    // Surface the live session code + signaling endpoint. The renderer's
+    // HostSession connects to this (LAN-local by default) signaling server and
+    // joins a room keyed by this stable code, so the signaling server's mDNS
+    // discovery advertises a REAL, joinable host room (not a placeholder).
+    // STREAMSCREEN_CODE pins the code across restarts; otherwise it is generated.
+    console.log(
+      `[StreamScreen Host] ready — code ${bootConfig.code} on ${bootConfig.signalingUrl} (host "${bootConfig.hostName}")`,
+    );
+
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createControlWindow();
     });

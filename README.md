@@ -86,7 +86,7 @@ What a modern remote desktop should have, and where StreamScreen stands:
 | **No bitrate / quality cap** | ✅ Guaranteed | Ceiling is only what the link sustains |
 | Free & self-hosted, no accounts | ✅ Guaranteed | Session gated by a 6–9 digit code only |
 | Adaptive bitrate/quality ("auto-negotiate lag") | ✅ Implemented | AIMD over RTT/loss/jitter, ~1 Hz |
-| Zero-config LAN discovery | ✅ Implemented | mDNS/DNS-SD (`_streamscreen._tcp`) |
+| Zero-config LAN discovery | ✅ Implemented | mDNS/DNS-SD (`_streamscreen._tcp`); advertises only codes of **live** host rooms |
 | Session codes (6–9 digits) | ✅ Implemented | Minted by host or signaling server |
 | End-to-end transport encryption | ✅ Implemented | DTLS-SRTP (WebRTC stack) |
 | Multiple viewers per host | ✅ Implemented | One host, N viewers per room |
@@ -201,7 +201,10 @@ npm run build      # tsc project references + viewer typecheck
 ### 1. Signaling server (zero-config LAN)
 
 The signaling server hosts a WebSocket SDP/ICE relay **and** a tiny REST API on a
-single port (default `8787`), and advertises the host over mDNS.
+single port (default `8787`). It advertises **live host rooms** over mDNS: a code
+is advertised only once a real host has joined that room (re-synced from
+`server.listSessions()` whenever a host joins or leaves), so every discovered
+code maps to a joinable session rather than a placeholder minted at startup.
 
 ```bash
 npm run dev:signaling                 # tsx, hot dev
@@ -232,8 +235,16 @@ npm -w @stream-screen/host run build
 STREAMSCREEN_SIGNALING_URL=ws://<server-ip>:8787 npm -w @stream-screen/host start
 ```
 
+- `build` compiles TypeScript to `dist/` (entrypoint `dist/main.js`, per the
+  package `main`) **and** copies the renderer's static assets
+  (`src/renderer/index.html` + CSS/images) into `dist/renderer/` via
+  `scripts/copy-assets.mjs` — `tsc` only emits JS, so without this the packaged
+  control window would open blank.
 - The host **mints a 6–9 digit session code** on launch (or honors
-  `STREAMSCREEN_CODE`) and displays it in the tray + control window.
+  `STREAMSCREEN_CODE`), connects to the signaling server (LAN-local by default),
+  and **joins a room with that code** so the session becomes live and is
+  advertised over mDNS. It surfaces/logs the code and displays it in the tray +
+  control window.
 - Remote input injection requires the optional native dep. If it's missing,
   the host still streams; it just logs a one-time warning and ignores input
   (graceful degradation, never a crash).
@@ -362,7 +373,11 @@ never drift:
 - **REST API** (Express) — for any non-MCP automation.
 
 Both drive a single `RemoteDesktopSession`, which connects as a **viewer** via the
-core `Peer`. A node WebRTC runtime (`@roamhq/wrtc`) and OCR (`tesseract.js`) are
+core `Peer`. `list_hosts` queries the signaling server's REST API over HTTP
+(`GET /api/discover`, falling back to `/api/sessions`) — the HTTP base URL is
+derived from the signaling WS URL or set via `STREAMSCREEN_SIGNALING_HTTP_URL` —
+so every returned code maps to a live, joinable host room. A node WebRTC runtime
+(`@roamhq/wrtc`) and OCR (`tesseract.js`) are
 **optional**: without them the server, tool list, and schemas stay fully valid and
 the affected calls return a clear "requires native webrtc runtime" / "OCR
 unavailable" message. **Nothing here counts usage or expires a session.**
@@ -371,7 +386,7 @@ unavailable" message. **Nothing here counts usage or expires a session.**
 
 | Tool (MCP) | REST route | Args | Returns |
 |---|---|---|---|
-| `list_hosts` | `GET /api/hosts` | – | hosts discoverable on the LAN |
+| `list_hosts` | `GET /api/hosts` | – | live hosts via the signaling REST API (`GET /api/discover`, falling back to `/api/sessions`) |
 | `connect` | `POST /api/connect` | `{ code }` | establishes the P2P session |
 | `disconnect` | `POST /api/disconnect` | – | closes the session |
 | `screenshot` | `GET /api/screenshot` | – | current frame as PNG |
@@ -524,6 +539,7 @@ Per-package tests can also be run directly, e.g.
 | `STREAMSCREEN_PORT` | signaling | `8787` | HTTP+WS port |
 | `STREAMSCREEN_HOST_NAME` | signaling, host | machine hostname | advertised name |
 | `STREAMSCREEN_SIGNALING_URL` | host, ai | `ws://127.0.0.1:8787` | signaling WS URL |
+| `STREAMSCREEN_SIGNALING_HTTP_URL` | ai | derived from WS URL | signaling REST base for `list_hosts` |
 | `STREAMSCREEN_CODE` | host | minted | fixed session code |
 | `STREAMSCREEN_AI_MODE` | ai | `mcp` | `rest` to run the REST API |
 | `STREAMSCREEN_AI_PORT` | ai | `8788` | REST port |

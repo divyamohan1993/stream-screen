@@ -176,6 +176,9 @@ export function App(): React.JSX.Element {
   const onPreset = useCallback((p: QualityPreset) => {
     setPreset(p);
     controllerRef.current = controllerForPreset(p);
+    // Tell the host to apply the requested quality ceiling over the control
+    // channel; its authoritative adaptive controller acts on it.
+    sessionRef.current?.setQuality(p);
   }, []);
 
   const toggleFullscreen = useCallback(() => {

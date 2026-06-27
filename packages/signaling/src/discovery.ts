@@ -44,9 +44,21 @@ export interface BrowseOptions {
  * construction error (e.g. multicast blocked) into `available = false`, so the
  * rest of the server can call advertise/browse unconditionally.
  */
+/** A single live host session to advertise on the LAN. */
+export interface LiveSession {
+  /** The session code an actual host has joined and is reachable on. */
+  code: string;
+  /** Human-readable host name shown to viewers. */
+  hostName: string;
+}
+
 export class Discovery {
   private bonjour: Bonjour | undefined;
   private service: Service | undefined;
+  /** Per-code published services, keyed by the live host session code. */
+  private readonly services = new Map<string, Service>();
+  /** Port live-session advertisements are published on (set via syncSessions). */
+  private port: number | undefined;
   private failed = false;
 
   /** Whether the mDNS stack initialised successfully. */
@@ -106,6 +118,67 @@ export class Discovery {
   }
 
   /**
+   * Reconcile the advertised LAN services with the set of ACTUAL live host
+   * sessions known to the signaling server. This is the truthful discovery
+   * model: a code is advertised IFF a real host has joined that room, so every
+   * discovered code maps to a joinable session (never a placeholder minted at
+   * startup with no host behind it).
+   *
+   * Idempotent and incremental: it publishes a service for each newly-live code,
+   * withdraws services whose code is no longer live, and leaves unchanged
+   * sessions untouched. Sessions without a valid code are ignored (we never
+   * advertise something unconnectable). Returns true if the mDNS stack is
+   * available, false (graceful no-op) if multicast is unavailable.
+   *
+   * Supports multiple concurrent host sessions: one service per live code.
+   */
+  syncSessions(sessions: readonly LiveSession[], port: number): boolean {
+    const bonjour = this.ensure();
+    if (!bonjour) return false;
+    this.port = port;
+
+    // Desired set: one entry per session that carries a connectable code.
+    const desired = new Map<string, LiveSession>();
+    for (const s of sessions) {
+      if (isAdvertisableCode(s.code)) desired.set(s.code, s);
+    }
+
+    // Withdraw services whose code is no longer a live host session.
+    for (const [code, service] of this.services) {
+      if (!desired.has(code)) {
+        try {
+          service.stop?.();
+        } catch {
+          /* ignore */
+        }
+        this.services.delete(code);
+      }
+    }
+
+    // Publish a service for each newly-live code.
+    for (const [code, session] of desired) {
+      if (this.services.has(code)) continue;
+      try {
+        const service = bonjour.publish({
+          name: `StreamScreen @ ${session.hostName} (${code})`,
+          type: SERVICE_TYPE,
+          protocol: SERVICE_PROTOCOL,
+          port,
+          txt: { host: session.hostName, code },
+        });
+        service.on('error', () => {
+          /* best-effort advertisement */
+        });
+        this.services.set(code, service);
+      } catch {
+        /* a single publish failure must not abort the rest of the sync */
+      }
+    }
+
+    return true;
+  }
+
+  /**
    * Browse the LAN for StreamScreen hosts for `timeoutMs`, then resolve the
    * collected list. Always resolves (never rejects); returns [] when mDNS is
    * unavailable so callers can treat "no discovery" and "no hosts" uniformly.
@@ -154,6 +227,14 @@ export class Discovery {
   /** Tear down all mDNS resources (guarded, idempotent). */
   destroy(): void {
     this.unadvertise();
+    for (const service of this.services.values()) {
+      try {
+        service.stop?.();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.services.clear();
     if (this.bonjour) {
       try {
         this.bonjour.destroy();
@@ -163,6 +244,15 @@ export class Discovery {
       this.bonjour = undefined;
     }
   }
+}
+
+/**
+ * Only advertise codes a viewer could actually connect with: a 6–9 digit
+ * session code. This mirrors core's `isValidSessionCode` without importing a
+ * runtime dependency, and guarantees we never publish an unconnectable code.
+ */
+function isAdvertisableCode(code: string): boolean {
+  return /^[0-9]{6,9}$/.test(code);
 }
 
 /** Map a discovered Bonjour service to a {@link DiscoveredHost}. */

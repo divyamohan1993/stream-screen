@@ -139,6 +139,28 @@ describe('ViewerSession control channel', () => {
     ]);
   });
 
+  it('sends the selected quality preset as a control frame (mapped to wire case)', async () => {
+    const session = await connectedSession();
+    session.setQuality('Low');
+    session.setQuality('Auto');
+    const quality = FakePeer.current!.sentControl.filter((m) => m.t === 'quality');
+    expect(quality).toEqual([
+      { t: 'quality', preset: 'low' },
+      { t: 'quality', preset: 'auto' },
+    ]);
+  });
+
+  it('maps every UI preset to its lowercase wire preset', async () => {
+    const session = await connectedSession();
+    session.setQuality('High');
+    session.setQuality('Balanced');
+    const quality = FakePeer.current!.sentControl.filter((m) => m.t === 'quality');
+    expect(quality).toEqual([
+      { t: 'quality', preset: 'high' },
+      { t: 'quality', preset: 'balanced' },
+    ]);
+  });
+
   it('forwards a special-key input sequence', async () => {
     const session = await connectedSession();
     session.sendInputSequence([

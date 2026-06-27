@@ -11,6 +11,12 @@
  * advertised host name with env STREAMSCREEN_HOST_NAME (default: the machine
  * hostname). On start it logs the reachable LAN URL(s).
  *
+ * DISCOVERY IS TRUTHFUL: it advertises the codes of ACTUAL live host rooms
+ * (re-synced from the signaling server whenever a host joins/leaves), never a
+ * placeholder code minted at startup with no host behind it. With no live host
+ * sessions, nothing connectable is advertised — so every discovered code maps
+ * to a joinable room.
+ *
  * ALWAYS FREE / UNLIMITED: nothing here imposes time limits, usage counters, or
  * licensing. Sessions last as long as their sockets stay open.
  */
@@ -35,12 +41,6 @@ export type { RestDeps } from './rest.js';
 export interface StreamScreenSignaling {
   signaling: SignalingServer;
   discovery: Discovery;
-  /**
-   * The session code minted at startup and published in the mDNS advertisement.
-   * The host should join the WS room with this code so that a discovered host
-   * resolves to a real, connectable session.
-   */
-  sessionCode: string;
   port: number;
   close(): Promise<void>;
 }
@@ -50,12 +50,6 @@ export interface StartOptions {
   hostName?: string;
   /** Disable mDNS advertisement/discovery entirely. */
   disableDiscovery?: boolean;
-  /**
-   * Explicit session code to advertise (must be a valid 6–9 digit code). When
-   * omitted, a fresh code is minted at startup. Publishing this in the mDNS TXT
-   * record is what makes a discovered host one-tap connectable.
-   */
-  code?: string;
 }
 
 /**
@@ -98,19 +92,30 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
 
   const boundPort = addressPort(http) ?? port;
 
-  // Mint the session code up front so the mDNS advertisement can carry a VALID,
-  // connectable code from the very first packet. Without this the TXT record has
-  // no `code`, every discovered host surfaces `code:''`, and the viewer's
-  // one-tap connect is rejected (not a 6–9 digit code) — forcing manual entry.
-  // The host should join the WS room with this same code so discovery resolves
-  // to a real session (see `sessionCode` on the returned handle).
-  const sessionCode = opts.code ?? signaling.mintCode();
-
+  // TRUTHFUL DISCOVERY: advertise the codes of ACTUAL live host rooms, not a
+  // placeholder code minted at startup with no host behind it. Discovery
+  // re-syncs from the signaling server's live sessions whenever a host
+  // joins/leaves, so every advertised (and thus discoverable) code maps to a
+  // joinable room. With no live host sessions, nothing connectable is
+  // advertised. Multiple concurrent hosts each get their own advertisement.
+  let onSessionsChanged: ((sessions: ReturnType<SignalingServer['listSessions']>) => void) | undefined;
   if (!opts.disableDiscovery) {
-    const ok = discovery.advertise({ hostName, port: boundPort, code: sessionCode });
-    if (!ok) {
-      console.warn('[signaling] mDNS unavailable; LAN auto-discovery disabled (manual code entry still works).');
-    }
+    const sync = (sessions: ReturnType<SignalingServer['listSessions']>): void => {
+      const live = sessions.map((s) => ({
+        code: s.code,
+        hostName: s.hostName?.trim() || hostName,
+      }));
+      const ok = discovery.syncSessions(live, boundPort);
+      if (!ok) {
+        console.warn(
+          '[signaling] mDNS unavailable; LAN auto-discovery disabled (manual code entry still works).',
+        );
+      }
+    };
+    onSessionsChanged = sync;
+    signaling.on('sessions-changed', sync);
+    // Initial sync (typically no live hosts yet ⇒ advertises nothing joinable).
+    sync(signaling.listSessions());
   }
 
   logUrls(boundPort);
@@ -118,9 +123,9 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
   return {
     signaling,
     discovery,
-    sessionCode,
     port: boundPort,
     async close() {
+      if (onSessionsChanged) signaling.off('sessions-changed', onSessionsChanged);
       discovery.destroy();
       await signaling.close();
       await new Promise<void>((resolve) => http.close(() => resolve()));

@@ -24,7 +24,6 @@ import type {
   InputEvent,
   MonitorInfo,
   QualityPreset,
-  SessionInfo,
 } from '@stream-screen/core';
 import {
   clickEvents,
@@ -63,6 +62,14 @@ export interface SessionOptions {
    * `STREAMSCREEN_SIGNALING_URL` or `ws://127.0.0.1:8787`.
    */
   signalingUrl?: string;
+  /**
+   * HTTP base URL of the signaling server's REST API (used by
+   * {@link RemoteDesktopSession.listHosts}). The signaling WS and REST surfaces
+   * share one HTTP port, so when omitted this is derived from `signalingUrl`
+   * (`ws://`→`http://`, `wss://`→`https://`). Defaults to
+   * `STREAMSCREEN_SIGNALING_HTTP_URL` else the derived value.
+   */
+  signalingHttpUrl?: string;
   /** STUN/TURN servers (LAN P2P usually needs none). */
   iceServers?: RTCIceServer[];
   /**
@@ -103,6 +110,34 @@ export class NotConnectedError extends Error {
 const DEFAULT_SIGNALING_URL = 'ws://127.0.0.1:8787';
 
 /**
+ * Derive the signaling server's HTTP base URL from its WebSocket URL. The
+ * signaling WS and REST surfaces share a single HTTP port, so `ws://` maps to
+ * `http://` and `wss://` to `https://` (any path/query/hash is dropped). Falls
+ * back to returning the input unchanged if it cannot be parsed.
+ */
+export function deriveSignalingHttpUrl(signalingUrl: string): string {
+  try {
+    const u = new URL(signalingUrl);
+    if (u.protocol === 'ws:') u.protocol = 'http:';
+    else if (u.protocol === 'wss:') u.protocol = 'https:';
+    u.pathname = '/';
+    u.search = '';
+    u.hash = '';
+    // Strip the trailing slash so callers can append `/api/...` cleanly.
+    return u.toString().replace(/\/+$/, '');
+  } catch {
+    return signalingUrl.replace(/\/+$/, '');
+  }
+}
+
+/** The shape `/api/discover` and `/api/sessions` return (subset we read). */
+interface RestHost {
+  code?: unknown;
+  hostName?: unknown;
+  name?: unknown;
+}
+
+/**
  * Attempt to resolve a node WebRTC `RTCPeerConnection` constructor.
  * Tries `@roamhq/wrtc` then `werift`. Returns `null` if neither is installed.
  */
@@ -136,6 +171,7 @@ async function resolveNodeRtc(): Promise<typeof RTCPeerConnection | null> {
 export class RemoteDesktopSession {
   private readonly opts: SessionOptions;
   private readonly signalingUrl: string;
+  private readonly signalingHttpUrl: string;
 
   private signaling: SignalingClient | null = null;
   private peer: SessionPeer | null = null;
@@ -156,6 +192,10 @@ export class RemoteDesktopSession {
     this.opts = opts;
     this.signalingUrl =
       opts.signalingUrl ?? process.env.STREAMSCREEN_SIGNALING_URL ?? DEFAULT_SIGNALING_URL;
+    this.signalingHttpUrl =
+      opts.signalingHttpUrl ??
+      process.env.STREAMSCREEN_SIGNALING_HTTP_URL ??
+      deriveSignalingHttpUrl(this.signalingUrl);
     this.rtcCtor = opts.rtcPeerConnection ?? null;
   }
 
@@ -170,31 +210,67 @@ export class RemoteDesktopSession {
   }
 
   /**
-   * Browse the LAN for active host sessions via the signaling server's `hosts`
-   * message. Returns immediately with whatever the server reports.
+   * List host machines reachable through the signaling server by querying its
+   * REST API over HTTP (Node global `fetch`). We prefer `/api/discover` (the
+   * mDNS browse of LAN hosts) and fall back to `/api/sessions` (the live rooms
+   * on this signaling server) when discovery yields nothing. Both endpoints
+   * return objects carrying a `code` and a `hostName`, which we normalize to the
+   * {@link HostEntry} shape.
+   *
+   * Why REST and not the WebSocket `hosts` message: the signaling WS server only
+   * handles join/ping/pong/offer/answer/ice and ignores a `hosts` request, so a
+   * WS-based query would always time out to `[]`. Querying the REST endpoint is
+   * the truthful, supported path — every code returned maps to a live, joinable
+   * host room (or an advertised LAN host).
+   *
+   * Returns `[]` only on a genuine failure (network error, non-2xx, malformed
+   * body, or timeout). Never throws.
    */
   async listHosts(timeoutMs = 1500): Promise<HostEntry[]> {
-    const client = new SignalingClient(this.signalingUrl);
-    await client.connect();
+    // Prefer discovered LAN hosts; fall back to this server's live sessions.
+    const discovered = await this.fetchHosts('/api/discover', timeoutMs);
+    if (discovered.length > 0) return discovered;
+    return this.fetchHosts('/api/sessions', timeoutMs);
+  }
+
+  /**
+   * GET a signaling REST endpoint that returns an array of host-like objects and
+   * normalize it to {@link HostEntry}[]. Resolves to `[]` on any failure so the
+   * tool/REST surface degrades gracefully rather than hanging or throwing.
+   */
+  private async fetchHosts(pathName: string, timeoutMs: number): Promise<HostEntry[]> {
+    const url = `${this.signalingHttpUrl}${pathName}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return await new Promise<HostEntry[]>((resolve) => {
-        const timer = setTimeout(() => resolve([]), timeoutMs);
-        client.on('hosts', (m) => {
-          clearTimeout(timer);
-          const payload = (m.payload ?? []) as Array<SessionInfo | HostEntry>;
-          resolve(
-            payload.map((h) => ({
-              code: (h as SessionInfo).code,
-              name: (h as HostEntry).name ?? (h as SessionInfo).hostName ?? 'host',
-            })),
-          );
-        });
-        // Ask the server to enumerate hosts.
-        client.send({ type: 'hosts' });
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: controller.signal,
       });
+      if (!res.ok) return [];
+      const body = (await res.json()) as unknown;
+      if (!Array.isArray(body)) return [];
+      return (body as RestHost[])
+        .map((h) => this.toHostEntry(h))
+        .filter((h): h is HostEntry => h !== null);
+    } catch {
+      // Network error, abort/timeout, or invalid JSON — degrade to empty.
+      return [];
     } finally {
-      client.close();
+      clearTimeout(timer);
     }
+  }
+
+  /** Normalize a REST host record to a {@link HostEntry}, or `null` if unusable. */
+  private toHostEntry(h: RestHost): HostEntry | null {
+    const code = typeof h.code === 'string' ? h.code : undefined;
+    if (!code) return null;
+    const name =
+      (typeof h.name === 'string' && h.name) ||
+      (typeof h.hostName === 'string' && h.hostName) ||
+      'host';
+    return { code, name };
   }
 
   /**

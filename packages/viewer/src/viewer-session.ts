@@ -10,7 +10,17 @@ import {
   type ControlMessage,
   type MonitorInfo,
   type FileMeta,
+  type QualityPreset as CoreQualityPreset,
 } from '@stream-screen/core';
+import type { QualityPreset } from './quality.js';
+
+/**
+ * Map a viewer UI quality preset (`Auto`/`High`/`Balanced`/`Low`) to the
+ * lowercase wire-protocol {@link CoreQualityPreset} the host understands.
+ */
+function toWirePreset(preset: QualityPreset): CoreQualityPreset {
+  return preset.toLowerCase() as CoreQualityPreset;
+}
 
 /** Connection lifecycle states surfaced to the UI. */
 export type SessionState =
@@ -482,6 +492,19 @@ export class ViewerSession {
   /** Toggle host system-audio capture on/off. */
   setAudioEnabled(enabled: boolean): void {
     this.peer?.sendControl({ t: 'audio', enabled });
+  }
+
+  /**
+   * Request a quality preset from the host. The viewer's UI presets
+   * (`Auto`/`High`/`Balanced`/`Low`) are mapped to the wire-protocol's lowercase
+   * {@link CoreQualityPreset} discriminants and sent as a `{t:'quality',preset}`
+   * control frame, so the host's authoritative adaptive controller can apply the
+   * requested ceiling. No-op if the control channel is not open. This imposes no
+   * time limit and no hard cap below what the link can carry — it only adjusts
+   * the adaptive ceiling on the host side.
+   */
+  setQuality(preset: QualityPreset): void {
+    this.peer?.sendControl({ t: 'quality', preset: toWirePreset(preset) });
   }
 
   /**

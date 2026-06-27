@@ -98,3 +98,154 @@ describe('serviceToHost (TXT code propagation, P2 regression)', () => {
     expect(isValidSessionCode(host!.code)).toBe(true);
   });
 });
+
+describe('syncSessions (advertise the codes hosts actually joined — truthful model)', () => {
+  /**
+   * A fake Bonjour that records every publish() and lets us stop() services so
+   * the test can assert the advertised set tracks the live host sessions.
+   */
+  function fakeBonjour() {
+    const published: Array<{
+      txt: Record<string, string>;
+      name: string;
+      port: number;
+      stopped: boolean;
+      service: { on: () => void; stop: () => void };
+    }> = [];
+    const bonjour = {
+      publish(opts: { txt: Record<string, string>; name: string; port: number }) {
+        const entry = {
+          txt: opts.txt,
+          name: opts.name,
+          port: opts.port,
+          stopped: false,
+          service: {
+            on: () => {},
+            stop: () => {
+              entry.stopped = true;
+            },
+          },
+        };
+        published.push(entry);
+        return entry.service;
+      },
+    };
+    return { bonjour, published };
+  }
+
+  function inject(disc: Discovery, bonjour: unknown): void {
+    (disc as unknown as { bonjour: unknown; failed: boolean }).bonjour = bonjour;
+    (disc as unknown as { failed: boolean }).failed = false;
+  }
+
+  it('advertises a code only after a host joined it, and that code is connectable via serviceToHost', () => {
+    const { bonjour, published } = fakeBonjour();
+    const disc = new Discovery();
+    inject(disc, bonjour);
+
+    // No live host sessions -> nothing joinable is advertised.
+    expect(disc.syncSessions([], 8787)).toBe(true);
+    expect(published).toHaveLength(0);
+
+    // A host has actually joined code X on the signaling server.
+    const code = '482913';
+    disc.syncSessions([{ code, hostName: 'Test Host' }], 8787);
+    expect(published).toHaveLength(1);
+    expect(published[0]!.txt.code).toBe(code);
+    expect(published[0]!.port).toBe(8787);
+
+    // The advertised TXT, read back as a discovered host, yields code X with a
+    // valid (connectable) session code — i.e. discovery maps to a joinable room.
+    const host = serviceToHost({
+      name: published[0]!.name,
+      type: 'streamscreen',
+      protocol: 'tcp',
+      port: published[0]!.port,
+      addresses: ['192.168.1.7'],
+      txt: published[0]!.txt,
+    } as unknown as Service);
+    expect(host!.code).toBe(code);
+    expect(isValidSessionCode(host!.code)).toBe(true);
+    expect(host!.hostName).toBe('Test Host');
+
+    disc.destroy();
+  });
+
+  it('withdraws a code when its host leaves (re-sync without that session)', () => {
+    const { bonjour, published } = fakeBonjour();
+    const disc = new Discovery();
+    inject(disc, bonjour);
+
+    const code = '730264';
+    disc.syncSessions([{ code, hostName: 'Test Host' }], 8787);
+    expect(published).toHaveLength(1);
+    expect(published[0]!.stopped).toBe(false);
+
+    // The host left -> live sessions is now empty -> the advertisement is stopped.
+    disc.syncSessions([], 8787);
+    expect(published[0]!.stopped).toBe(true);
+
+    disc.destroy();
+  });
+
+  it('supports multiple concurrent host sessions, one advertisement per live code', () => {
+    const { bonjour, published } = fakeBonjour();
+    const disc = new Discovery();
+    inject(disc, bonjour);
+
+    disc.syncSessions(
+      [
+        { code: '111222', hostName: 'Host A' },
+        { code: '333444', hostName: 'Host B' },
+      ],
+      8787,
+    );
+    expect(published.map((p) => p.txt.code).sort()).toEqual(['111222', '333444']);
+
+    // Re-syncing the same set is idempotent: no duplicate publishes.
+    disc.syncSessions(
+      [
+        { code: '111222', hostName: 'Host A' },
+        { code: '333444', hostName: 'Host B' },
+      ],
+      8787,
+    );
+    expect(published).toHaveLength(2);
+
+    // One host leaves: exactly its advertisement is withdrawn, the other stays.
+    disc.syncSessions([{ code: '111222', hostName: 'Host A' }], 8787);
+    const a = published.find((p) => p.txt.code === '111222')!;
+    const b = published.find((p) => p.txt.code === '333444')!;
+    expect(a.stopped).toBe(false);
+    expect(b.stopped).toBe(true);
+
+    disc.destroy();
+  });
+
+  it('never advertises a session whose code is not a valid 6-9 digit code', () => {
+    const { bonjour, published } = fakeBonjour();
+    const disc = new Discovery();
+    inject(disc, bonjour);
+
+    disc.syncSessions(
+      [
+        { code: '', hostName: 'No Code' },
+        { code: 'abc', hostName: 'Bad Code' },
+        { code: '12345', hostName: 'Too Short' },
+        { code: '123456', hostName: 'Good' },
+      ],
+      8787,
+    );
+    expect(published.map((p) => p.txt.code)).toEqual(['123456']);
+
+    disc.destroy();
+  });
+
+  it('is a graceful no-op when multicast is unavailable', () => {
+    const disc = new Discovery();
+    // Force the mDNS stack into the unavailable state.
+    (disc as unknown as { failed: boolean }).failed = true;
+    expect(disc.syncSessions([{ code: '123456', hostName: 'Host' }], 8787)).toBe(false);
+    disc.destroy();
+  });
+});

@@ -5,7 +5,7 @@
   "description": "StreamScreen host agent — Electron app for Windows that captures the screen via desktopCapturer and injects remote input via nut.js. Always free, no time limits, no bitrate caps.",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "electron .",
     "test": "vitest run",

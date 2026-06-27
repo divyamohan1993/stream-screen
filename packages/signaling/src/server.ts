@@ -20,6 +20,7 @@
  */
 
 import { randomInt, randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { Role, SignalMessage, SessionInfo } from '@stream-screen/core';
@@ -132,7 +133,20 @@ export function generateCode(digits = DEFAULT_CODE_DIGITS): string {
   return code;
 }
 
-export class SignalingServer {
+/**
+ * Events emitted by {@link SignalingServer}. `sessions-changed` fires whenever
+ * the set of LIVE host rooms changes — i.e. a host joins (a room gains its host)
+ * or a host leaves (a room is reaped). This is the hook LAN discovery uses to
+ * advertise/withdraw the codes of ACTUAL joinable host sessions, so every
+ * discovered code maps to a real room rather than a placeholder minted at
+ * startup with no host behind it. The payload is the current snapshot from
+ * {@link SignalingServer.listSessions}.
+ */
+export interface SignalingServerEvents {
+  'sessions-changed': [sessions: SessionInfo[]];
+}
+
+export class SignalingServer extends EventEmitter<SignalingServerEvents> {
   private readonly wss: WebSocketServer;
   private readonly rooms = new Map<string, Room>();
   private readonly heartbeatMs: number;
@@ -149,6 +163,7 @@ export class SignalingServer {
   private heartbeat?: ReturnType<typeof setInterval>;
 
   constructor(opts: SignalingServerOptions = {}) {
+    super();
     this.heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     this.codeDigits = opts.codeDigits ?? DEFAULT_CODE_DIGITS;
     this.maxPayloadBytes = opts.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
@@ -478,7 +493,24 @@ export class SignalingServer {
       });
     }
 
+    // A host joining makes this room a LIVE, joinable session — notify listeners
+    // (LAN discovery) so the room's code starts being advertised. Viewer joins
+    // don't change the set of joinable host rooms, so they don't emit.
+    if (role === 'host') this.emitSessionsChanged();
+
     return peer;
+  }
+
+  /**
+   * Notify listeners that the set of live host sessions changed. Guarded so a
+   * misbehaving listener can never take down the signaling server.
+   */
+  private emitSessionsChanged(): void {
+    try {
+      this.emit('sessions-changed', this.listSessions());
+    } catch {
+      /* a listener threw; discovery is best-effort and must not break signaling */
+    }
   }
 
   /**
@@ -523,7 +555,14 @@ export class SignalingServer {
 
     // Reap empty rooms so `listSessions` reflects reality. NOTE: this is NOT a
     // session timeout — the room only disappears once every socket has left.
-    if (room.peers.size === 0) this.rooms.delete(room.code);
+    const reaped = room.peers.size === 0;
+    if (reaped) this.rooms.delete(room.code);
+
+    // The set of live host sessions changes when a host leaves (the room is no
+    // longer joinable) or when a hosted room is reaped. Tell discovery so it can
+    // withdraw the now-dead code. A viewer leaving a still-hosted room does not
+    // change the joinable-host set, so it doesn't emit.
+    if (peer.role === 'host' || reaped) this.emitSessionsChanged();
   }
 
   /**
