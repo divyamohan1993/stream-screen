@@ -160,6 +160,21 @@ export class ViewerSession {
   }
 
   /**
+   * Handle a signaling `peer-left`. Per the SHARED SIGNALING CONTRACT,
+   * `peer-left` carries the departed peer's `role`. In a multi-viewer room the
+   * server emits `peer-left` for ANY peer, including OTHER viewers — those must
+   * NOT downgrade us to `waiting-for-host`, because the host stream is still
+   * connected. Only an actual HOST departure (`role === 'host'`) returns the
+   * session to `waiting-for-host`. Genuine host loss is also covered by the peer
+   * connection-state path (`failed`/`disconnected`).
+   */
+  private onPeerLeft(m: SignalMessage): void {
+    if (this.closed) return;
+    if (m.role !== 'host') return;
+    this.setState('waiting-for-host', 'Host left the session.');
+  }
+
+  /**
    * Connect, join the room, and begin negotiation. Resolves once signaling is
    * connected and the join has been sent; media/connection events continue to
    * arrive via handlers.
@@ -178,8 +193,8 @@ export class ViewerSession {
     signaling.on('error', (m: SignalMessage) => {
       this.setState('error', m.message ?? 'Signaling error');
     });
-    signaling.on('peer-left', () => {
-      if (!this.closed) this.setState('waiting-for-host', 'Host left the session.');
+    signaling.on('peer-left', (m: SignalMessage) => {
+      this.onPeerLeft(m);
     });
 
     this.buildPeer(signaling);
@@ -336,8 +351,8 @@ export class ViewerSession {
       signaling.on('error', (m: SignalMessage) => {
         this.setState('error', m.message ?? 'Signaling error');
       });
-      signaling.on('peer-left', () => {
-        if (!this.closed) this.setState('waiting-for-host', 'Host left the session.');
+      signaling.on('peer-left', (m: SignalMessage) => {
+        this.onPeerLeft(m);
       });
 
       const peer = this.buildPeer(signaling);

@@ -254,7 +254,12 @@ STREAMSCREEN_SIGNALING_URL=ws://<server-ip>:8787 npm -w @stream-screen/host star
   `STREAMSCREEN_CODE`), connects to the signaling server (LAN-local by default),
   and **joins a room with that code** so the session becomes live and is
   advertised over mDNS. It surfaces/logs the code and displays it in the tray +
-  control window.
+  control window. Startup is ordered for safety: it **acquires the screen capture
+  first**, then joins and **waits for the server's `joined` acknowledgement**
+  before attaching media — so if the code is already held by a live host the join
+  is rejected (`host-exists`) and startup **cleans up** instead of advertising a
+  room it does not own. (The join-ack wait is a connect-time bound only, never a
+  session time limit.)
 - Remote input injection requires the optional native dep. If it's missing,
   the host still streams; it just logs a one-time warning and ignores input
   (graceful degradation, never a crash).
@@ -274,7 +279,10 @@ npm -w @stream-screen/viewer run preview
 ```
 
 The viewer derives its signaling WebSocket URL from the page host on port `8787`
-(override the REST proxy with `VITE_SIGNALING_HTTP`). By default — with no
+for manually entered codes; when you instead **pick a host from the discovered
+LAN list**, the viewer connects to **that host's own advertised signaling
+endpoint** (`ws://<host-address>:<port>`), so a host running on another LAN
+machine is reachable rather than failing with `no-such-session`. By default — with no
 `STREAMSCREEN_ALLOWED_ORIGINS` configured — the signaling server accepts WS
 handshakes whose browser `Origin` is loopback, the same host as the server (on
 **any** port, so the Vite dev viewer on `:5173` reaches signaling on `:8787`), or

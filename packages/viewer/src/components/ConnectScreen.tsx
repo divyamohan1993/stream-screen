@@ -1,12 +1,17 @@
 import React, { useRef, useState } from 'react';
 import { isValidSessionCode } from '@stream-screen/core';
 import { DiscoveryList } from './DiscoveryList.js';
-import type { DiscoveredHost } from '../discovery-client.js';
+import { signalingUrlForHost, type DiscoveredHost } from '../discovery-client.js';
 
 /** Props for {@link ConnectScreen}. */
 export interface ConnectScreenProps {
-  /** Start a session for the given code. */
-  onConnect: (code: string) => void;
+  /**
+   * Start a session for the given code. When the code was chosen from a
+   * discovered LAN host, `signalingUrl` is the ws URL of THAT host's signaling
+   * server (e.g. `ws://192.168.1.50:8787`); it is omitted for manual code entry,
+   * where the viewer's default signaling URL should be used.
+   */
+  onConnect: (code: string, signalingUrl?: string) => void;
   /** A connection error to display, if any. */
   error?: string | null;
   /** Whether a connection attempt is in flight. */
@@ -41,7 +46,12 @@ export function ConnectScreen({
     const advertised = (host.code ?? '').replace(/\D/g, '').slice(0, 9);
     setCode(advertised);
     if (isValidSessionCode(advertised)) {
-      if (!connecting) onConnect(advertised);
+      // Connect to the discovered host's OWN signaling server (its advertised
+      // address:port), not the viewer's default localhost endpoint — otherwise a
+      // host on another LAN machine is unreachable and join fails with
+      // no-such-session. Falls back to undefined (→ default) if no address was
+      // advertised.
+      if (!connecting) onConnect(advertised, signalingUrlForHost(host) ?? undefined);
     } else {
       inputRef.current?.focus();
     }

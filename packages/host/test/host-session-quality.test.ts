@@ -61,11 +61,26 @@ vi.mock('@stream-screen/core', async () => {
   }
 
   class FakeSignalingClient {
+    private handlers = new Map<string, Set<(m: { type: string }) => void>>();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     constructor(_url: string) {}
     async connect(): Promise<void> {}
-    on(): void {}
-    join(): void {}
+    on(type: string, cb: (m: { type: string }) => void): void {
+      let set = this.handlers.get(type);
+      if (!set) {
+        set = new Set();
+        this.handlers.set(type, set);
+      }
+      set.add(cb);
+    }
+    off(type: string, cb: (m: { type: string }) => void): void {
+      this.handlers.get(type)?.delete(cb);
+    }
+    // start() now awaits the server's `joined` ack; reply synchronously so the
+    // host join handshake completes and start() resolves.
+    join(): void {
+      for (const cb of this.handlers.get('joined') ?? []) cb({ type: 'joined' });
+    }
     close(): void {}
   }
 

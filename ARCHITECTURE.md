@@ -152,6 +152,17 @@ Key points:
 
 - **Rooms by code.** A host without a code mints one; viewers must target an
   existing room (`no-such-session` otherwise). One host + N viewers per room.
+- **Join is acknowledged.** A successful `join` (host or viewer) gets a `joined`
+  reply addressed to the joining socket. The host **awaits this ack** before
+  treating the room as its own (see below), so a rejected or unanswered join
+  never proceeds as if it succeeded.
+- **One host per code.** A second `join` with `role: host` for a code already
+  held by a live host is **rejected with an `error` whose code/message is
+  `host-exists`**, and the second socket is *not* registered as that room's host
+  — so a duplicate `STREAMSCREEN_CODE` cannot hijack or shadow a live session.
+- **`peer-left` carries role.** Every `peer-left` includes the departed peer's
+  `role` (`host` | `viewer`), so a viewer can tell "the host went away" from
+  "another viewer left" (only the former returns it to `waiting-for-host`).
 - **The server overwrites `from`** with the sender's authoritative id, so peers
   can't spoof each other within a room. `to` targets a specific peer; otherwise a
   message broadcasts to the rest of the room.
@@ -171,6 +182,14 @@ Key points:
 - **Executable bin.** The signaling entrypoint (`src/index.ts`) begins with a
   `#!/usr/bin/env node` shebang so the `streamscreen-signaling` bin
   (package.json `bin` → `dist/index.js`) runs directly on Unix.
+- **Host start ordering + ack.** `HostSession.start` (`host/host-session.ts`)
+  **acquires the capture stream first**, then connects, joins as host, and
+  **awaits the `joined` acknowledgement** before attaching media and starting the
+  adaptive loop. Any failure along the way — capture rejection, a `host-exists`
+  rejection, or a join-ack timeout (`JOIN_ACK_TIMEOUT_MS`, a connect-time bound
+  only, **not** a session limit) — fully **tears down via `stop()`**, so a failed
+  start never leaves a dangling joined socket or a live advertised room with no
+  media behind it.
 
 ---
 
@@ -196,6 +215,15 @@ these and present a one-tap list — **zero configuration, no cloud, no accounts
 If a host ever advertises an empty/invalid code (e.g. an mDNS race before it is
 ready), the viewer prefills the field and waits for confirmation instead of
 auto-connecting with a bad code.
+
+**Cross-machine discovery connects to the host's own signaling endpoint.** A host
+found over mDNS advertises its `address`/`port`, and that host runs its *own*
+signaling server at that address. When the viewer picks a discovered host it
+connects to *that* host's advertised `ws://address:port`
+(`signalingUrlForHost`, IPv6 bracketed), not the viewer's default
+`localhost:8787` — otherwise a host on another LAN machine would be unreachable
+and the join would fail with `no-such-session`. Manual code entry has no
+advertised endpoint and falls back to the viewer's default signaling URL.
 
 mDNS is **best-effort and fully guarded**: on locked-down networks or sandboxes
 where UDP multicast is blocked, advertise/browse degrade to graceful no-ops
@@ -462,7 +490,9 @@ is enforced in code, not just by default config:
   ~15‑minute cutoff.)
 - **The only timers are safety mechanisms, not limits.** The signaling
   heartbeat reaps *dead* sockets; the adaptive loop samples stats every ~1 s;
-  `SignalingClient` backoff reconnects. None of these end a live session.
+  `SignalingClient` backoff reconnects; the host's join-ack timeout
+  (`JOIN_ACK_TIMEOUT_MS`) bounds only the connect-time wait for the server's
+  `joined` reply. None of these end a live session.
 - **No usage metering or licensing.** No counters, no "commercial use" checks, no
   watermarks, no viewer caps imposed by policy.
 - **No bitrate cap.** The only ceiling is the caller-supplied `maxKbps` (default

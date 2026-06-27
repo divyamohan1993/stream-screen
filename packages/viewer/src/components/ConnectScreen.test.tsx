@@ -4,9 +4,13 @@ import type { DiscoveredHost } from '../discovery-client.js';
 
 // Drive the discovery path with controlled hosts so we can exercise pick().
 const discoverHosts = vi.fn<() => Promise<DiscoveredHost[]>>();
-vi.mock('../discovery-client.js', () => ({
-  discoverHosts: () => discoverHosts(),
-}));
+vi.mock('../discovery-client.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../discovery-client.js')>();
+  return {
+    ...actual,
+    discoverHosts: () => discoverHosts(),
+  };
+});
 
 const { ConnectScreen } = await import('./ConnectScreen.js');
 
@@ -63,14 +67,44 @@ describe('ConnectScreen', () => {
   }
 
   it('auto-connects when picking a discovered host with a valid code', async () => {
-    discoverHosts.mockResolvedValue([host({ code: '987654' })]);
+    discoverHosts.mockResolvedValue([host({ code: '987654', address: '192.168.1.50' })]);
     const onConnect = vi.fn();
     render(<ConnectScreen onConnect={onConnect} />);
     fireEvent.click(await findHostRowButton());
-    expect(onConnect).toHaveBeenCalledWith('987654');
+    expect(onConnect).toHaveBeenCalledWith('987654', 'ws://192.168.1.50:8787');
     // Field reflects the picked code too.
     const input = screen.getByLabelText(/session code/i) as HTMLInputElement;
     expect(input.value).toBe('987654');
+  });
+
+  it('threads the discovered host endpoint (address:port) through onConnect', async () => {
+    // Regression for FINDING A: picking a host advertised on ANOTHER LAN machine
+    // must connect to THAT host's signaling server, not the viewer's default
+    // localhost endpoint — otherwise join fails with no-such-session.
+    discoverHosts.mockResolvedValue([host({ code: '111222', address: '192.168.1.50', port: 8787 })]);
+    const onConnect = vi.fn();
+    render(<ConnectScreen onConnect={onConnect} />);
+    fireEvent.click(await findHostRowButton());
+    expect(onConnect).toHaveBeenCalledWith('111222', 'ws://192.168.1.50:8787');
+  });
+
+  it('omits the signaling override for a discovered host with no advertised address', async () => {
+    // No address → fall back to the default (undefined override).
+    discoverHosts.mockResolvedValue([host({ code: '333444', port: 8787 })]);
+    const onConnect = vi.fn();
+    render(<ConnectScreen onConnect={onConnect} />);
+    fireEvent.click(await findHostRowButton());
+    expect(onConnect).toHaveBeenCalledWith('333444', undefined);
+  });
+
+  it('manual code entry connects with no signaling override (uses the default)', async () => {
+    const onConnect = vi.fn();
+    render(<ConnectScreen onConnect={onConnect} />);
+    const input = screen.getByLabelText(/session code/i);
+    fireEvent.change(input, { target: { value: '123456' } });
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    // Manual entry passes only the code; App falls back to defaultSignalingUrl().
+    expect(onConnect).toHaveBeenCalledWith('123456');
   });
 
   it('does NOT auto-connect on a host with an invalid (too-short) code; prefills+focuses the field', async () => {

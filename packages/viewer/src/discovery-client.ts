@@ -44,6 +44,22 @@ export async function mintCode(): Promise<string | null> {
   }
 }
 
+/**
+ * Build the signaling WebSocket URL for a discovered host from its advertised
+ * `address`/`port`. A host found via mDNS on ANOTHER LAN machine runs its own
+ * signaling server at that address — connecting to the viewer's own
+ * {@link defaultSignalingUrl} (localhost:8787) would hit the wrong server and
+ * fail with `no-such-session`. Returns `null` when no usable address was
+ * advertised, so the caller can fall back to the default.
+ */
+export function signalingUrlForHost(host: DiscoveredHost): string | null {
+  const address = host.address?.trim();
+  if (!address) return null;
+  // Bracket IPv6 literals so the host:port URL is well-formed.
+  const authority = address.includes(':') ? `[${address}]` : address;
+  return `ws://${authority}:${host.port}`;
+}
+
 function isDiscoveredHost(v: unknown): v is DiscoveredHost {
   if (v === null || typeof v !== 'object') return false;
   const o = v as Record<string, unknown>;

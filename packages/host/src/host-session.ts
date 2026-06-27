@@ -32,6 +32,7 @@ import {
   type InputEvent,
   type MonitorInfo,
   type QualityPreset,
+  type SignalMessage,
 } from '@stream-screen/core';
 import { getDisplayStream, streamHasAudio, type CaptureConstraints } from './capture.js';
 
@@ -55,6 +56,28 @@ export function isCtrlAltDelKeyDown(e: InputEvent): boolean {
 
 /** How often the adaptive loop samples stats and re-negotiates (ms). */
 export const ADAPTIVE_INTERVAL_MS = 1000;
+
+/**
+ * Default time (ms) {@link HostSession.start} waits for the signaling server's
+ * `joined` acknowledgement after sending the host `join`, before aborting.
+ *
+ * This is a CONNECT-TIME HANDSHAKE TIMEOUT ONLY — it bounds the wait for the
+ * server to confirm the room is ours. It is emphatically NOT a session duration
+ * limit or usage cap: once joined, the session runs until the user closes it.
+ */
+export const JOIN_ACK_TIMEOUT_MS = 10_000;
+
+/**
+ * Thrown when the host's signaling `join` is rejected by the server (e.g. the
+ * session code is already held by a live host — `host-exists`) or no `joined`
+ * acknowledgement arrives within {@link JOIN_ACK_TIMEOUT_MS}.
+ */
+export class HostJoinRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'HostJoinRejectedError';
+  }
+}
 
 /**
  * Mark a captured video track as screen content so the encoder preserves sharp
@@ -149,6 +172,13 @@ export interface HostSessionOptions {
     c?: CaptureConstraints,
     withAudio?: boolean,
   ) => Promise<MediaStream>;
+  /**
+   * Override the connect-time handshake timeout (ms) — how long {@link start}
+   * waits for the signaling server's `joined` acknowledgement before aborting.
+   * Purely a connect handshake bound; NOT a session time limit. Defaults to
+   * {@link JOIN_ACK_TIMEOUT_MS}.
+   */
+  joinTimeoutMs?: number;
 }
 
 /**
@@ -232,65 +262,139 @@ export class HostSession {
   }
 
   /**
-   * Connect to signaling, capture the display, attach it to the peer, wire up
-   * input forwarding, and start the adaptive loop.
+   * Bring the host session up, in this order: capture the display FIRST, then
+   * connect to signaling, join the room as the host and AWAIT the server's
+   * `joined` acknowledgement, and only after a confirmed join attach the stream
+   * to the peer and start the adaptive loop. ANY failure along the way (capture,
+   * connect, peer start, a rejected join such as `host-exists`, or a join-ack
+   * timeout) fully tears down via {@link stop} so no dangling joined socket or
+   * live advertised room is ever left behind. The handshake wait is a
+   * connect-time bound only ({@link JOIN_ACK_TIMEOUT_MS}); it is NOT a session
+   * time limit. Re-entrant calls are ignored.
    */
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
 
-    const signaling = new SignalingClient(this.opts.signalingUrl);
-    this.signaling = signaling;
-    await signaling.connect();
+    try {
+      // ACQUIRE the capture stream FIRST — before we ever announce ourselves to
+      // signaling. A capture failure (getUserMedia rejects, permission denied,
+      // no source) must abort start() WITHOUT having joined a room: otherwise the
+      // socket lingers as a live, advertised host with NO media — a dead room
+      // viewers can still list and join (data-only, no screen). By acquiring up
+      // front, any acquire rejection propagates here and tears down cleanly via
+      // the catch below, having never joined. Audio is best-effort:
+      // getDisplayStream falls back to video-only if loopback fails.
+      const acquire = this.opts.acquireStream ?? getDisplayStream;
+      const withAudio = this.opts.withAudio ?? true;
+      const stream = await acquire(this.opts.sourceId, this.opts.capture, withAudio);
+      this.stream = stream;
 
-    const peer = new Peer({
-      role: 'host',
-      signaling,
-      iceServers: this.opts.iceServers,
-    });
-    this.peer = peer;
+      const signaling = new SignalingClient(this.opts.signalingUrl);
+      this.signaling = signaling;
+      await signaling.connect();
 
-    peer.onInput((e, viewerId) => this.routeInput(e, viewerId));
-    if (this.opts.onState) {
-      peer.on('state', (...args: unknown[]) => {
-        this.opts.onState?.(String(args[0]));
+      const peer = new Peer({
+        role: 'host',
+        signaling,
+        iceServers: this.opts.iceServers,
       });
+      this.peer = peer;
+
+      peer.onInput((e, viewerId) => this.routeInput(e, viewerId));
+      if (this.opts.onState) {
+        peer.on('state', (...args: unknown[]) => {
+          this.opts.onState?.(String(args[0]));
+        });
+      }
+
+      // Reassemble inbound file transfers per viewer; hand finished bytes to the
+      // host app tagged with the originating viewer.
+      peer.onFileChunk((buf, viewerId) => this.fileManagerFor(viewerId).onChunk(buf));
+      peer.onControl((m, viewerId) => void this.handleControl(m, viewerId));
+
+      // Surface viewer connect/disconnect to the host UI. A viewer leaving also
+      // drops its per-viewer file manager so a stale partial transfer is not kept.
+      signaling.on('peer-joined', (msg) => {
+        if (msg.role === 'viewer' && msg.from) this.opts.onViewerJoined?.(msg.from);
+      });
+      signaling.on('peer-left', (msg) => {
+        if (!msg.from) return;
+        this.fileManagers.delete(msg.from);
+        if (msg.role === 'viewer') this.opts.onViewerLeft?.(msg.from);
+      });
+
+      await peer.start();
+
+      // Join the room keyed by the session code, as the host, then WAIT for the
+      // server's acknowledgement before treating the room as ours. Per the shared
+      // signaling contract the server replies `joined` on success or `error`
+      // (code/message `host-exists`) when the code is already held by a live host.
+      // Without this handshake a rejected join would still proceed to capture and
+      // advertise a usable-looking code we do not actually own. A rejection or a
+      // handshake timeout throws and is cleaned up by the catch below.
+      await this.awaitHostJoinAck(signaling, () => {
+        signaling.join({ code: this.opts.code, role: 'host', name: this.opts.hostName });
+      });
+
+      // Only AFTER a confirmed join do we attach media and start the session.
+      // Tell the encoder this is screen content: optimize for sharp static text
+      // over motion smoothness. Without this hint the encoder treats it as camera
+      // video and blurs text. Paired with degradationPreference 'maintain-resolution'
+      // in Peer.applyDecisionTo, the pipeline drops framerate before resolution.
+      for (const t of stream.getVideoTracks()) hintScreenContent(t);
+      peer.attachStream(stream);
+
+      this.startAdaptiveLoop();
+    } catch (err) {
+      // ANY failure in start() — capture, connect, peer start, or a rejected/
+      // timed-out join — must fully tear down so no dangling joined socket or
+      // live advertised room is left behind. stop() stops the acquired stream,
+      // closes the peer and the signaling client, and resets `started` so the
+      // session can be retried.
+      this.stop();
+      throw err;
     }
+  }
 
-    // Reassemble inbound file transfers per viewer; hand finished bytes to the
-    // host app tagged with the originating viewer.
-    peer.onFileChunk((buf, viewerId) => this.fileManagerFor(viewerId).onChunk(buf));
-    peer.onControl((m, viewerId) => void this.handleControl(m, viewerId));
-
-    // Surface viewer connect/disconnect to the host UI. A viewer leaving also
-    // drops its per-viewer file manager so a stale partial transfer is not kept.
-    signaling.on('peer-joined', (msg) => {
-      if (msg.role === 'viewer' && msg.from) this.opts.onViewerJoined?.(msg.from);
+  /**
+   * Resolve when the signaling server acknowledges our host `join` with `joined`;
+   * reject if it replies `error` (e.g. message/code `host-exists` for a code
+   * already held by a live host) or if no acknowledgement arrives within the
+   * handshake timeout. The `join` is sent via `sendJoin` AFTER the listeners are
+   * wired so the reply can never be missed. CONNECT-TIME HANDSHAKE ONLY — it
+   * imposes no session duration limit.
+   */
+  private awaitHostJoinAck(signaling: SignalingClient, sendJoin: () => void): Promise<void> {
+    const timeoutMs = this.opts.joinTimeoutMs ?? JOIN_ACK_TIMEOUT_MS;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onJoined = (): void => finish();
+      const onError = (m: SignalMessage): void =>
+        finish(new HostJoinRejectedError(m.message ?? 'signaling host join rejected'));
+      const finish = (err?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signaling.off('joined', onJoined);
+        signaling.off('error', onError);
+        if (err) reject(err);
+        else resolve();
+      };
+      const timer = setTimeout(
+        () =>
+          finish(
+            new HostJoinRejectedError(
+              `Timed out after ${timeoutMs}ms waiting for the signaling server to ` +
+                `acknowledge the host join for code "${this.opts.code}".`,
+            ),
+          ),
+        timeoutMs,
+      );
+      signaling.on('joined', onJoined);
+      signaling.on('error', onError);
+      sendJoin();
     });
-    signaling.on('peer-left', (msg) => {
-      if (!msg.from) return;
-      this.fileManagers.delete(msg.from);
-      if (msg.role === 'viewer') this.opts.onViewerLeft?.(msg.from);
-    });
-
-    await peer.start();
-
-    // Join the room keyed by the session code, as the host.
-    signaling.join({ code: this.opts.code, role: 'host', name: this.opts.hostName });
-
-    // Acquire and attach the capture stream (native res, 60fps target). Audio is
-    // best-effort: getDisplayStream falls back to video-only if loopback fails.
-    const acquire = this.opts.acquireStream ?? getDisplayStream;
-    const withAudio = this.opts.withAudio ?? true;
-    this.stream = await acquire(this.opts.sourceId, this.opts.capture, withAudio);
-    // Tell the encoder this is screen content: optimize for sharp static text
-    // over motion smoothness. Without this hint the encoder treats it as camera
-    // video and blurs text. Paired with degradationPreference 'maintain-resolution'
-    // in Peer.applyDecisionTo, the pipeline drops framerate before resolution.
-    for (const t of this.stream.getVideoTracks()) hintScreenContent(t);
-    peer.attachStream(this.stream);
-
-    this.startAdaptiveLoop();
   }
 
   /**

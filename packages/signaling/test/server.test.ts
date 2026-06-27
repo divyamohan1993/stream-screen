@@ -168,6 +168,30 @@ describe('SignalingServer', () => {
     host.close();
   });
 
+  it('fires peer-left with role "host" to remaining viewers when the host disconnects', async () => {
+    // Regression: a 'peer-left' must carry the departed peer's role so the
+    // viewer can distinguish "the host went away" from "another viewer left".
+    // When the host leaves a still-populated room, remaining viewers receive a
+    // peer-left for the host (role 'host') before being disconnected.
+    const host = await connect(port);
+    send(host, { type: 'join', role: 'host', name: 'Host PC', code: '484848' });
+    const hostJoined = await nextMessage(host, 'joined');
+    const hostId = hostJoined.from!;
+
+    const viewer = await connect(port);
+    send(viewer, { type: 'join', role: 'viewer', code: '484848' });
+    await nextMessage(viewer, 'joined');
+    await nextMessage(host, 'peer-joined');
+
+    const leftPromise = nextMessage(viewer, 'peer-left');
+    host.close();
+    const left = await leftPromise;
+    expect(left.from).toBe(hostId);
+    expect(left.role).toBe('host');
+
+    viewer.close();
+  });
+
   it('answers ping with pong (keepalive)', async () => {
     const host = await connect(port);
     send(host, { type: 'join', role: 'host', code: '666777' });

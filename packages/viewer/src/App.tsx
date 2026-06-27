@@ -116,7 +116,7 @@ export function App(): React.JSX.Element {
   }, []);
 
   const connect = useCallback(
-    async (code: string) => {
+    async (code: string, signalingUrl?: string) => {
       setError(null);
       setChatMessages([]);
       setTransfers([]);
@@ -124,7 +124,10 @@ export function App(): React.JSX.Element {
       setActiveMonitorId(null);
       const session = new ViewerSession({
         code,
-        signalingUrl: defaultSignalingUrl(),
+        // When a discovered host was picked, connect to ITS signaling server
+        // (its advertised address:port); manual code entry has no override and
+        // falls back to the viewer's default endpoint.
+        signalingUrl: signalingUrl ?? defaultSignalingUrl(),
         handlers: {
           onState: (st, detail) => {
             setState(st);
