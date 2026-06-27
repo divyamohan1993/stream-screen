@@ -44,6 +44,7 @@ import {
   type RawScreenSource,
 } from './monitor.js';
 import { resolveDownloadPath } from './file-save.js';
+import { decideWindowClose } from './window-lifecycle.js';
 import type {
   HostBootConfig,
   PickedFile,
@@ -70,6 +71,14 @@ const injector = new InputInjector();
 
 let controlWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+/**
+ * Set true only once the app is REALLY quitting (the user chose "Quit" from the
+ * tray, or the OS is shutting us down). Until then, clicking the control
+ * window's close button must HIDE the window to the tray — NOT destroy the
+ * renderer — so the {@link HostSession} (WebRTC + signaling) stays joined and
+ * the session code stays advertised. See {@link decideWindowClose}.
+ */
+let isQuitting = false;
 
 function createControlWindow(): void {
   controlWindow = new BrowserWindow({
@@ -85,6 +94,17 @@ function createControlWindow(): void {
     },
   });
   void controlWindow.loadFile(join(__dirname, 'renderer', 'index.html'));
+  // Intercept the close button: hide to tray (keeping the host session joined
+  // and the code advertised) unless the app is genuinely quitting. Without this,
+  // closing the window destroyed the renderer — firing beforeunload, which tore
+  // down the HostSession — yet the main process + tray kept running showing a
+  // code with NO live host behind it. See decideWindowClose.
+  controlWindow.on('close', (event) => {
+    if (decideWindowClose(isQuitting).hide) {
+      event.preventDefault();
+      controlWindow?.hide();
+    }
+  });
   controlWindow.on('closed', () => {
     controlWindow = null;
   });
@@ -241,6 +261,13 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  // Mark a real quit so the control window's 'close' handler stops hiding to the
+  // tray and lets the renderer be destroyed (which fires its beforeunload
+  // teardown of the HostSession). Set BEFORE windows receive their close events.
+  app.on('before-quit', () => {
+    isQuitting = true;
+  });
+
   app.on('second-instance', () => {
     if (controlWindow) {
       if (controlWindow.isMinimized()) controlWindow.restore();

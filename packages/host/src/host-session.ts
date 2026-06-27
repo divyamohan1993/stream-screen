@@ -576,15 +576,25 @@ export class HostSession {
       ? this.stream.getVideoTracks().filter((t) => t !== videoTrack)
       : [];
 
-    const replaced = await peer.replaceVideoTrack(videoTrack);
-    if (!replaced) {
-      videoTrack.stop();
-      return;
-    }
+    // replaceVideoTrack returns FALSE when there are no RTCRtpSenders yet — i.e.
+    // NO viewers are connected. We must NOT treat that as a no-op: the operator
+    // still changed the source, and the freshly-captured `videoTrack` must become
+    // the new active/queued stream so the NEXT viewer to connect (which replays
+    // this.stream / the Peer's stored localStream via attachStream) gets the
+    // CHOSEN source, not the original default. So whether or not a live sender
+    // was swapped, we ALWAYS adopt `videoTrack` into the shared stream, stop the
+    // OLD track(s) (don't leak them), and update activeSourceId. The ONLY thing
+    // gated on `replaced` is whether any sender's track was hot-swapped — and
+    // replaceVideoTrack handled that already. Critically, we do NOT stop the new
+    // `videoTrack` in the no-viewer case: it is now the active queued stream.
+    await peer.replaceVideoTrack(videoTrack);
 
-    // Stop ONLY the old video track(s) — never the new active `videoTrack`.
-    // replaceVideoTrack has already adopted `videoTrack` into the shared stream;
-    // ensure it is present without re-adding (and without touching the new one).
+    // Adopt the new video track into the shared stream and stop ONLY the old
+    // video track(s) — never the new active `videoTrack`. The Peer holds the
+    // SAME MediaStream object (passed via attachStream), so mutating it here
+    // also updates what future connections replay. replaceVideoTrack may have
+    // already adopted `videoTrack` (when it swapped a live sender); guard the
+    // add so we never duplicate it, and never re-stop the new one.
     if (this.stream) {
       for (const t of oldVideoTracks) {
         this.stream.removeTrack(t);

@@ -9,6 +9,7 @@
 
 import { HostSession, type HostSessionOptions } from '../host-session.js';
 import { normalizeSources, pickDefaultSource, type CaptureSource } from '../capture.js';
+import { shouldStopOnLifecycle, type LifecycleReason } from '../window-lifecycle.js';
 import type { StreamScreenHostApi } from '../preload.js';
 import type { FileMeta } from '@stream-screen/core';
 
@@ -158,6 +159,24 @@ export class SessionController {
   stop(): void {
     this.session?.stop();
   }
+
+  /**
+   * React to a renderer/window lifecycle event WITHOUT over-tearing-down the
+   * session.
+   *
+   * In the Windows tray flow, clicking the control window's close button no
+   * longer destroys the renderer — the main process intercepts 'close' and HIDES
+   * the window to the tray (see main.ts `decideWindowClose`), keeping the host
+   * session joined and the code advertised. A mere HIDE must therefore NOT stop
+   * the session; only a real teardown ('unload', fired when the window is
+   * genuinely being destroyed on quit) tears the WebRTC/signaling session down.
+   *
+   * Delegates the decision to the pure {@link shouldStopOnLifecycle} so the
+   * keep-alive-on-hide behavior is unit-testable without an Electron window.
+   */
+  onLifecycle(reason: LifecycleReason): void {
+    if (shouldStopOnLifecycle(reason)) this.stop();
+  }
 }
 
 /**
@@ -202,7 +221,13 @@ async function boot(): Promise<void> {
     });
   });
 
-  window.addEventListener('beforeunload', () => controller.stop());
+  // beforeunload fires ONLY when the renderer is actually being destroyed — i.e.
+  // a real app quit, since the main process now intercepts the window 'close'
+  // button and HIDES to the tray instead of destroying (see main.ts
+  // decideWindowClose). So this is a genuine 'unload' teardown, and onLifecycle
+  // stops the session. A mere hide never reaches here, so the host session stays
+  // joined and the code stays advertised while the window is hidden in the tray.
+  window.addEventListener('beforeunload', () => controller.onLifecycle('unload'));
 
   if (def) await controller.startSession(sessionCfg, def.id);
 }

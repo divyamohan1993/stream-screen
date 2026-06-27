@@ -461,7 +461,14 @@ flowchart LR
   the same code, but `stop()` returns before the server observes the host's
   departure, so the fresh join could race ahead and be rejected as `host-exists`
   — leaving the operator with no advertised session after a source change. Staying
-  joined in place removes the race entirely.
+  joined in place removes the race entirely. **The switch also applies with NO
+  viewers connected:** with no `RTCRtpSender` yet, `replaceVideoTrack` returns
+  `false`, but `switchSource` still adopts the freshly-captured track into the
+  shared `MediaStream` (the same object the `Peer` replays to future viewers via
+  `attachStream`), stops only the old track(s), and advances `activeSourceId` — so
+  the *next* viewer to connect gets the operator's chosen source, not the original
+  default. The new track is never stopped in this path (it is the active queued
+  stream).
 - **File transfer.** `FileTransferManager` (`core/src/file-transfer.ts`) is a
   pure, DOM-free chunker/reassembler. The sender emits `file-offer`, awaits
   `file-accept`, streams 16 KiB chunks over the binary `file` channel, then

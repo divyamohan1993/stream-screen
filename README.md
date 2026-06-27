@@ -263,8 +263,13 @@ STREAMSCREEN_SIGNALING_URL=ws://<server-ip>:8787 npm -w @stream-screen/host star
 - Remote input injection requires the optional native dep. If it's missing,
   the host still streams; it just logs a one-time warning and ignores input
   (graceful degradation, never a crash).
-- The host **never** quits on window close — it stays in the tray with **no time
-  limit** until you explicitly quit.
+- The host **never** quits on window close — clicking the control window's close
+  button **hides it to the tray** (the main process intercepts `close` and calls
+  `hide()` unless a real quit is in progress), so the renderer is **not**
+  destroyed and the live `HostSession` stays **joined and its code advertised**.
+  Only an explicit **Quit** (tray menu / OS shutdown) destroys the renderer and
+  tears the WebRTC/signaling session down. There is **no time limit** at any
+  point — the session lives until you explicitly quit.
 
 ### 3. Web viewer
 
