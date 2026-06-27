@@ -100,6 +100,11 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           type: 'string',
           description: 'The 6–9 digit session code advertised by the host.',
         },
+        signalingUrl: {
+          type: 'string',
+          description:
+            "Optional signaling WebSocket URL of the host (e.g. 'ws://192.168.1.50:8787'). For a host found on another LAN machine via list_hosts, leave unset — the discovered endpoint is used automatically. Provide it only to override or to reach a host not surfaced by list_hosts.",
+        },
       },
       required: ['code'],
       additionalProperties: false,

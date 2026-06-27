@@ -121,6 +121,13 @@ function bodyString(req: Request, key: string): string {
   return v;
 }
 
+/** Read an optional string body field; undefined when absent or empty. */
+function bodyOptString(req: Request, key: string): string | undefined {
+  const v = (req.body ?? {})[key];
+  if (typeof v !== 'string' || v.length === 0) return undefined;
+  return v;
+}
+
 /**
  * Build the Express app wiring every REST route to a shared
  * {@link RemoteDesktopSession}. Does not call `listen` — the caller decides
@@ -213,10 +220,10 @@ export function createRestApi(opts: RestApiOptions = {}): {
     }
   });
 
-  // POST /api/connect { code } — connect.
+  // POST /api/connect { code, signalingUrl? } — connect.
   app.post('/api/connect', async (req: Request, res: Response) => {
     try {
-      await session.connect(bodyString(req, 'code'));
+      await session.connect(bodyString(req, 'code'), bodyOptString(req, 'signalingUrl'));
       res.json({ connected: true, code: session.code });
     } catch (err) {
       sendError(res, err);

@@ -346,7 +346,10 @@ file-transfer signaling) and a reliable binary `file` channel (the file bytes).
   arbitrary modifier+key combo. `buildKeyCombo` / `SPECIAL_KEYS`
   (`core/src/protocol.ts`) build an ordered key-down/up sequence with the correct
   cumulative modifier bitmask, sent over the input channel and replayed by the
-  host injector.
+  host injector. A modifier pressed on its own key event stays physically held
+  until **its own** key-up — it is never released by an unrelated non-modifier
+  key-up — so chords like **Ctrl+Tab** cycling and **Shift+Arrow** selection keep
+  the modifier down across the repeats.
 
   **Ctrl+Alt+Del routing (Windows SAS).** The Ctrl+Alt+Del chord arrives over the
   ordinary input channel as individual key events, but a synthetic Ctrl+Alt+Del is
@@ -417,7 +420,13 @@ Both drive a single `RemoteDesktopSession`, which connects as a **viewer** via t
 core `Peer`. `list_hosts` queries the signaling server's REST API over HTTP
 (`GET /api/discover`, falling back to `/api/sessions`) — the HTTP base URL is
 derived from the signaling WS URL or set via `STREAMSCREEN_SIGNALING_HTTP_URL` —
-so every returned code maps to a live, joinable host room. Codes are validated
+so every returned code maps to a live, joinable host room. When `/api/discover`
+advertises a host's own `address`/`port`, `list_hosts` carries that host's
+signaling endpoint (`ws://address:port`) through with the code, so a later
+`connect(code)` joins against **that** host's signaling server rather than this
+AI server's configured `signalingUrl` — a host on another LAN machine is reachable
+instead of failing with `no-such-session` (pass an explicit `signalingUrl` to
+`connect` to override). Codes are validated
 against the 6–9 digit pattern and any unusable one is dropped, so `list_hosts`
 never surfaces a code `connect` would reject; in particular the `/api/sessions`
 fallback **redacts** codes (e.g. `****56`) for unauthenticated callers, so set
@@ -433,7 +442,7 @@ unavailable" message. **Nothing here counts usage or expires a session.**
 | Tool (MCP) | REST route | Args | Returns |
 |---|---|---|---|
 | `list_hosts` | `GET /api/hosts` | – | live hosts via the signaling REST API (`GET /api/discover`, falling back to `/api/sessions`) |
-| `connect` | `POST /api/connect` | `{ code }` | establishes the P2P session |
+| `connect` | `POST /api/connect` | `{ code, signalingUrl? }` | establishes the P2P session (a discovered host's advertised endpoint is used automatically; `signalingUrl` overrides) |
 | `disconnect` | `POST /api/disconnect` | – | closes the session |
 | `screenshot` | `GET /api/screenshot` | – | current frame as PNG |
 | `ocr_screen` | `GET /api/ocr` | – | recognized text from the screen |

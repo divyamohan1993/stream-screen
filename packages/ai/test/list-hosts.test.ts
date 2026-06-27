@@ -11,7 +11,33 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isValidSessionCode } from '@stream-screen/core';
 import { RemoteDesktopSession, deriveSignalingHttpUrl } from '../src/session.js';
+import type { SessionSignaling } from '../src/session.js';
 import { dispatchTool } from '../src/mcp-server.js';
+
+/** Minimal inert RTCPeerConnection so Peer construction/start never touches a real runtime. */
+class FakeRTCPeerConnection {
+  onicecandidate: unknown = null;
+  ontrack: unknown = null;
+  ondatachannel: unknown = null;
+  onconnectionstatechange: unknown = null;
+  oniceconnectionstatechange: unknown = null;
+  onnegotiationneeded: unknown = null;
+  addEventListener(): void {}
+  removeEventListener(): void {}
+  createDataChannel(): unknown {
+    return { onopen: null, onmessage: null, onclose: null, send() {}, close() {} };
+  }
+  addTrack(): void {}
+  getSenders(): unknown[] {
+    return [];
+  }
+  close(): void {}
+}
+
+/** A fresh inert RTCPeerConnection ctor for tests that exercise connect(). */
+function fakeRtc(): typeof RTCPeerConnection {
+  return FakeRTCPeerConnection as unknown as typeof RTCPeerConnection;
+}
 
 /** Build a Response-like object for a mocked fetch. */
 function jsonResponse(body: unknown, ok = true): Response {
@@ -51,9 +77,11 @@ describe('RemoteDesktopSession.listHosts (REST-backed)', () => {
     const session = new RemoteDesktopSession({ signalingUrl: 'ws://127.0.0.1:8787' });
     const hosts = await session.listHosts();
 
-    // Proves it no longer times out to [].
+    // Proves it no longer times out to []. The first host advertised an
+    // address/port, so its discovered signaling endpoint is carried through; the
+    // second advertised no address, so it has no endpoint (connect falls back).
     expect(hosts).toEqual([
-      { code: '123456', name: 'office-pc' },
+      { code: '123456', name: 'office-pc', signalingUrl: 'ws://192.168.1.5:8787' },
       { code: '987654', name: 'laptop' },
     ]);
     // Discover was queried against the derived HTTP base URL.
@@ -225,6 +253,95 @@ describe('RemoteDesktopSession.listHosts (REST-backed)', () => {
       'http://127.0.0.1:8787/api/sessions',
       expect.anything(),
     );
+  });
+
+  it('carries a discovered host signaling endpoint and connect() joins it, NOT this.signalingUrl (P2)', async () => {
+    // /api/discover advertises a host on ANOTHER LAN machine (192.168.1.50:8787).
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/discover')) {
+        return jsonResponse([
+          { code: '246810', hostName: 'lan-host', address: '192.168.1.50', port: 8787, viewers: 0, createdAt: 1 },
+        ]);
+      }
+      return jsonResponse([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Record every signaling URL the factory is constructed with.
+    const factoryUrls: string[] = [];
+    const makeSignaling = (url: string): SessionSignaling => {
+      factoryUrls.push(url);
+      const listeners: Record<string, Array<(m: { type: string }) => void>> = {};
+      return {
+        connect: async () => {},
+        join: () => {
+          // Acknowledge immediately so connect() resolves.
+          for (const cb of listeners['joined'] ?? []) cb({ type: 'joined' });
+        },
+        on: (type, cb) => {
+          (listeners[type] ??= []).push(cb as (m: { type: string }) => void);
+        },
+        off: (type, cb) => {
+          listeners[type] = (listeners[type] ?? []).filter((c) => c !== cb);
+        },
+        close: () => {},
+      };
+    };
+
+    const session = new RemoteDesktopSession({
+      signalingUrl: 'ws://127.0.0.1:8787',
+      rtcPeerConnection: fakeRtc(),
+      signalingClientFactory: makeSignaling,
+    });
+
+    // list_hosts surfaces the discovered endpoint built from address:port.
+    const hosts = await session.listHosts();
+    expect(hosts).toEqual([
+      { code: '246810', name: 'lan-host', signalingUrl: 'ws://192.168.1.50:8787' },
+    ]);
+
+    // connect(code) alone resolves the discovered endpoint from the cache: the
+    // signaling client is built against the HOST's server, not this.signalingUrl.
+    await session.connect('246810');
+    expect(session.connected).toBe(true);
+    expect(factoryUrls).toEqual(['ws://192.168.1.50:8787']);
+    expect(factoryUrls).not.toContain('ws://127.0.0.1:8787');
+  });
+
+  it('a manually-entered (undiscovered) code still uses this.signalingUrl (P2)', async () => {
+    // Discovery is empty/unavailable — no endpoint is ever cached.
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse([])));
+
+    const factoryUrls: string[] = [];
+    const makeSignaling = (url: string): SessionSignaling => {
+      factoryUrls.push(url);
+      const listeners: Record<string, Array<(m: { type: string }) => void>> = {};
+      return {
+        connect: async () => {},
+        join: () => {
+          for (const cb of listeners['joined'] ?? []) cb({ type: 'joined' });
+        },
+        on: (type, cb) => {
+          (listeners[type] ??= []).push(cb as (m: { type: string }) => void);
+        },
+        off: (type, cb) => {
+          listeners[type] = (listeners[type] ?? []).filter((c) => c !== cb);
+        },
+        close: () => {},
+      };
+    };
+
+    const session = new RemoteDesktopSession({
+      signalingUrl: 'ws://127.0.0.1:8787',
+      rtcPeerConnection: fakeRtc(),
+      signalingClientFactory: makeSignaling,
+    });
+
+    // No list_hosts call (or an empty one) — a code typed by hand.
+    await session.connect('135790');
+    expect(session.connected).toBe(true);
+    expect(factoryUrls).toEqual(['ws://127.0.0.1:8787']);
   });
 
   it('list_hosts MCP tool surfaces the REST hosts as JSON', async () => {

@@ -308,8 +308,15 @@ flowchart LR
   round-trip safe, with an exhaustiveness guard so a new event variant fails to
   compile until handled.
 - **Key translation.** DOM `KeyboardEvent.code` (e.g. `KeyA`, `Digit1`,
-  `ArrowLeft`, `F5`) maps to nut.js `Key` enum names; modifiers are held/released
-  around the main key. The pure mapping is unit-tested without the native library.
+  `ArrowLeft`, `F5`) maps to nut.js `Key` enum names. A modifier pressed on its
+  **own** key event (Ctrl/Alt/Shift/Meta, either side) is held down until its own
+  key-up — it is never released as a side effect of an unrelated non-modifier
+  key-up — so chords like **Ctrl+Tab** cycling or **Shift+Arrow** selection keep
+  the modifier physically down across the repeats. A modifier asserted only by a
+  non-modifier key's `mods` bitfield (e.g. the AI `press_key key='c' mods=ctrl`
+  path, which sends no separate modifier event) is pressed transiently and
+  released on that key's key-up, but never releases a modifier that is also
+  physically held. The pure mapping is unit-tested without the native library.
 - **Graceful degradation.** The native injector (`@nut-tree-fork/nut-js`) is an
   **optional** dependency loaded lazily. If absent, input becomes a logged no-op
   and streaming continues. Clipboard events are handled by the Electron clipboard
@@ -432,7 +439,14 @@ validated against the 6–9 digit pattern and any unusable one is dropped; in
 particular the `/api/sessions` fallback redacts codes (e.g. `****56`) for
 unauthenticated callers, so `list_hosts` presents `STREAMSCREEN_TOKEN` as a bearer
 token for un-redacted codes and drops any redacted code that `connect` would
-reject. The node WebRTC
+reject. When `/api/discover` advertises a host's own `address`/`port`,
+`list_hosts` carries that host's signaling endpoint
+(`ws://address:port`, IPv6 bracketed) through with the code, so a later
+`connect(code)` joins against **that** host's own signaling server rather than
+this AI server's configured `signalingUrl` — a host on another LAN machine is
+reachable instead of failing with `no-such-session`. A manually-entered
+(undiscovered) code, or an explicit `signalingUrl` argument to `connect`,
+overrides this and uses the given/configured endpoint. The node WebRTC
 runtime and OCR engine are optional dynamic imports; when missing, the server and
 its schemas stay valid and only the affected calls return a clear error.
 Screenshots are produced by converting raw I420 frames to PNG with a

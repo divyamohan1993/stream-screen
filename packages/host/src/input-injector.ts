@@ -120,6 +120,85 @@ export function modifierKeyNames(mods: number): string[] {
   return names;
 }
 
+/** The four logical modifiers, independent of left/right physical key. */
+export type LogicalModifier = 'shift' | 'ctrl' | 'alt' | 'meta';
+
+/**
+ * The nut.js `Key` enum member NAME used when we need to press a logical modifier
+ * transiently (i.e. because a non-modifier key event carried it in its `mods`
+ * bitfield but the viewer never sent a separate modifier key-down). We always use
+ * the LEFT variant for these synthetic holds.
+ */
+const LOGICAL_MOD_KEY_NAME: Record<LogicalModifier, string> = {
+  ctrl: 'LeftControl',
+  alt: 'LeftAlt',
+  shift: 'LeftShift',
+  meta: 'LeftSuper',
+};
+
+/**
+ * If a key event (`code`/`key`) is itself a MODIFIER key (Control/Alt/Shift/Meta,
+ * either physical side), return the logical modifier it represents; otherwise
+ * `null`.
+ *
+ * This is what lets the injector track held-modifier state from the modifier
+ * keys' OWN key-down / key-up events, instead of inferring (and prematurely
+ * releasing) modifiers from the `mods` bitfield carried by unrelated
+ * non-modifier key releases. Holding Ctrl across e.g. Ctrl+Tab cycling or Shift
+ * across Arrow repeats therefore keeps the modifier physically down on the host
+ * until the modifier's own key-up arrives.
+ *
+ * Pure and side-effect-free — unit-tested on Linux without the native libs.
+ */
+export function modifierForKeyEvent(code: string, key: string): LogicalModifier | null {
+  switch (code) {
+    case 'ControlLeft':
+    case 'ControlRight':
+      return 'ctrl';
+    case 'AltLeft':
+    case 'AltRight':
+      return 'alt';
+    case 'ShiftLeft':
+    case 'ShiftRight':
+      return 'shift';
+    case 'MetaLeft':
+    case 'MetaRight':
+      return 'meta';
+    default:
+      break;
+  }
+  // Fall back to the logical `key` value (DOM `KeyboardEvent.key`) and bare names
+  // the AI vocabulary may emit ("Control", "ctrl", "Alt", "Shift", "Meta", ...).
+  switch (key.toLowerCase()) {
+    case 'control':
+    case 'ctrl':
+      return 'ctrl';
+    case 'alt':
+      return 'alt';
+    case 'shift':
+      return 'shift';
+    case 'meta':
+    case 'win':
+    case 'super':
+    case 'cmd':
+    case 'os':
+      return 'meta';
+    default:
+      return null;
+  }
+}
+
+/** Decode a `mods` bitfield into the set of logical modifiers it asserts. */
+export function logicalModifiers(mods: number): LogicalModifier[] {
+  const m = decodeModifiers(mods);
+  const out: LogicalModifier[] = [];
+  if (m.ctrl) out.push('ctrl');
+  if (m.alt) out.push('alt');
+  if (m.shift) out.push('shift');
+  if (m.meta) out.push('meta');
+  return out;
+}
+
 /**
  * Decide whether an ordered {@link InputEvent} sequence is the Ctrl+Alt+Del
  * chord, so the host can route it to the real Windows Secure Attention Sequence
@@ -309,6 +388,23 @@ export class InputInjector {
    * null we fall back to primary-display pixel mapping via {@link screenSize}.
    */
   private displayGeometry: DisplayGeometry | null = null;
+  /**
+   * Modifiers currently held because their OWN modifier key (Control/Alt/Shift/
+   * Meta) was pressed and has not yet been released. Maps the logical modifier to
+   * the nut.js `Key` enum member NAME we actually pressed (honoring the left/right
+   * side the viewer used). A modifier here stays down across any number of
+   * non-modifier key presses — fixing premature modifier-up during Ctrl+Tab
+   * cycling, Shift+Arrow repeats, etc. — until that modifier's own key-up.
+   */
+  private readonly physicalMods = new Map<LogicalModifier, string>();
+  /**
+   * Modifiers we pressed TRANSIENTLY for a single non-modifier key event whose
+   * `mods` bitfield asserted them but for which the viewer sent no separate
+   * modifier key-down (e.g. the AI `press_key key='c' mods=2` path). These are
+   * released on that key's key-up — but only if they are not ALSO physically held
+   * via their own modifier key.
+   */
+  private readonly transientMods = new Map<LogicalModifier, string>();
 
   /**
    * Attempt to load the native library. Idempotent and never throws. Returns
@@ -414,21 +510,40 @@ export class InputInjector {
           break;
         }
         case 'k-down': {
-          await this.holdModifiers(nut, e.mods, true);
-          const keyName = mapKeyCode(e.code);
-          if (keyName && !modifierKeyNames(e.mods).includes(keyName)) {
-            const k = nut.Key[keyName];
-            if (k !== undefined) await nut.keyboard.pressKey(k);
+          const mod = modifierForKeyEvent(e.code, e.key);
+          if (mod) {
+            // A modifier key pressed on its OWN behalf: hold it down and remember
+            // it until its own key-up. Do NOT release it as a side effect of any
+            // later non-modifier key-up.
+            await this.pressModifier(nut, mod, e.code);
+          } else {
+            // A normal key: make sure the modifiers its `mods` bitfield asserts
+            // are down (pressing only the ones not already held), then press the
+            // key. Held modifiers stay down for subsequent keys.
+            await this.applyTransientModifiers(nut, e.mods);
+            const keyName = mapKeyCode(e.code);
+            if (keyName) {
+              const k = nut.Key[keyName];
+              if (k !== undefined) await nut.keyboard.pressKey(k);
+            }
           }
           break;
         }
         case 'k-up': {
-          const keyName = mapKeyCode(e.code);
-          if (keyName && !modifierKeyNames(e.mods).includes(keyName)) {
-            const k = nut.Key[keyName];
-            if (k !== undefined) await nut.keyboard.releaseKey(k);
+          const mod = modifierForKeyEvent(e.code, e.key);
+          if (mod) {
+            // Release a modifier ONLY when the released key IS that modifier.
+            await this.releaseModifier(nut, mod);
+          } else {
+            const keyName = mapKeyCode(e.code);
+            if (keyName) {
+              const k = nut.Key[keyName];
+              if (k !== undefined) await nut.keyboard.releaseKey(k);
+            }
+            // Release only the modifiers we pressed transiently for this key and
+            // that are not physically held by their own modifier key.
+            await this.releaseTransientModifiers(nut);
           }
-          await this.holdModifiers(nut, e.mods, false);
           break;
         }
         case 'clipboard': {
@@ -544,12 +659,73 @@ export class InputInjector {
     });
   }
 
-  private async holdModifiers(nut: NutModule, mods: number, press: boolean): Promise<void> {
-    for (const name of modifierKeyNames(mods)) {
-      const k = nut.Key[name];
-      if (k === undefined) continue;
-      if (press) await nut.keyboard.pressKey(k);
-      else await nut.keyboard.releaseKey(k);
+  /** Whether a logical modifier is currently down (physically held or transient). */
+  private isModifierDown(mod: LogicalModifier): boolean {
+    return this.physicalMods.has(mod) || this.transientMods.has(mod);
+  }
+
+  /**
+   * Press a modifier on its OWN behalf (its key-down). If it was only transiently
+   * held it is promoted to physically held so a later non-modifier key-up cannot
+   * release it. Idempotent: re-pressing an already-held modifier is a no-op (key
+   * auto-repeat).
+   */
+  private async pressModifier(nut: NutModule, mod: LogicalModifier, code: string): Promise<void> {
+    // Prefer the nut.js key matching the side the viewer used; fall back to Left.
+    const keyName = mapKeyCode(code) ?? LOGICAL_MOD_KEY_NAME[mod];
+    // Promote a transient hold to physical so it survives non-modifier key-ups.
+    const wasTransient = this.transientMods.delete(mod);
+    if (this.physicalMods.has(mod)) {
+      // Already physically held: ensure we keep the recorded key name.
+      return;
+    }
+    this.physicalMods.set(mod, keyName);
+    if (wasTransient) return; // the key is already physically down; don't re-press
+    const k = nut.Key[keyName];
+    if (k !== undefined) await nut.keyboard.pressKey(k);
+  }
+
+  /** Release a modifier on its OWN behalf (its key-up). No-op if not held. */
+  private async releaseModifier(nut: NutModule, mod: LogicalModifier): Promise<void> {
+    const keyName = this.physicalMods.get(mod) ?? this.transientMods.get(mod);
+    this.physicalMods.delete(mod);
+    this.transientMods.delete(mod);
+    if (keyName === undefined) return;
+    const k = nut.Key[keyName];
+    if (k !== undefined) await nut.keyboard.releaseKey(k);
+  }
+
+  /**
+   * Ensure every modifier asserted by a non-modifier key's `mods` bitfield is
+   * down before the key is pressed. Modifiers already held (physically or
+   * transiently) are left untouched; newly-pressed ones are recorded as transient
+   * so they can be released on the key's own key-up.
+   */
+  private async applyTransientModifiers(nut: NutModule, mods: number): Promise<void> {
+    for (const mod of logicalModifiers(mods)) {
+      if (this.isModifierDown(mod)) continue;
+      const keyName = LOGICAL_MOD_KEY_NAME[mod];
+      this.transientMods.set(mod, keyName);
+      const k = nut.Key[keyName];
+      if (k !== undefined) await nut.keyboard.pressKey(k);
+    }
+  }
+
+  /**
+   * Release the modifiers we pressed transiently for the just-released
+   * non-modifier key. Physically-held modifiers (driven by their own modifier
+   * key events) are never touched here, so holding Ctrl/Alt/Shift/Meta across
+   * multiple non-modifier keys stays down until that modifier's own key-up.
+   */
+  private async releaseTransientModifiers(nut: NutModule): Promise<void> {
+    for (const [mod, keyName] of [...this.transientMods]) {
+      if (this.physicalMods.has(mod)) {
+        this.transientMods.delete(mod);
+        continue;
+      }
+      this.transientMods.delete(mod);
+      const k = nut.Key[keyName];
+      if (k !== undefined) await nut.keyboard.releaseKey(k);
     }
   }
 

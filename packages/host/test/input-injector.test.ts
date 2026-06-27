@@ -11,8 +11,10 @@ import {
   decodeModifiers,
   InputInjector,
   isCtrlAltDelCombo,
+  logicalModifiers,
   mapButton,
   mapKeyCode,
+  modifierForKeyEvent,
   modifierKeyNames,
   normalizedToPixels,
   MOD_ALT,
@@ -20,7 +22,7 @@ import {
   MOD_META,
   MOD_SHIFT,
 } from '../src/input-injector.js';
-import { CTRL_ALT_DEL, SPECIAL_KEYS } from '@stream-screen/core';
+import { buildKeyCombo, CTRL_ALT_DEL, SPECIAL_KEYS, type InputEvent } from '@stream-screen/core';
 import type { DisplayGeometry } from '../src/monitor.js';
 
 describe('normalizedToPixels', () => {
@@ -271,5 +273,199 @@ describe('isCtrlAltDelCombo', () => {
     expect(
       isCtrlAltDelCombo([{ t: 'k-up', code: 'Delete', key: 'Delete', mods: MOD_CTRL | MOD_ALT }]),
     ).toBe(false);
+  });
+});
+
+describe('modifierForKeyEvent', () => {
+  it('maps physical modifier codes (both sides) to their logical modifier', () => {
+    expect(modifierForKeyEvent('ControlLeft', 'Control')).toBe('ctrl');
+    expect(modifierForKeyEvent('ControlRight', 'Control')).toBe('ctrl');
+    expect(modifierForKeyEvent('AltLeft', 'Alt')).toBe('alt');
+    expect(modifierForKeyEvent('AltRight', 'Alt')).toBe('alt');
+    expect(modifierForKeyEvent('ShiftLeft', 'Shift')).toBe('shift');
+    expect(modifierForKeyEvent('ShiftRight', 'Shift')).toBe('shift');
+    expect(modifierForKeyEvent('MetaLeft', 'Meta')).toBe('meta');
+    expect(modifierForKeyEvent('MetaRight', 'Meta')).toBe('meta');
+  });
+
+  it('falls back to the logical key / bare names', () => {
+    expect(modifierForKeyEvent('Control', 'Control')).toBe('ctrl');
+    expect(modifierForKeyEvent('ctrl', 'ctrl')).toBe('ctrl');
+    expect(modifierForKeyEvent('win', 'win')).toBe('meta');
+    expect(modifierForKeyEvent('Super', 'Super')).toBe('meta');
+  });
+
+  it('returns null for non-modifier keys', () => {
+    expect(modifierForKeyEvent('Tab', 'Tab')).toBeNull();
+    expect(modifierForKeyEvent('KeyA', 'a')).toBeNull();
+    expect(modifierForKeyEvent('ArrowLeft', 'ArrowLeft')).toBeNull();
+  });
+});
+
+describe('logicalModifiers', () => {
+  it('decodes the mods bitfield into logical modifiers', () => {
+    expect(logicalModifiers(0)).toEqual([]);
+    expect(logicalModifiers(MOD_CTRL)).toEqual(['ctrl']);
+    expect(logicalModifiers(MOD_CTRL | MOD_ALT | MOD_SHIFT | MOD_META)).toEqual([
+      'ctrl',
+      'alt',
+      'shift',
+      'meta',
+    ]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/*  Held-modifier injection behavior (with a FAKE nut.js)                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A minimal fake of the `@nut-tree-fork/nut-js` surface the injector touches.
+ * Records every keyboard pressKey/releaseKey as a `down:NAME` / `up:NAME` log
+ * line, where NAME is the nut.js `Key` enum member name (resolved back from the
+ * numeric enum value the injector passes). This lets the held-modifier tests
+ * assert the EXACT sequence of OS-level key down/up calls on Linux/CI, with no
+ * native library present.
+ */
+function makeFakeNut(): { nut: unknown; keys: string[] } {
+  const keys: string[] = [];
+  // Build a name<->value enum like nut.js's Key. Values are arbitrary but stable.
+  const names = [
+    'LeftControl',
+    'RightControl',
+    'LeftAlt',
+    'RightAlt',
+    'LeftShift',
+    'RightShift',
+    'LeftSuper',
+    'RightSuper',
+    'Tab',
+    'Up',
+    'Down',
+    'Left',
+    'Right',
+    'A',
+    'B',
+    'C',
+    'V',
+    'Delete',
+  ];
+  const Key: Record<string, number> = {};
+  const valueToName: Record<number, string> = {};
+  names.forEach((n, i) => {
+    Key[n] = i + 1;
+    valueToName[i + 1] = n;
+  });
+  const keyboard = {
+    config: { autoDelayMs: 0 },
+    async pressKey(k: number): Promise<void> {
+      keys.push(`down:${valueToName[k] ?? k}`);
+    },
+    async releaseKey(k: number): Promise<void> {
+      keys.push(`up:${valueToName[k] ?? k}`);
+    },
+  };
+  return { nut: { Key, keyboard }, keys };
+}
+
+/** Build an injector wired to the fake nut.js, bypassing the dynamic import. */
+function injectorWithFakeNut(): { inj: InputInjector; keys: string[] } {
+  const { nut, keys } = makeFakeNut();
+  const inj = new InputInjector();
+  // The native lib is unavailable on Linux/CI; inject the fake directly so the
+  // pure down/up sequencing can be exercised deterministically.
+  (inj as unknown as { nut: unknown }).nut = nut;
+  (inj as unknown as { loadAttempted: boolean }).loadAttempted = true;
+  return { inj, keys };
+}
+
+async function injectAll(inj: InputInjector, events: InputEvent[]): Promise<void> {
+  for (const e of events) await inj.inject(e);
+}
+
+describe('InputInjector held-modifier sequencing', () => {
+  it('keeps Ctrl held across Ctrl+Tab cycling — released ONCE at the final Ctrl-up', async () => {
+    const { inj, keys } = injectorWithFakeNut();
+    // Ctrl-down, Tab-down, Tab-up, Tab-down, Tab-up, Ctrl-up — Ctrl held the whole
+    // time (every event still carries the Ctrl mod bit while it is physically
+    // held). The OLD code released Ctrl on every Tab key-up; the fix must not.
+    await injectAll(inj, [
+      { t: 'k-down', code: 'ControlLeft', key: 'Control', mods: MOD_CTRL },
+      { t: 'k-down', code: 'Tab', key: 'Tab', mods: MOD_CTRL },
+      { t: 'k-up', code: 'Tab', key: 'Tab', mods: MOD_CTRL },
+      { t: 'k-down', code: 'Tab', key: 'Tab', mods: MOD_CTRL },
+      { t: 'k-up', code: 'Tab', key: 'Tab', mods: MOD_CTRL },
+      { t: 'k-up', code: 'ControlLeft', key: 'Control', mods: 0 },
+    ]);
+
+    expect(keys).toEqual([
+      'down:LeftControl',
+      'down:Tab',
+      'up:Tab',
+      'down:Tab',
+      'up:Tab',
+      'up:LeftControl',
+    ]);
+    // Ctrl pressed exactly once, released exactly once (only at the final Ctrl-up).
+    expect(keys.filter((k) => k === 'down:LeftControl')).toHaveLength(1);
+    expect(keys.filter((k) => k === 'up:LeftControl')).toHaveLength(1);
+    // No premature Ctrl release BETWEEN the two Tab releases.
+    const firstTabUp = keys.indexOf('up:Tab');
+    const lastTabUp = keys.lastIndexOf('up:Tab');
+    expect(keys.slice(firstTabUp, lastTabUp + 1)).not.toContain('up:LeftControl');
+  });
+
+  it('keeps Shift held across Arrow repeats (Shift+Arrow selection)', async () => {
+    const { inj, keys } = injectorWithFakeNut();
+    await injectAll(inj, [
+      { t: 'k-down', code: 'ShiftLeft', key: 'Shift', mods: MOD_SHIFT },
+      { t: 'k-down', code: 'ArrowRight', key: 'ArrowRight', mods: MOD_SHIFT },
+      { t: 'k-up', code: 'ArrowRight', key: 'ArrowRight', mods: MOD_SHIFT },
+      { t: 'k-down', code: 'ArrowRight', key: 'ArrowRight', mods: MOD_SHIFT },
+      { t: 'k-up', code: 'ArrowRight', key: 'ArrowRight', mods: MOD_SHIFT },
+      { t: 'k-down', code: 'ArrowRight', key: 'ArrowRight', mods: MOD_SHIFT },
+      { t: 'k-up', code: 'ArrowRight', key: 'ArrowRight', mods: MOD_SHIFT },
+      { t: 'k-up', code: 'ShiftLeft', key: 'Shift', mods: 0 },
+    ]);
+
+    expect(keys.filter((k) => k === 'down:LeftShift')).toHaveLength(1);
+    expect(keys.filter((k) => k === 'up:LeftShift')).toHaveLength(1);
+    // Shift's only release is the very last call.
+    expect(keys[keys.length - 1]).toBe('up:LeftShift');
+    // Three Right presses + releases, none interleaved with a Shift release.
+    expect(keys.filter((k) => k === 'down:Right')).toHaveLength(3);
+    expect(keys.filter((k) => k === 'up:Right')).toHaveLength(3);
+  });
+
+  it('still presses AND releases a modifier asserted only via a non-modifier key (press_key Ctrl+C)', async () => {
+    // The AI `press_key key='c' mods=ctrl` path sends NO separate Ctrl key events;
+    // the Ctrl bit rides on the C key-down/up. The transient Ctrl must be pressed
+    // before C and released on C's key-up (otherwise Ctrl would leak held).
+    const { inj, keys } = injectorWithFakeNut();
+    await injectAll(inj, [
+      { t: 'k-down', code: 'KeyC', key: 'c', mods: MOD_CTRL },
+      { t: 'k-up', code: 'KeyC', key: 'c', mods: MOD_CTRL },
+    ]);
+    expect(keys).toEqual(['down:LeftControl', 'down:C', 'up:C', 'up:LeftControl']);
+  });
+
+  it('does not release a physically-held modifier when a transient combo key-up arrives', async () => {
+    // Ctrl physically held, then a press_key-style Ctrl+A arrives WITHOUT its own
+    // Ctrl events. The A key-up must NOT release the physically-held Ctrl.
+    const { inj, keys } = injectorWithFakeNut();
+    await injectAll(inj, [
+      { t: 'k-down', code: 'ControlLeft', key: 'Control', mods: MOD_CTRL },
+      { t: 'k-down', code: 'KeyA', key: 'a', mods: MOD_CTRL },
+      { t: 'k-up', code: 'KeyA', key: 'a', mods: MOD_CTRL },
+      { t: 'k-up', code: 'ControlLeft', key: 'Control', mods: 0 },
+    ]);
+    expect(keys).toEqual(['down:LeftControl', 'down:A', 'up:A', 'up:LeftControl']);
+  });
+
+  it('replays an explicit buildKeyCombo chord (Alt+Tab) with correct down/up order', async () => {
+    const { inj, keys } = injectorWithFakeNut();
+    await injectAll(inj, buildKeyCombo(['alt', 'tab']));
+    // alt down, tab down, tab up, alt up — modifier released only by its own k-up.
+    expect(keys).toEqual(['down:LeftAlt', 'down:Tab', 'up:Tab', 'up:LeftAlt']);
   });
 });

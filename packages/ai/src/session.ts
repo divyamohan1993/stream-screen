@@ -53,6 +53,17 @@ export interface SessionPeer {
 export interface HostEntry {
   code: string;
   name: string;
+  /**
+   * The signaling WebSocket URL this host is reachable at, when discovery
+   * advertised one (built from the mDNS `address`/`port`, IPv6-bracketed). A host
+   * found via `/api/discover` on ANOTHER LAN machine runs its OWN signaling
+   * server at this endpoint — joining its code against this AI server's own
+   * `signalingUrl` would hit the wrong server and fail with `no-such-session`.
+   * Omitted when no usable address was advertised (e.g. `/api/sessions` rows or
+   * mDNS records without an address), in which case {@link connect} falls back to
+   * the configured {@link SessionOptions.signalingUrl}.
+   */
+  signalingUrl?: string;
 }
 
 /**
@@ -187,6 +198,28 @@ interface RestHost {
   code?: unknown;
   hostName?: unknown;
   name?: unknown;
+  /** mDNS-advertised address of the host's signaling server (`/api/discover`). */
+  address?: unknown;
+  /** mDNS-advertised port of the host's signaling server (`/api/discover`). */
+  port?: unknown;
+}
+
+/**
+ * Build a signaling WebSocket URL for a discovered host from its advertised
+ * `address`/`port`. Mirrors the viewer's `signalingUrlForHost`: a host found via
+ * mDNS on another LAN machine runs its own signaling server at that endpoint, so
+ * its code must be joined there — NOT against this AI server's own
+ * `signalingUrl`. Returns `undefined` when no usable address/port was advertised
+ * so the caller falls back to the configured signaling URL. IPv6 literals are
+ * bracketed so the resulting `host:port` authority is well-formed.
+ */
+export function signalingUrlForDiscoveredHost(h: RestHost): string | undefined {
+  const address = typeof h.address === 'string' ? h.address.trim() : '';
+  if (!address) return undefined;
+  const port = typeof h.port === 'number' ? h.port : Number(h.port);
+  if (!Number.isFinite(port) || port <= 0) return undefined;
+  const authority = address.includes(':') ? `[${address}]` : address;
+  return `ws://${authority}:${port}`;
 }
 
 /**
@@ -236,6 +269,14 @@ export class RemoteDesktopSession {
   /** Most recent monitor list reported by the host, if any. */
   private lastMonitors: MonitorInfo[] | null = null;
 
+  /**
+   * Maps a discovered host code to the signaling endpoint it was advertised at,
+   * captured from the last {@link listHosts}. Lets `connect(code)` alone reach a
+   * host on another LAN machine: a code present here joins against that host's
+   * own signaling server, not this AI server's default {@link signalingUrl}.
+   */
+  private discoveredEndpoints = new Map<string, string>();
+
   /** Most recent decoded video frame, kept for screenshot/OCR. */
   private lastFrame: CapturedFrame | null = null;
   /** Frame sink installed on the inbound track, if the runtime supports it. */
@@ -284,13 +325,28 @@ export class RemoteDesktopSession {
     // Prefer discovered LAN hosts (`/api/discover` returns full codes). It is an
     // open endpoint, so no token is needed.
     const discovered = await this.fetchHosts('/api/discover', timeoutMs);
-    if (discovered.length > 0) return discovered;
+    if (discovered.length > 0) return this.rememberEndpoints(discovered);
     // Fall back to this server's live sessions. The REST server REDACTS codes
     // (e.g. `****56`) for unauthenticated callers, so present the configured
     // bearer token to obtain UN-REDACTED, joinable codes. Without a token any
     // redacted/invalid code is dropped by `toHostEntry`, so the fallback only
     // ever returns USABLE host codes.
-    return this.fetchHosts('/api/sessions', timeoutMs, this.token);
+    return this.rememberEndpoints(await this.fetchHosts('/api/sessions', timeoutMs, this.token));
+  }
+
+  /**
+   * Refresh {@link discoveredEndpoints} from a freshly fetched host list so a
+   * later `connect(code)` resolves the endpoint that host was advertised at. The
+   * map is replaced (not merged) each call so it always reflects the latest
+   * discovery snapshot — stale endpoints never linger.
+   */
+  private rememberEndpoints(hosts: HostEntry[]): HostEntry[] {
+    this.discoveredEndpoints = new Map(
+      hosts
+        .filter((h): h is HostEntry & { signalingUrl: string } => Boolean(h.signalingUrl))
+        .map((h) => [h.code, h.signalingUrl]),
+    );
+    return hosts;
   }
 
   /**
@@ -345,14 +401,36 @@ export class RemoteDesktopSession {
       (typeof h.name === 'string' && h.name) ||
       (typeof h.hostName === 'string' && h.hostName) ||
       'host';
-    return { code, name };
+    // Carry the discovered signaling endpoint through so connect() can reach a
+    // host living on another LAN machine (its own signaling server), instead of
+    // joining the code against this AI server's default signalingUrl.
+    const signalingUrl = signalingUrlForDiscoveredHost(h);
+    return signalingUrl ? { code, name, signalingUrl } : { code, name };
+  }
+
+  /**
+   * Resolve the signaling endpoint to connect a given code against. Precedence:
+   *   1. an explicit `endpoint` passed to {@link connect} (caller override),
+   *   2. the endpoint discovered for this code in the last {@link listHosts}
+   *      (so `connect(code)` alone reaches a host on another LAN machine), then
+   *   3. this AI server's configured {@link signalingUrl} (manual codes).
+   */
+  private resolveSignalingUrl(code: string, endpoint?: string): string {
+    const explicit = endpoint?.trim();
+    if (explicit) return explicit;
+    return this.discoveredEndpoints.get(code) ?? this.signalingUrl;
   }
 
   /**
    * Connect to a host by its session code as a viewer. Idempotent for the same
    * code; reconnecting to a different code disconnects first.
+   *
+   * `endpoint` (the host's signaling WebSocket URL, e.g. `ws://192.168.1.50:8787`)
+   * is optional. When omitted, a code discovered via the last {@link listHosts}
+   * is joined against the endpoint it was advertised at; an unknown (manually
+   * entered) code falls back to the configured {@link SessionOptions.signalingUrl}.
    */
-  async connect(code: string): Promise<void> {
+  async connect(code: string, endpoint?: string): Promise<void> {
     if (!isValidSessionCode(code)) {
       throw new Error(`Invalid session code "${code}": expected 6–9 digits.`);
     }
@@ -361,9 +439,10 @@ export class RemoteDesktopSession {
 
     const ctor = await this.ensureRtc();
 
+    const signalingUrl = this.resolveSignalingUrl(code, endpoint);
     const signaling: SessionSignaling = this.opts.signalingClientFactory
-      ? this.opts.signalingClientFactory(this.signalingUrl)
-      : new SignalingClient(this.signalingUrl);
+      ? this.opts.signalingClientFactory(signalingUrl)
+      : new SignalingClient(signalingUrl);
     await signaling.connect();
 
     const peer = new Peer({

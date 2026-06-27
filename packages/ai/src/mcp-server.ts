@@ -67,6 +67,13 @@ function reqString(args: Record<string, unknown>, key: string): string {
   return v;
 }
 
+/** Read an optional string argument; undefined when absent or empty. */
+function optString(args: Record<string, unknown>, key: string): string | undefined {
+  const v = args[key];
+  if (typeof v !== 'string' || v.length === 0) return undefined;
+  return v;
+}
+
 /** Read a required number argument or throw a descriptive error. */
 function reqNumber(args: Record<string, unknown>, key: string): number {
   const v = args[key];
@@ -96,7 +103,7 @@ export async function dispatchTool(
         return text(JSON.stringify(hosts, null, 2));
       }
       case 'connect': {
-        await session.connect(reqString(args, 'code'));
+        await session.connect(reqString(args, 'code'), optString(args, 'signalingUrl'));
         return text(`Connected to host ${session.code}.`);
       }
       case 'disconnect': {
