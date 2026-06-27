@@ -33,7 +33,7 @@ runs identically in a browser and in node.
 | `@stream-screen/host` | Electron (Windows) | Captures screen + system audio, enumerates/switches monitors, runs the adaptive loop, injects remote input incl. special combos (`nut.js`), saves received files, tray UI. |
 | `@stream-screen/viewer` | browser (Vite + React) | Renders the remote screen+audio, captures input, file transfer, monitor switching, recording, chat, live stats dashboard. |
 | `@stream-screen/ai` | node | MCP (stdio) server + mirrored REST API so AI agents can drive a session (incl. monitors, chat, quality, key combos). |
-| `@stream-screen/e2e` | node + Chromium | Playwright: two real browser peers run a live WebRTC session (11 specs: session/input/adaptive/audio/file/control/keys/recording). |
+| `@stream-screen/e2e` | node + Chromium | Playwright: two real browser peers run a live WebRTC session (12 specs: session/input/adaptive/audio/file (both directions)/control/keys/recording). |
 
 ---
 
@@ -376,9 +376,10 @@ StreamScreen is **LAN-first** and trades WAN reach for simplicity and privacy.
 - **Identity within a room.** The server assigns each peer an authoritative id
   and overwrites the `from` field on every relayed message, so peers in a room
   cannot impersonate one another during signaling.
-- **Least privilege on the host.** The Electron host uses `contextIsolation`,
-  no `nodeIntegration` in the renderer, a preload contextBridge for IPC, and a
-  single-instance lock. OS input injection is an *optional* capability.
+- **Least privilege on the host.** The Electron host control window runs with
+  `sandbox: true`, `contextIsolation`, no `nodeIntegration` in the renderer, a
+  preload contextBridge for IPC, and a single-instance lock. OS input injection
+  is an *optional* capability.
 - **CORS.** The REST surfaces use permissive CORS deliberately, because they are
   intended to be reached from the LAN viewer/automation on other origins. Run the
   signaling and AI servers on trusted networks.

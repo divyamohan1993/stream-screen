@@ -55,6 +55,11 @@ test('viewer records the incoming stream and produces non-empty output', async (
     const result = await viewer.evaluate(() => window.__viewer.stopRecording());
     expect(result.bytes).toBeGreaterThan(0);
     expect(result.chunks).toBeGreaterThan(0);
+
+    // The produced blob must be a REAL WebM container, not just non-empty bytes:
+    // its first four bytes are the EBML magic 0x1A 0x45 0xDF 0xA3. We read them
+    // from the recorded Blob via arrayBuffer() on the viewer page.
+    expect(result.head).toEqual([0x1a, 0x45, 0xdf, 0xa3]);
   } finally {
     await hostCtx.close();
     await viewerCtx.close();

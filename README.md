@@ -485,7 +485,7 @@ npm test                      # unit tests across all workspaces (vitest)
 npm run e2e                   # Playwright e2e (bundles core, serves fixtures)
 ```
 
-What the **e2e** suite proves (no mocks for the hard parts) — **11 Playwright
+What the **e2e** suite proves (no mocks for the hard parts) — **12 Playwright
 specs**, two real Chromium peers each:
 
 - **`session.spec`** — host + viewer establish a *real* WebRTC P2P session; the
@@ -500,13 +500,17 @@ specs**, two real Chromium peers each:
 - **`file-transfer.spec`** — a multi-chunk (>3×16 KiB) file streams viewer → host
   over the real `file` data channel and reassembles with exact length and
   checksum (offer → accept → chunks → complete).
+- **`file-transfer-h2v.spec`** — the same transfer in the **host → viewer**
+  direction: a 50 KB file (4 of the 16 KiB chunks) streams over the real `file`
+  channel and reassembles on the viewer with exact length and checksum.
 - **`control.spec`** — multi-monitor enumeration + runtime switch (host acks
   `monitor-switched` after an in-place `replaceTrack`) and chat round-tripping in
   both directions over the `control` channel.
 - **`keys.spec`** — Ctrl+Alt+Del / Win / arbitrary combos arrive on the host as
   the exact ordered key events with the correct cumulative modifier bitmask.
 - **`recording.spec`** — the viewer records the incoming remote stream with
-  `MediaRecorder` and produces non-empty `.webm` output.
+  `MediaRecorder` and produces a real `.webm`: non-empty output whose first four
+  bytes are the EBML magic (`0x1A 0x45 0xDF 0xA3`).
 
 Per-package tests can also be run directly, e.g.
 `npm -w @stream-screen/core test` or `npm -w @stream-screen/viewer test`.

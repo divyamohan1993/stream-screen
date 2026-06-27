@@ -45,6 +45,12 @@ declare global {
       getActiveMonitor(): string;
       getReceivedFiles(): ReceivedFile[];
       sendChat(text: string): void;
+      sendFileToViewer(
+        id: string,
+        name: string,
+        mime: string,
+        bytesArray: number[],
+      ): Promise<boolean>;
     };
     __viewer: {
       getState(): ViewerState;
@@ -71,8 +77,14 @@ declare global {
         mime: string,
         bytesArray: number[],
       ): Promise<boolean>;
+      getReceivedFiles(): ReceivedFile[];
+      getReceivedFile(id: string): ReceivedFile | null;
       startRecording(): boolean;
-      stopRecording(): Promise<{ bytes: number; chunks: number }>;
+      stopRecording(): Promise<{
+        bytes: number;
+        chunks: number;
+        head: number[];
+      }>;
     };
     __hostError?: string;
     __viewerError?: string;

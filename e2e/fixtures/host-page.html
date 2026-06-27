@@ -21,6 +21,7 @@
         SignalingClient,
         AdaptiveController,
         createReceiver,
+        createSender,
       } from './core.bundle.js';
 
       const params = new URLSearchParams(location.search);
@@ -128,6 +129,30 @@
         getReceivedFiles: () => state.receivedFiles.map((f) => ({ ...f })),
         sendChat: (text) => {
           peer.sendControl({ t: 'chat', text, ts: Date.now() });
+        },
+        // --- File transfer (host -> viewer), the reverse direction. ---
+        // Streams `bytesArray` to the viewer using the core createSender over the
+        // real control + file data channels: a `file-offer`, the viewer's
+        // `file-accept`, the binary chunks, then `file-complete`. Resolves once
+        // every chunk has been handed off.
+        sendFileToViewer: async (id, name, mime, bytesArray) => {
+          const data = new Uint8Array(bytesArray);
+          const sender = createSender({
+            meta: { id, name, size: data.byteLength, mime },
+            data,
+            send: (m) => peer.sendControl(m),
+            sendChunk: (buf) => peer.sendFileChunk(buf),
+            drain: () => peer.drainFile(),
+          });
+          // Release the chunk stream once the viewer's file-accept arrives.
+          peer.onControl((m) => {
+            if (m.t === 'file-accept' && m.id === id) sender.accept();
+            if ((m.t === 'file-reject' || m.t === 'file-error') && m.id === id) {
+              sender.abort(m.t);
+            }
+          });
+          await sender.start();
+          return true;
         },
       };
 

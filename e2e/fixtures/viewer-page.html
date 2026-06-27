@@ -18,6 +18,7 @@
         Peer,
         SignalingClient,
         createSender,
+        createReceiver,
       } from './core.bundle.js';
 
       const params = new URLSearchParams(location.search);
@@ -46,10 +47,49 @@
       const signaling = new SignalingClient(wsUrl);
       const peer = new Peer({ role: 'viewer', signaling });
 
+      // --- Inbound file reception (host -> viewer), the reverse direction. ---
+      // Mirrors the host page's receiver wiring: createReceiver does the
+      // framing/reassembly, and we finalize only once the sender has signalled
+      // file-complete AND every offered byte has arrived (the control-channel
+      // file-complete can race ahead of the trailing chunks on the file channel).
+      const receivedFiles = []; // { id, name, size, length, checksum }
+      const inboundTransfers = new Map(); // id -> { receiver, meta, size, completed, done }
+
+      // Sum every byte (mod 2^32) — the same cheap content checksum the host uses.
+      function fileChecksum(bytes) {
+        let sum = 0;
+        for (let i = 0; i < bytes.length; i++) {
+          sum = (sum + bytes[i]) >>> 0;
+        }
+        return sum;
+      }
+
+      function recordInboundFile(t) {
+        const data = t.receiver.finish();
+        receivedFiles.push({
+          id: t.meta.id,
+          name: t.meta.name,
+          size: t.meta.size,
+          length: data.byteLength,
+          checksum: fileChecksum(data),
+        });
+      }
+
+      function maybeFinishInbound(id) {
+        const t = inboundTransfers.get(id);
+        if (!t || t.done) return;
+        if (t.completed && t.receiver.received >= t.size) {
+          t.done = true;
+          recordInboundFile(t);
+          inboundTransfers.delete(id);
+        }
+      }
+
       // --- Recording state (MediaRecorder over the received stream). ---
       let recorder = null;
       let recordedBytes = 0;
       let recordedChunks = 0;
+      let recordedBlobs = []; // kept so we can prove the container is real WebM
 
       // --- Test hooks the spec reads / calls. ---
       window.__viewer = {
@@ -126,11 +166,18 @@
           await sender.start();
           return true;
         },
+        // --- Inbound files (host -> viewer). ---
+        getReceivedFiles: () => receivedFiles.map((f) => ({ ...f })),
+        getReceivedFile: (id) => {
+          const f = receivedFiles.find((x) => x.id === id);
+          return f ? { ...f } : null;
+        },
         // --- Recording (MediaRecorder of the incoming stream). ---
         startRecording: () => {
           if (!remoteStream) return false;
           recordedBytes = 0;
           recordedChunks = 0;
+          recordedBlobs = [];
           // Record video only — robust across builds regardless of audio track.
           const opts = {};
           if (window.MediaRecorder && MediaRecorder.isTypeSupported?.('video/webm')) {
@@ -141,6 +188,7 @@
             if (e.data && e.data.size > 0) {
               recordedBytes += e.data.size;
               recordedChunks += 1;
+              recordedBlobs.push(e.data);
             }
           };
           recorder.start(100); // emit a blob every 100ms
@@ -149,10 +197,24 @@
         stopRecording: () =>
           new Promise((resolve) => {
             if (!recorder) {
-              resolve({ bytes: 0, chunks: 0 });
+              resolve({ bytes: 0, chunks: 0, head: [] });
               return;
             }
-            recorder.onstop = () => resolve({ bytes: recordedBytes, chunks: recordedChunks });
+            recorder.onstop = async () => {
+              // Assemble the full recording into one Blob and read its first 4
+              // bytes through arrayBuffer() so the spec can assert the EBML magic
+              // (0x1A 0x45 0xDF 0xA3) — i.e. a real, decodable WebM container.
+              const mime = recorder.mimeType || 'video/webm';
+              const blob = new Blob(recordedBlobs, { type: mime });
+              let head = [];
+              try {
+                const ab = await blob.slice(0, 4).arrayBuffer();
+                head = Array.from(new Uint8Array(ab));
+              } catch {
+                head = [];
+              }
+              resolve({ bytes: recordedBytes, chunks: recordedChunks, head });
+            };
             recorder.stop();
           }),
       };
@@ -195,9 +257,46 @@
           case 'monitor-switched':
             state.monitorSwitched = m.id;
             break;
+          case 'file-offer': {
+            const meta = { id: m.id, name: m.name, size: m.size, mime: m.mime };
+            inboundTransfers.set(m.id, {
+              receiver: createReceiver({ meta }),
+              meta,
+              size: m.size,
+              completed: false,
+              done: false,
+            });
+            // Auto-accept: release the host's chunk stream.
+            peer.sendControl({ t: 'file-accept', id: m.id });
+            break;
+          }
+          case 'file-complete': {
+            const t = inboundTransfers.get(m.id);
+            if (t) {
+              t.completed = true;
+              maybeFinishInbound(m.id);
+            }
+            break;
+          }
+          case 'file-error':
+          case 'file-reject':
+            inboundTransfers.delete(m.id);
+            break;
           default:
             break;
         }
+      });
+
+      // Route inbound binary file chunks to the active (last not-done) transfer,
+      // then re-check completion in case the final chunk lands after file-complete.
+      peer.onFileChunk((buf) => {
+        let activeId = null;
+        for (const [id, t] of inboundTransfers) {
+          if (!t.done) activeId = id;
+        }
+        if (activeId === null) return;
+        inboundTransfers.get(activeId).receiver.push(buf);
+        maybeFinishInbound(activeId);
       });
 
       (async () => {

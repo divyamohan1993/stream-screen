@@ -81,7 +81,7 @@ function createControlWindow(): void {
       preload: join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
   });
   void controlWindow.loadFile(join(__dirname, 'renderer', 'index.html'));
