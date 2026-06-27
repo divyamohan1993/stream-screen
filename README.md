@@ -119,7 +119,7 @@ What a modern remote desktop should have, and where StreamScreen stands:
    │   HOST  (Windows)        │   SDP offer/answer + ICE + room join  │   VIEWER  (any browser)  │
    │   Electron app           │◄────────────────────────────────────►│   Vite + React web app   │
    │                          │            ws://LAN:8787              │                          │
-   │  desktopCapturer ─┐      │                                       │   <video> remote screen  │
+   │  desktopCapturer ─┐      │                                       │   remote screen video    │
    │  nut.js inject ◄──┤      │                                       │   input capture          │
    │  AdaptiveController│      │        mDNS discovery (LAN)           │   stats dashboard        │
    └─────────┬─────────┘      │   _streamscreen._tcp advertise/browse └─────────┬────────────────┘

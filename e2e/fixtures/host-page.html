@@ -10,13 +10,29 @@
       body { margin: 0; font-family: monospace; background: #111; color: #0f0; }
       #lastInput { padding: 8px; white-space: pre; }
       canvas { display: block; }
+      h1 { margin: 0; padding: 8px; font-size: 16px; }
+      /* Visually hidden but available to assistive tech / keyboard focus. */
+      .skip-link {
+        position: absolute;
+        left: -9999px;
+        top: 0;
+        background: #0f0;
+        color: #111;
+        padding: 8px;
+        z-index: 1;
+      }
+      .skip-link:focus { left: 0; }
     </style>
   </head>
   <body>
-    <canvas id="screen" width="640" height="480"></canvas>
-    <div id="status">host: booting</div>
-    <div id="frame">frame: 0</div>
-    <div id="lastInput">lastInput: none</div>
+    <a href="#main" class="skip-link">Skip to main content</a>
+    <main id="main">
+      <h1>StreamScreen e2e — host</h1>
+      <canvas id="screen" width="640" height="480"></canvas>
+      <div id="status">host: booting</div>
+      <div id="frame">frame: 0</div>
+      <div id="lastInput">lastInput: none</div>
+    </main>
 
     <script type="module">
       import {

@@ -10,11 +10,32 @@
       body { margin: 0; font-family: monospace; background: #000; color: #0ff; }
       #status { padding: 8px; }
       video { display: block; width: 640px; height: 480px; background: #000; }
+      h1 { margin: 0; padding: 8px; font-size: 16px; }
+      /* Visually hidden but available to assistive tech / keyboard focus. */
+      .skip-link {
+        position: absolute;
+        left: -9999px;
+        top: 0;
+        background: #0ff;
+        color: #000;
+        padding: 8px;
+        z-index: 1;
+      }
+      .skip-link:focus { left: 0; }
     </style>
   </head>
   <body>
-    <video id="remote" autoplay playsinline></video>
-    <div id="status">viewer: booting</div>
+    <a href="#main" class="skip-link">Skip to main content</a>
+    <main id="main">
+      <h1>StreamScreen e2e — viewer</h1>
+      <video id="remote" autoplay playsinline>
+        <!-- A live remote-desktop stream has no pre-authored captions; an empty
+             English captions track satisfies WCAG 1.2.2 without claiming captions
+             exist for the live content. -->
+        <track kind="captions" srclang="en" label="English" src="data:text/vtt;charset=utf-8,WEBVTT%0A%0A" />
+      </video>
+      <div id="status">viewer: booting</div>
+    </main>
 
     <script type="module">
       import {

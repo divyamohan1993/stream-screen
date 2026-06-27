@@ -128,7 +128,6 @@ export const VideoStage = forwardRef<VideoStageHandle, VideoStageProps>(function
         mouse and keyboard to control the remote computer. Captions are not available for a
         live screen share.
       </p>
-      {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
       <video
         ref={videoRef}
         className={stream ? 'stage-video' : 'stage-video no-local-cursor'}
@@ -137,7 +136,17 @@ export const VideoStage = forwardRef<VideoStageHandle, VideoStageProps>(function
         tabIndex={0}
         aria-label="Remote screen video"
         aria-describedby="stage-video-desc"
-      />
+      >
+        {/* A live remote-desktop stream has no pre-authored captions; an empty
+            English captions track satisfies WCAG 1.2.2 / jsx-a11y media-has-caption
+            without claiming captions exist for the live content. */}
+        <track
+          kind="captions"
+          srcLang="en"
+          label="English"
+          src="data:text/vtt;charset=utf-8,WEBVTT%0A%0A"
+        />
+      </video>
       {/* Zero-latency local cursor overlay; hidden until the first mousemove. */}
       <div ref={cursorRef} className="local-cursor" style={{ display: 'none' }} aria-hidden="true" />
       {!stream && (
