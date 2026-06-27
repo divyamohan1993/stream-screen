@@ -179,9 +179,16 @@ Key points:
   (rotating it would dodge the per-source budget). Set `STREAMSCREEN_TRUST_PROXY`
   (or `trustProxy: true`) only when behind a trusted reverse proxy to honor the
   left-most XFF entry as the client address.
-- **Executable bin.** The signaling entrypoint (`src/index.ts`) begins with a
-  `#!/usr/bin/env node` shebang so the `streamscreen-signaling` bin
-  (package.json `bin` → `dist/index.js`) runs directly on Unix.
+- **Executable bins (symlink-safe).** The signaling and AI entrypoints
+  (`signaling/src/index.ts`, `ai/src/index.ts`) begin with a `#!/usr/bin/env node`
+  shebang so the `streamscreen-signaling` / `streamscreen-ai` bins (package.json
+  `bin` → `dist/index.js`) run directly on Unix. npm installs those `.bin` entries
+  as **symlinks** to `dist/index.js`, so when launched through the symlink
+  `process.argv[1]` is the symlink path while `import.meta.url` is the resolved
+  target — a plain URL equality check is false and the bin would exit without
+  starting the server. Both guards (`isMainEntry` / `isDirectRun`) therefore
+  **resolve the realpath of `argv[1]`** (following symlinks) before comparing, with
+  a try/catch fallback to the direct URL comparison if realpath throws.
 - **Host start ordering + ack.** `HostSession.start` (`host/host-session.ts`)
   **acquires the capture stream first**, then connects, joins as host, and
   **awaits the `joined` acknowledgement** before attaching media and starting the
@@ -454,7 +461,13 @@ flowchart LR
   viewer picker allows selecting multiple files) from corrupting one another. The
   receiver reassembles deterministically (the seq lets it slot out-of-order
   frames and detect gaps/duplicates) and reports `file-progress`; the Windows host
-  persists received files via `host/src/file-save.ts`.
+  persists received files via `host/src/file-save.ts`. For host→viewer sends,
+  `HostSession.sendFile` registers a **per-transfer** control handler to route the
+  viewer's `file-accept`/`file-reject`/`file-error` reply to the right sender;
+  `Peer.onControl` now returns a disposer and `sendFile` calls it in a `finally`
+  (and drops its sender reference) the moment the transfer settles, so the handler
+  closure and the sender's cached framed chunks are **released after each transfer**
+  rather than accumulating on the Peer for the session's lifetime.
 - **Recording.** Purely viewer-side and local: a `MediaRecorder` over the
   incoming remote `MediaStream` yields a downloadable `.webm`. Nothing is uploaded
   and there is no length cap.

@@ -9,8 +9,11 @@
  * The fix: only run the server when the resolved CLI entry (as a file URL)
  * exactly equals this module's URL.
  */
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { isDirectRun } from '../src/index.js';
 
@@ -43,5 +46,91 @@ describe('isDirectRun', () => {
     const entry = fileURLToPath(moduleUrl);
     expect(entry.startsWith('file://')).toBe(false);
     expect(isDirectRun(entry, moduleUrl)).toBe(true);
+  });
+});
+
+/**
+ * Regression for the symlinked `.bin` entrypoint (P2). npm installs the
+ * `streamscreen-ai` bin as a symlink to `dist/index.js`. When the symlinked
+ * shebang is executed, `process.argv[1]` is the symlink path while
+ * `import.meta.url` is the real `dist/index.js`. The guard must resolve
+ * realpaths before comparing so the installed CLI actually starts the server.
+ */
+describe('isDirectRun — symlinked bin entry', () => {
+  // Map a path string to the realpath it should resolve to. Anything not in the
+  // map is treated as a real file that resolves to itself.
+  const linkTarget = '/app/node_modules/@stream-screen/ai/dist/index.js';
+  const binSymlink = '/app/node_modules/.bin/streamscreen-ai';
+  const moduleUrl = pathToFileURL(linkTarget).href;
+
+  const fakeRealpath =
+    (links: Record<string, string>) =>
+    (p: string): string =>
+      links[p] ?? p;
+
+  it('is TRUE when argv[1] is a symlink whose realpath === the module file', () => {
+    const realpath = fakeRealpath({ [binSymlink]: linkTarget });
+    // Without realpath resolution the plain URLs differ...
+    expect(pathToFileURL(binSymlink).href).not.toBe(moduleUrl);
+    // ...but resolving the symlink makes them match.
+    expect(isDirectRun(binSymlink, moduleUrl, realpath)).toBe(true);
+  });
+
+  it('is FALSE for a different entrypoint that is also named index.js', () => {
+    const otherIndex = '/app/index.js';
+    const realpath = fakeRealpath({});
+    expect(isDirectRun(otherIndex, moduleUrl, realpath)).toBe(false);
+  });
+
+  it('is FALSE for an unrelated symlink that resolves elsewhere', () => {
+    const realpath = fakeRealpath({ [binSymlink]: '/app/some/other/main.js' });
+    expect(isDirectRun(binSymlink, moduleUrl, realpath)).toBe(false);
+  });
+
+  it('falls back to the URL comparison when realpath throws', () => {
+    const throwing = (): never => {
+      throw new Error('ENOENT');
+    };
+    // Exact URL match still succeeds without ever needing realpath.
+    const entry = fileURLToPath(moduleUrl);
+    expect(isDirectRun(entry, moduleUrl, throwing)).toBe(true);
+    // A symlink path that would only match via realpath now returns false
+    // because realpath throws and we fall back to the (non-matching) URL check.
+    expect(isDirectRun(binSymlink, moduleUrl, throwing)).toBe(false);
+  });
+});
+
+/**
+ * End-to-end variant using a real temp symlink on disk (no injection), to prove
+ * the default `realpathSync` resolver behaves as expected.
+ */
+describe('isDirectRun — real on-disk symlink', () => {
+  let dir: string;
+  let realModule: string;
+  let symlink: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ss-ai-directrun-'));
+    realModule = join(dir, 'index.js');
+    writeFileSync(realModule, '// fake module\n');
+    symlink = join(dir, 'streamscreen-ai');
+    symlinkSync(realModule, symlink);
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is TRUE when argv[1] is a real symlink to the module file', () => {
+    const moduleUrl = pathToFileURL(realModule).href;
+    expect(pathToFileURL(symlink).href).not.toBe(moduleUrl);
+    expect(isDirectRun(symlink, moduleUrl)).toBe(true);
+  });
+
+  it('is FALSE for a real sibling file that is not the module', () => {
+    const other = join(dir, 'other.js');
+    writeFileSync(other, '// other\n');
+    const moduleUrl = pathToFileURL(realModule).href;
+    expect(isDirectRun(other, moduleUrl)).toBe(false);
   });
 });

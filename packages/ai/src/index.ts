@@ -16,7 +16,8 @@
  * Always free, no time limits, no bitrate caps.
  */
 
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { startMcpServer } from './mcp-server.js';
 import { startRestApi } from './rest-api.js';
@@ -56,15 +57,41 @@ export async function main(): Promise<void> {
  * app's entrypoint is very commonly named `index.js`, which would spuriously
  * start the server.
  *
- * @param entry    The CLI entrypoint path (typically `process.argv[1]`).
- * @param moduleUrl This module's URL (typically `import.meta.url`).
+ * SYMLINK CAVEAT (P2): npm installs the `streamscreen-ai` `.bin` entry as a
+ * SYMLINK to `dist/index.js` on Unix. Executing the symlinked shebang leaves
+ * `process.argv[1]` as the symlink path, while `import.meta.url` resolves to the
+ * real `dist/index.js`. A naive URL comparison then returns false and the
+ * installed CLI exits without starting the server. We therefore resolve the
+ * realpath of both the entry and the module file before comparing. If realpath
+ * throws (e.g. the path no longer exists), we fall back to the plain file-URL
+ * comparison so behaviour never regresses below the previous exact match.
+ *
+ * @param entry      The CLI entrypoint path (typically `process.argv[1]`).
+ * @param moduleUrl  This module's URL (typically `import.meta.url`).
+ * @param realpath   Injectable realpath resolver (defaults to `realpathSync`),
+ *                   for testability.
  */
 export function isDirectRun(
   entry: string | undefined,
   moduleUrl: string,
+  realpath: (p: string) => string = realpathSync,
 ): boolean {
   if (!entry) return false;
-  return pathToFileURL(entry).href === moduleUrl;
+
+  const entryUrl = pathToFileURL(entry).href;
+  if (entryUrl === moduleUrl) return true;
+
+  // Resolve symlinks on both sides so a symlinked `.bin` entry that points at
+  // the real module file is recognised as a direct run.
+  try {
+    const realEntry = realpath(entry);
+    const realModule = realpath(fileURLToPath(moduleUrl));
+    return pathToFileURL(realEntry).href === pathToFileURL(realModule).href;
+  } catch {
+    // realpath failed (missing path, permissions, etc.) — fall back to the
+    // exact URL comparison already computed above (which was not a match).
+    return false;
+  }
 }
 
 if (isDirectRun(process.argv[1], import.meta.url)) {

@@ -521,9 +521,19 @@ export class Peer {
   /**
    * Register a handler for inbound {@link ControlMessage}s. The second argument
    * is the originating remote id (the viewer it came from), for attribution.
+   *
+   * Returns a disposer that unregisters this exact handler. Callers that add a
+   * short-lived, per-operation handler (e.g. a per-transfer file-accept routing
+   * handler) MUST call the disposer once the operation settles so the handler —
+   * and everything its closure retains — can be garbage-collected; otherwise the
+   * handler set (and the captured state) grows unbounded for the session's life.
+   * Existing callers may ignore the return value with no behavior change.
    */
-  onControl(cb: (m: ControlMessage, remoteId: string) => void): void {
+  onControl(cb: (m: ControlMessage, remoteId: string) => void): () => void {
     this.controlHandlers.add(cb);
+    return () => {
+      this.controlHandlers.delete(cb);
+    };
   }
 
   /**

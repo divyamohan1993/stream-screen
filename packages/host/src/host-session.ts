@@ -29,6 +29,7 @@ import {
   type AdaptiveStats,
   type ControlMessage,
   type FileMeta,
+  type FileSender,
   type InputEvent,
   type MonitorInfo,
   type QualityPreset,
@@ -657,7 +658,7 @@ export class HostSession {
     if (!peer) throw new Error('HostSession.sendFile: session not started');
     const id = `host-${Date.now()}-${this.outboundSeq++}`;
     const meta: FileMeta = { id, name: file.name, size: file.data.byteLength, mime: file.mime };
-    const sender = createSender({
+    let sender: FileSender | null = createSender({
       meta,
       data: file.data,
       send: (msg) => peer.sendControl(msg, viewerId),
@@ -670,13 +671,26 @@ export class HostSession {
     // should drive the transfer; on a broadcast, the first accept releases it.
     const onCtl = (m: ControlMessage, fromViewer: string): void => {
       if (viewerId !== undefined && fromViewer !== viewerId) return;
-      if (m.t === 'file-accept' && m.id === id) sender.accept();
+      if (m.t === 'file-accept' && m.id === id) sender?.accept();
       else if ((m.t === 'file-reject' || m.t === 'file-error') && m.id === id) {
-        sender.abort(m.t === 'file-error' ? m.message : 'rejected by viewer');
+        sender?.abort(m.t === 'file-error' ? m.message : 'rejected by viewer');
       }
     };
-    peer.onControl(onCtl);
-    await sender.start();
+    // Register the per-transfer routing handler and capture its disposer so we
+    // can remove it the instant the transfer settles. Without this, the closure
+    // (and through it the sender, which retains the whole file's framed chunks)
+    // would stay alive on the Peer's handler set until the session stops, so
+    // every completed/aborted host->viewer send leaks its file bytes — repeated
+    // large sends grow renderer memory unbounded.
+    const removeCtl = peer.onControl(onCtl);
+    try {
+      await sender.start();
+    } finally {
+      removeCtl();
+      // Drop the sender reference so its cached framed chunks become eligible
+      // for GC; the now-removed closure no longer pins them either.
+      sender = null;
+    }
   }
 
   /** Send a chat message to the viewer. */

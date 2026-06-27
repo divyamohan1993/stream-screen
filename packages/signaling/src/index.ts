@@ -24,6 +24,8 @@
 
 import { hostname } from 'node:os';
 import { networkInterfaces } from 'node:os';
+import { realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { SignalingServer } from './server.js';
 import { Discovery } from './discovery.js';
 import { createRestServer } from './rest.js';
@@ -196,18 +198,43 @@ function logUrls(port: number): void {
 }
 
 /**
- * Run directly (`node dist/index.js` / `tsx src/index.ts`) but stay importable
- * for tests/embedding. Compares the resolved entry module URL to this file.
+ * Decide whether this module is the process entrypoint (run directly via
+ * `node dist/index.js` / `tsx src/index.ts`) versus merely imported.
+ *
+ * npm installs the `streamscreen-signaling` .bin entry as a SYMLINK to
+ * dist/index.js on Unix. When launched through that symlink, `process.argv[1]`
+ * is the SYMLINK path while `import.meta.url` is the RESOLVED target, so a plain
+ * equality check is false and the bin would exit without starting the server.
+ *
+ * To handle that we resolve the real path of argv[1] (following symlinks) and
+ * compare it — as a file URL — against the module URL. realpath is wrapped in
+ * try/catch: if it throws (e.g. the file is missing) we fall back to the direct
+ * URL comparison. Pure and dependency-injected so it is unit-testable.
  */
-const isMain = (() => {
+export function isMainEntry(
+  moduleUrl: string,
+  argv1: string | undefined,
+  realpath: (p: string) => string = realpathSync,
+): boolean {
+  if (!argv1) return false;
+  // Direct comparison (also the fallback when realpath is unavailable/throws).
+  const directMatch = (entry: string): boolean => {
+    try {
+      return moduleUrl === pathToFileURL(entry).href || moduleUrl.endsWith(entry);
+    } catch {
+      return false;
+    }
+  };
   try {
-    const entry = process.argv[1];
-    if (!entry) return false;
-    return import.meta.url === new URL(`file://${entry}`).href || import.meta.url.endsWith(entry);
+    const resolved = realpath(argv1);
+    if (moduleUrl === pathToFileURL(resolved).href) return true;
   } catch {
-    return false;
+    // realpath failed (missing file, perms, ...) — fall through to direct match.
   }
-})();
+  return directMatch(argv1);
+}
+
+const isMain = isMainEntry(import.meta.url, process.argv[1]);
 
 if (isMain) {
   start().catch((err) => {
