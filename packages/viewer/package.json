@@ -1,0 +1,29 @@
+{
+  "name": "@stream-screen/viewer",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "StreamScreen web viewer: WebRTC remote screen, input capture, live adaptive stats dashboard. Any browser; also the AI-friendly surface. Always free, no time limits, no bitrate caps.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@stream-screen/core": "*",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.0.1",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "jsdom": "^25.0.0",
+    "typescript": "^5.5",
+    "vite": "^5.4.0",
+    "vitest": "^2"
+  }
+}

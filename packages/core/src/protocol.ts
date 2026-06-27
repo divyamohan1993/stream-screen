@@ -92,3 +92,48 @@ export interface SessionInfo {
   createdAt: number;
   viewers: number;
 }
+
+/** Valid {@link SignalMessage.type} discriminants. */
+const SIGNAL_TYPES = new Set<SignalMessage['type']>([
+  'join',
+  'joined',
+  'peer-joined',
+  'peer-left',
+  'offer',
+  'answer',
+  'ice',
+  'error',
+  'hosts',
+  'ping',
+  'pong',
+]);
+
+/** Valid {@link InputEvent.t} discriminants. */
+const INPUT_TYPES = new Set<InputEvent['t']>([
+  'm-move',
+  'm-down',
+  'm-up',
+  'm-wheel',
+  'k-down',
+  'k-up',
+  'clipboard',
+]);
+
+/** Runtime guard: is `v` a structurally-valid {@link SignalMessage}? */
+export function isSignalMessage(v: unknown): v is SignalMessage {
+  if (v === null || typeof v !== 'object') return false;
+  const t = (v as { type?: unknown }).type;
+  return typeof t === 'string' && SIGNAL_TYPES.has(t as SignalMessage['type']);
+}
+
+/** Runtime guard: is `v` a structurally-valid {@link InputEvent}? */
+export function isInputEvent(v: unknown): v is InputEvent {
+  if (v === null || typeof v !== 'object') return false;
+  const t = (v as { t?: unknown }).t;
+  return typeof t === 'string' && INPUT_TYPES.has(t as InputEvent['t']);
+}
+
+/** A session code is 6–9 digits (no accounts, no relay — just this code gates a session). */
+export function isValidSessionCode(code: string): boolean {
+  return /^[0-9]{6,9}$/.test(code);
+}

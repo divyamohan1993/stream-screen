@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>StreamScreen e2e — viewer</title>
+    <style>
+      body { margin: 0; font-family: monospace; background: #000; color: #0ff; }
+      #status { padding: 8px; }
+      video { display: block; width: 640px; height: 480px; background: #000; }
+    </style>
+  </head>
+  <body>
+    <video id="remote" autoplay playsinline muted></video>
+    <div id="status">viewer: booting</div>
+
+    <script type="module">
+      import { Peer, SignalingClient } from './core.bundle.js';
+
+      const params = new URLSearchParams(location.search);
+      const code = params.get('code') ?? '123456';
+      const wsUrl = `ws://${location.host}`;
+
+      const statusEl = document.getElementById('status');
+      const video = document.getElementById('remote');
+
+      const state = {
+        ready: false,
+        connectionState: 'new',
+        gotTrack: false,
+        dataChannelOpen: false,
+      };
+
+      const signaling = new SignalingClient(wsUrl);
+      const peer = new Peer({ role: 'viewer', signaling });
+
+      // --- Test hooks the spec reads / calls. ---
+      window.__viewer = {
+        getState: () => ({ ...state }),
+        getVideoSize: () => ({ width: video.videoWidth, height: video.videoHeight }),
+        isVideoPlaying: () => video.videoWidth > 0 && video.videoHeight > 0 && !video.paused,
+        getStats: async () => {
+          try {
+            return await peer.getStats();
+          } catch (e) {
+            return { error: String(e) };
+          }
+        },
+        sendInput: (ev) => {
+          peer.sendInput(ev);
+        },
+      };
+
+      peer.on('state', (s) => {
+        state.connectionState = s;
+        statusEl.textContent = `viewer: ${s}`;
+      });
+
+      peer.on('track', (_track, remoteStream) => {
+        state.gotTrack = true;
+        if (remoteStream) {
+          video.srcObject = remoteStream;
+        } else {
+          const ms = new MediaStream([_track]);
+          video.srcObject = ms;
+        }
+        video.play().catch(() => {});
+      });
+
+      peer.on('datachannel', (ch) => {
+        const markOpen = () => {
+          state.dataChannelOpen = true;
+        };
+        if (ch.readyState === 'open') markOpen();
+        ch.addEventListener?.('open', markOpen);
+        ch.onopen = markOpen;
+      });
+
+      (async () => {
+        await signaling.connect();
+        await peer.start();
+        signaling.join({ code, role: 'viewer', name: 'e2e-viewer' });
+        state.ready = true;
+        statusEl.textContent = 'viewer: joined';
+      })().catch((err) => {
+        statusEl.textContent = `viewer: error ${String(err)}`;
+        window.__viewerError = String(err);
+      });
+    </script>
+  </body>
+</html>

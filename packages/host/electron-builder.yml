@@ -1,0 +1,35 @@
+appId: com.streamscreen.host
+productName: StreamScreen Host
+copyright: StreamScreen — always free, no time limits.
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - package.json
+
+# The native input library is an optional dependency; bundle it if present on
+# the build machine, but never fail the build when it is absent.
+asarUnpack:
+  - "**/node_modules/@nut-tree-fork/**"
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  shortcutName: StreamScreen Host
+
+portable:
+  artifactName: ${productName}-${version}-portable.${ext}

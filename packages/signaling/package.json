@@ -1,0 +1,38 @@
+{
+  "name": "@stream-screen/signaling",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "StreamScreen zero-config LAN signaling server: WebSocket SDP/ICE relay, mDNS discovery, and a tiny REST health/list API. Always free, no time limits.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "bin": {
+    "streamscreen-signaling": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "bonjour-service": "^1.2.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@stream-screen/core": "*",
+    "@types/node": "^20",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  }
+}

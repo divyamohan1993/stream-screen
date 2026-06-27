@@ -7,3 +7,7 @@ playwright-report
 test-results
 *.log
 packages/host/release
+e2e/fixtures/core.bundle.js
+e2e/fixtures/core.bundle.d.ts
+e2e/tests/core.bundle.d.ts
+.cache

@@ -1,6 +1,440 @@
 # StreamScreen
 
-Self-hosted, LAN-first, always-free, unlimited-time peer-to-peer remote desktop for Windows over WebRTC.
-No accounts, no relay/cloud, no time limits, no bitrate caps.
+**A free, unlimited-time, no-limits LAN remote desktop for Windows — over WebRTC.**
 
-> Placeholder — expanded in the Docs phase. See `ARCHITECTURE.md` for the system overview.
+StreamScreen lets you view and control another Windows PC on your Wi‑Fi/LAN, live
+and in real time, with peer-to-peer video and remote keyboard/mouse. It is
+self-hosted and open: there are **no accounts, no cloud relay, no usage metering,
+no bitrate caps, and — critically — no session time limits.**
+
+> ### Why this exists
+> Tools like **AnyDesk** cut you off in the free tier (the well-known ~**15‑minute
+> session limit**, plus "commercial use" nags and connection throttling).
+> StreamScreen has **none of that.** A session runs *exactly* as long as you keep
+> it open — minutes, hours, or days. Every "free" restriction other tools impose
+> (timers, watermarks, viewer caps, quality throttles) is **deliberately absent**
+> here. See [ARCHITECTURE.md](./ARCHITECTURE.md#no-limits-guarantee) for the
+> explicit no-limits guarantee enforced in code.
+
+It does what a modern remote desktop should: real-time screen streaming, full
+remote input, clipboard sync, adaptive quality that "auto-negotiates lag" to stay
+realtime on a busy network, zero-config LAN discovery, DTLS-SRTP encryption, and
+even an **AI/agent control surface** (MCP + REST) so a model can drive the remote
+machine.
+
+---
+
+## Table of contents
+
+- [Quickstart](#quickstart)
+- [Features](#features)
+- [Architecture at a glance](#architecture-at-a-glance)
+- [Monorepo layout](#monorepo-layout)
+- [Running each part](#running-each-part)
+  - [1. Signaling server](#1-signaling-server-zero-config-lan)
+  - [2. Electron host (Windows)](#2-electron-host-windows)
+  - [3. Web viewer](#3-web-viewer)
+- [The adaptive realtime engine](#the-adaptive-realtime-engine-auto-negotiate-lag)
+- [AI-friendly control: MCP + REST](#ai-friendly-control-mcp--rest)
+- [Building the Windows host (.exe)](#building-the-windows-host-exe)
+- [Testing](#testing)
+- [Configuration reference](#configuration-reference)
+- [License](#license)
+
+---
+
+## Quickstart
+
+Three terminals on the same Wi‑Fi/LAN. Node ≥ 20.
+
+```bash
+# 0) Install + build everything (workspace root)
+npm install
+npm run build
+
+# 1) Start the signaling server (zero-config; binds a port + logs LAN URLs)
+npm run dev:signaling
+#    -> logs e.g.  ws://192.168.1.10:8787   (note this address)
+
+# 2) On the WINDOWS machine you want to control, run the host agent.
+#    It captures the screen, joins signaling, and shows a 6–9 digit code.
+STREAMSCREEN_SIGNALING_URL=ws://192.168.1.10:8787 npm -w @stream-screen/host start
+
+# 3) On any other machine, open the web viewer and enter the code (or pick the
+#    host from the auto-discovered LAN list).
+npm -w @stream-screen/viewer run dev
+#    -> open the printed http://localhost:5173, enter the code, connect.
+```
+
+That's it — no sign-up, no relay, no timer. Media flows **peer-to-peer** between
+the two machines; the signaling server only helps them find each other.
+
+---
+
+## Features
+
+What a modern remote desktop should have, and where StreamScreen stands:
+
+| Capability | Status | Notes |
+|---|---|---|
+| Real-time screen streaming over LAN | ✅ Implemented | WebRTC video track, host → viewer |
+| Peer-to-peer media (no relay/cloud) | ✅ Implemented | Direct P2P once negotiated |
+| Remote mouse (move / click / wheel) | ✅ Implemented | Resolution-independent normalized coords |
+| Remote keyboard (keys + modifiers) | ✅ Implemented | DOM `code`/`key` → OS keys via nut.js |
+| Clipboard sync | ✅ Implemented | Electron clipboard on host |
+| **No session time limit** | ✅ Guaranteed | No timers/usage caps anywhere (vs AnyDesk's ~15 min) |
+| **No bitrate / quality cap** | ✅ Guaranteed | Ceiling is only what the link sustains |
+| Free & self-hosted, no accounts | ✅ Guaranteed | Session gated by a 6–9 digit code only |
+| Adaptive bitrate/quality ("auto-negotiate lag") | ✅ Implemented | AIMD over RTT/loss/jitter, ~1 Hz |
+| Zero-config LAN discovery | ✅ Implemented | mDNS/DNS-SD (`_streamscreen._tcp`) |
+| Session codes (6–9 digits) | ✅ Implemented | Minted by host or signaling server |
+| End-to-end transport encryption | ✅ Implemented | DTLS-SRTP (WebRTC stack) |
+| Multiple viewers per host | ✅ Implemented | One host, N viewers per room |
+| Auto-reconnect signaling | ✅ Implemented | Exponential backoff, replays `join` |
+| Cross-platform viewer | ✅ Implemented | Any modern browser |
+| Windows host installer (.exe) | ✅ Implemented | electron-builder NSIS + portable |
+| Multi-monitor / window selection | ✅ Implemented | Source picker enumerates screens + windows |
+| **AI / agent control (MCP + REST)** | ✅ Implemented | Screenshot, OCR, mouse, keyboard, stats |
+| Screenshot + OCR of remote screen | ✅ Implemented | PNG capture + tesseract.js OCR |
+| File transfer | ⛔ Not yet | Roadmap |
+| Audio streaming | ⛔ Not yet | Capture is video-only today |
+| WAN / VPN traversal (public IP) | ⛔ Not yet | LAN-first by design; STUN/TURN hooks exist |
+
+> The two rows that matter most for "free vs AnyDesk": **no time limit** and **no
+> bitrate cap** — both are not just defaults but *guarantees enforced in the
+> code* (no timer ends a healthy session; the only ceiling is link capacity).
+
+---
+
+## Architecture at a glance
+
+```
+   ┌──────────────────────────┐         signaling (WebSocket)         ┌──────────────────────────┐
+   │   HOST  (Windows)        │   SDP offer/answer + ICE + room join  │   VIEWER  (any browser)  │
+   │   Electron app           │◄────────────────────────────────────►│   Vite + React web app   │
+   │                          │            ws://LAN:8787              │                          │
+   │  desktopCapturer ─┐      │                                       │   <video> remote screen  │
+   │  nut.js inject ◄──┤      │                                       │   input capture          │
+   │  AdaptiveController│      │        mDNS discovery (LAN)           │   stats dashboard        │
+   └─────────┬─────────┘      │   _streamscreen._tcp advertise/browse └─────────┬────────────────┘
+             │                │                                                  │
+             │     WebRTC P2P (DTLS-SRTP encrypted) — video host→viewer,        │
+             └────────────────  input data channel viewer→host. NEVER relayed. ─┘
+```
+
+The signaling server is used **only** to bootstrap the connection (room join +
+SDP/ICE + LAN host listing). Once the WebRTC peer connection is up, **all video
+and input traffic flows directly peer-to-peer** and never touches the server
+again. Full diagrams, the SDP/ICE flow, the adaptive control loop, the input
+pipeline, and the security model are in **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
+
+---
+
+## Monorepo layout
+
+An npm-workspaces TypeScript monorepo (`packages/*` + `e2e`). Every package codes
+against the shared protocol in `@stream-screen/core`.
+
+```
+stream-screen/
+├── package.json              # workspace root: build / test / e2e / verify scripts
+├── tsconfig.json             # project references (core → signaling → ai → host)
+├── README.md                 # this file
+├── ARCHITECTURE.md           # deep architecture + security model
+├── packages/
+│   ├── core/                 # @stream-screen/core — shared, dependency-light, runs in browser + node
+│   │   └── src/
+│   │       ├── protocol.ts         # SignalMessage, InputEvent, AdaptiveStats/Decision, guards
+│   │       ├── peer.ts             # Peer: RTCPeerConnection wrapper, perfect negotiation, stats
+│   │       ├── signaling-client.ts # SignalingClient: WS join/relay, auto-reconnect
+│   │       ├── adaptive.ts         # AdaptiveController: AIMD "auto-negotiate lag" engine
+│   │       └── input-codec.ts      # compact wire codec for InputEvents
+│   ├── signaling/            # @stream-screen/signaling — zero-config LAN server
+│   │   └── src/
+│   │       ├── server.ts           # WebSocket SDP/ICE relay + rooms (NO time limits)
+│   │       ├── discovery.ts        # mDNS/DNS-SD advertise + browse (best-effort)
+│   │       ├── rest.ts             # tiny REST: /health /api/sessions /api/discover /api/code
+│   │       └── index.ts            # boots HTTP + WS on one port, logs LAN URLs
+│   ├── host/                 # @stream-screen/host — Electron host agent (Windows)
+│   │   └── src/
+│   │       ├── main.ts             # Electron main: tray, single-instance, IPC, injection
+│   │       ├── capture.ts          # desktopCapturer → MediaStream (renderer)
+│   │       ├── host-session.ts     # capture + Peer + AdaptiveController loop
+│   │       ├── input-injector.ts   # InputEvent → OS input via nut.js (optional native dep)
+│   │       └── renderer/           # control window UI
+│   ├── viewer/               # @stream-screen/viewer — Vite + React web viewer
+│   │   └── src/
+│   │       ├── viewer-session.ts   # signaling + Peer (role viewer), stats polling
+│   │       ├── input-capture.ts    # mouse/keyboard capture, normalized coords
+│   │       ├── discovery-client.ts # /api/discover + /api/code
+│   │       ├── quality.ts          # Auto/High/Balanced/Low presets
+│   │       └── components/         # ConnectScreen, VideoStage, Toolbar, StatsPanel, DiscoveryList
+│   └── ai/                   # @stream-screen/ai — MCP server + mirrored REST API
+│       └── src/
+│           ├── tools.ts            # single source of truth: tool catalogue + pure mappers
+│           ├── session.ts          # RemoteDesktopSession: viewer Peer + screenshot/OCR/input
+│           ├── mcp-server.ts       # MCP (stdio) transport
+│           ├── rest-api.ts         # Express REST mirror of every MCP tool
+│           └── ocr.ts              # tesseract.js OCR (optional dep)
+└── e2e/                      # @stream-screen/e2e — Playwright: two real Chromium peers
+    ├── tests/                # session / input / adaptive specs
+    └── scripts/              # serve.mjs (signaling + fixtures), bundle-core.mjs
+```
+
+---
+
+## Running each part
+
+Install once at the root (workspaces hoist dependencies):
+
+```bash
+npm install
+npm run build      # tsc project references + viewer typecheck
+```
+
+### 1. Signaling server (zero-config LAN)
+
+The signaling server hosts a WebSocket SDP/ICE relay **and** a tiny REST API on a
+single port (default `8787`), and advertises the host over mDNS.
+
+```bash
+npm run dev:signaling                 # tsx, hot dev
+# or, after build:
+npm -w @stream-screen/signaling start # node dist/index.js
+```
+
+On start it logs every reachable LAN URL, e.g.:
+
+```
+[signaling] StreamScreen signaling server ready (always free, no time limits).
+[signaling]   http://127.0.0.1:8787/health   ws://127.0.0.1:8787
+[signaling]   http://192.168.1.10:8787/health ws://192.168.1.10:8787
+```
+
+REST endpoints: `GET /health`, `GET /api/sessions`, `GET /api/discover` (mDNS
+browse), `POST /api/code` (mint a fresh code). Configure with
+`STREAMSCREEN_PORT` and `STREAMSCREEN_HOST_NAME`.
+
+### 2. Electron host (Windows)
+
+The host is an Electron app. It captures the screen via `desktopCapturer`, sends
+it P2P, and injects incoming remote input via the optional native library
+`@nut-tree-fork/nut-js`. It runs in the system tray and shows the session code.
+
+```bash
+npm -w @stream-screen/host run build
+STREAMSCREEN_SIGNALING_URL=ws://<server-ip>:8787 npm -w @stream-screen/host start
+```
+
+- The host **mints a 6–9 digit session code** on launch (or honors
+  `STREAMSCREEN_CODE`) and displays it in the tray + control window.
+- Remote input injection requires the optional native dep. If it's missing,
+  the host still streams; it just logs a one-time warning and ignores input
+  (graceful degradation, never a crash).
+- The host **never** quits on window close — it stays in the tray with **no time
+  limit** until you explicitly quit.
+
+### 3. Web viewer
+
+Any modern browser. Connect by entering the code, or pick a host from the
+auto-discovered LAN list.
+
+```bash
+npm -w @stream-screen/viewer run dev      # vite dev server (http://localhost:5173)
+# or for production:
+npm -w @stream-screen/viewer run build
+npm -w @stream-screen/viewer run preview
+```
+
+The viewer derives its signaling WebSocket URL from the page host on port `8787`
+(override the REST proxy with `VITE_SIGNALING_HTTP`). It renders the remote
+screen, captures mouse/keyboard (with resolution-independent coordinates,
+pointer lock, fullscreen, clipboard sync), and shows a **live adaptive-stats
+dashboard** (RTT, loss, jitter, fps, resolution, current bitrate decision).
+
+---
+
+## The adaptive realtime engine ("auto-negotiate lag")
+
+The single most important piece for staying realtime on a real Wi‑Fi network is
+the **`AdaptiveController`** in `@stream-screen/core` (`adaptive.ts`). It is a
+research-grade **AIMD** (additive-increase / multiplicative-decrease) congestion
+controller driven by live WebRTC stats.
+
+Every ~1 second the host runs this loop (`HostSession.tick`):
+
+```
+peer.getStats()  ──►  AdaptiveController.update(stats)  ──►  peer.applyDecision(decision)
+   RTT, loss,            choose bitrate / fps /                 setParameters() on the
+   jitter, fps,          resolution downscale                  outbound video sender
+   availableKbps
+```
+
+How it decides:
+
+- **INCREASE** — link is clean (RTT < target, loss < 2%, low jitter): grow the
+  target bitrate by ~8%, but never sprint past measured `availableOutgoingBitrate`.
+- **DECREASE** — congested (loss > 5%, RTT > 1.6× target, or jitter spike):
+  back off multiplicatively, with a severity-scaled factor (0.85 mild → 0.60 hard)
+  so the response is fast but proportionate. If the link reports lower headroom,
+  it's respected immediately.
+- **HOLD** — ambiguous region: keep steady to avoid oscillation.
+
+From the chosen bitrate it derives a **max framerate** (15…60 fps) and a
+**resolution downscale** (1 / 1.5 / 2 / 3 / 4), so low-bandwidth links shed
+framerate and resolution *gracefully* instead of stalling — the "auto-negotiate
+lag to stay realtime" behavior. The controller is **pure and deterministic** (no
+timers, no randomness), which is why it is directly unit-tested.
+
+There is **no bitrate ceiling** beyond the caller-supplied `maxKbps` (default
+40 Mbps) and **no time-based throttle of any kind.**
+
+---
+
+## AI-friendly control: MCP + REST
+
+`@stream-screen/ai` exposes the *same* remote-desktop control surface in two
+transports, generated from one shared tool registry (`tools.ts`) so they can
+never drift:
+
+- **MCP server** over stdio — for Model Context Protocol agents.
+- **REST API** (Express) — for any non-MCP automation.
+
+Both drive a single `RemoteDesktopSession`, which connects as a **viewer** via the
+core `Peer`. A node WebRTC runtime (`@roamhq/wrtc`) and OCR (`tesseract.js`) are
+**optional**: without them the server, tool list, and schemas stay fully valid and
+the affected calls return a clear "requires native webrtc runtime" / "OCR
+unavailable" message. **Nothing here counts usage or expires a session.**
+
+### Tool table
+
+| Tool (MCP) | REST route | Args | Returns |
+|---|---|---|---|
+| `list_hosts` | `GET /api/hosts` | – | hosts discoverable on the LAN |
+| `connect` | `POST /api/connect` | `{ code }` | establishes the P2P session |
+| `disconnect` | `POST /api/disconnect` | – | closes the session |
+| `screenshot` | `GET /api/screenshot` | – | current frame as PNG |
+| `ocr_screen` | `GET /api/ocr` | – | recognized text from the screen |
+| `move_mouse` | `POST /api/move` | `{ x, y }` (0..1) | moves the cursor |
+| `click` | `POST /api/click` | `{ x, y, button? }` | press + release (0=L,1=M,2=R) |
+| `type_text` | `POST /api/type` | `{ text }` | types a string |
+| `press_key` | `POST /api/key` | `{ key, mods? }` | key down/up; `mods` bitflags 1/2/4/8 |
+| `get_stats` | `GET /api/stats` | – | live RTT/loss/jitter/fps/resolution/bitrate |
+
+Coordinates are always **normalized fractions in [0,1]** of the remote screen, so
+they're resolution-independent. Modifier bitflags: `1`=shift, `2`=ctrl, `4`=alt,
+`8`=meta (combine by OR-ing, e.g. ctrl+shift = `3`).
+
+### Run it
+
+```bash
+# MCP server (stdio) — default
+STREAMSCREEN_SIGNALING_URL=ws://<server-ip>:8787 npm -w @stream-screen/ai start
+
+# REST API on :8788
+STREAMSCREEN_AI_MODE=rest STREAMSCREEN_AI_PORT=8788 \
+STREAMSCREEN_SIGNALING_URL=ws://<server-ip>:8787 npm -w @stream-screen/ai start
+```
+
+### Example REST calls
+
+```bash
+# Discover hosts, then connect by code
+curl http://localhost:8788/api/hosts
+curl -X POST http://localhost:8788/api/connect -H 'content-type: application/json' -d '{"code":"123456"}'
+
+# Look at the screen
+curl http://localhost:8788/api/screenshot -o screen.png
+curl http://localhost:8788/api/ocr
+
+# Control it (normalized coordinates)
+curl -X POST http://localhost:8788/api/move  -H 'content-type: application/json' -d '{"x":0.5,"y":0.5}'
+curl -X POST http://localhost:8788/api/click -H 'content-type: application/json' -d '{"x":0.5,"y":0.5,"button":0}'
+curl -X POST http://localhost:8788/api/type  -H 'content-type: application/json' -d '{"text":"hello"}'
+curl -X POST http://localhost:8788/api/key   -H 'content-type: application/json' -d '{"key":"Enter"}'
+
+# Health + capabilities (advertises: limits none, cost free)
+curl http://localhost:8788/health
+```
+
+To register the MCP server with an agent, point it at
+`node packages/ai/dist/index.js` as a stdio MCP server (env
+`STREAMSCREEN_SIGNALING_URL` set to your signaling URL).
+
+---
+
+## Building the Windows host (.exe)
+
+The host ships as a Windows installer and a portable executable via
+**electron-builder** (`packages/host/electron-builder.yml`).
+
+```bash
+npm -w @stream-screen/host run build   # compile TypeScript to dist/
+npm -w @stream-screen/host run dist    # electron-builder --win
+```
+
+Outputs land in `packages/host/release/`:
+
+- **NSIS installer** — `StreamScreen Host-<version>-x64.exe` (per-user install,
+  custom install dir allowed).
+- **Portable** — `StreamScreen Host-<version>-portable.exe` (no install).
+
+The optional native input library (`@nut-tree-fork/nut-js`) is `asarUnpack`ed
+when present on the build machine, so a built installer that includes it has full
+remote-control capability; if it was absent at build time, the app still installs
+and streams (input is the only thing that degrades).
+
+> Build the Windows artifacts on Windows (or a Windows CI runner) for native
+> module compatibility.
+
+---
+
+## Testing
+
+Unit tests use **Vitest** across every package; end-to-end uses **Playwright**
+driving **two real Chromium peers** through the live signaling server.
+
+```bash
+# Everything: build + unit tests + e2e
+npm run verify
+
+# Or individually:
+npm run build                 # tsc project refs + viewer typecheck
+npm test                      # unit tests across all workspaces (vitest)
+npm run e2e                   # Playwright e2e (bundles core, serves fixtures)
+```
+
+What the **e2e** suite proves (no mocks for the hard parts):
+
+- **`session.spec`** — host + viewer establish a *real* WebRTC P2P session; the
+  viewer receives decoded video frames and the input data channel opens.
+- **`input.spec`** — input events actually flow viewer → host over the data
+  channel and decode correctly.
+- **`adaptive.spec`** — the adaptive engine, exercised in-page, ramps up on a
+  clean link and backs off under loss/RTT/jitter.
+
+Per-package tests can also be run directly, e.g.
+`npm -w @stream-screen/core test` or `npm -w @stream-screen/viewer test`.
+
+---
+
+## Configuration reference
+
+| Env var | Used by | Default | Meaning |
+|---|---|---|---|
+| `STREAMSCREEN_PORT` | signaling | `8787` | HTTP+WS port |
+| `STREAMSCREEN_HOST_NAME` | signaling, host | machine hostname | advertised name |
+| `STREAMSCREEN_SIGNALING_URL` | host, ai | `ws://127.0.0.1:8787` | signaling WS URL |
+| `STREAMSCREEN_CODE` | host | minted | fixed session code |
+| `STREAMSCREEN_AI_MODE` | ai | `mcp` | `rest` to run the REST API |
+| `STREAMSCREEN_AI_PORT` | ai | `8788` | REST port |
+| `VITE_SIGNALING_HTTP` | viewer | `http://localhost:8787` | dev proxy target |
+
+---
+
+## License
+
+Free and self-hosted. StreamScreen imposes **no time limits, no usage caps, no
+bitrate ceilings, and no accounts** — by design and in code. See
+[ARCHITECTURE.md](./ARCHITECTURE.md#no-limits-guarantee).
+</content>

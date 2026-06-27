@@ -1,0 +1,27 @@
+{
+  "name": "@stream-screen/host",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "StreamScreen host agent — Electron app for Windows that captures the screen via desktopCapturer and injects remote input via nut.js. Always free, no time limits, no bitrate caps.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "electron .",
+    "test": "vitest run",
+    "dist": "electron-builder --win"
+  },
+  "dependencies": {
+    "@stream-screen/core": "*"
+  },
+  "optionalDependencies": {
+    "@nut-tree-fork/nut-js": "^4"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "electron": "^31",
+    "electron-builder": "^25",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  }
+}

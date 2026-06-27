@@ -1,5 +1,332 @@
 # StreamScreen Architecture
 
-npm-workspaces TypeScript monorepo: `core` (shared protocol + WebRTC peer + adaptive engine + input codec), `signaling`, `host` (Electron), `viewer` (Vite+React), `ai` (MCP + REST + OCR), and `e2e` (Playwright).
+StreamScreen is a free, unlimited-time, LAN-first remote desktop for Windows.
+Video and input flow **peer-to-peer over WebRTC**; a tiny signaling server only
+helps the two peers find each other and exchange the WebRTC handshake. This
+document covers the component model, the signaling/SDP/ICE flow, the adaptive
+control loop, the input pipeline, and the security model — and states explicitly
+that **there are no time limits or usage caps anywhere in the system.**
 
-> Placeholder — expanded in the Docs phase.
+- [Components](#components)
+- [Component diagram](#component-diagram)
+- [Signaling / SDP / ICE flow](#signaling--sdp--ice-flow)
+- [LAN discovery (mDNS)](#lan-discovery-mdns)
+- [The adaptive control loop](#the-adaptive-control-loop)
+- [The input pipeline](#the-input-pipeline)
+- [AI control layer (MCP + REST)](#ai-control-layer-mcp--rest)
+- [Security model](#security-model)
+- [No-limits guarantee](#no-limits-guarantee)
+
+---
+
+## Components
+
+An npm-workspaces TypeScript monorepo. Everything is built on the shared contract
+in `@stream-screen/core`, which is intentionally dependency-light so the same code
+runs identically in a browser and in node.
+
+| Package | Runtime | Role |
+|---|---|---|
+| `@stream-screen/core` | browser + node | Protocol types + runtime building blocks: `Peer` (WebRTC), `SignalingClient`, `AdaptiveController`, input codec. |
+| `@stream-screen/signaling` | node | Zero-config LAN server: WebSocket SDP/ICE relay + rooms, mDNS discovery, tiny REST API. |
+| `@stream-screen/host` | Electron (Windows) | Captures the screen (`desktopCapturer`), runs the adaptive loop, injects remote input (`nut.js`), tray UI. |
+| `@stream-screen/viewer` | browser (Vite + React) | Renders the remote screen, captures input, shows the live stats dashboard. |
+| `@stream-screen/ai` | node | MCP (stdio) server + mirrored REST API so AI agents can drive a session. |
+| `@stream-screen/e2e` | node + Chromium | Playwright: two real browser peers run a live WebRTC session. |
+
+---
+
+## Component diagram
+
+```mermaid
+flowchart LR
+  subgraph HOST["HOST — Electron (Windows)"]
+    DC["desktopCapturer\n(main process)"]
+    HS["HostSession\n(renderer)"]
+    AC["AdaptiveController"]
+    II["InputInjector\n(nut.js, optional)"]
+    DC --> HS
+    HS --> AC
+    HS -->|inject IPC| II
+  end
+
+  subgraph SIG["SIGNALING SERVER (node) — one port"]
+    WS["WebSocket relay\n(rooms by code)"]
+    REST["REST API\n/health /sessions /discover /code"]
+    MDNS["mDNS / DNS-SD\n_streamscreen._tcp"]
+  end
+
+  subgraph VIEW["VIEWER — browser (or AI session)"]
+    VS["ViewerSession"]
+    IC["input-capture"]
+    SP["StatsPanel"]
+    VS --> SP
+    IC --> VS
+  end
+
+  HS <-->|"SDP offer/answer + ICE\n(bootstrap only)"| WS
+  VS <-->|"SDP offer/answer + ICE\n(bootstrap only)"| WS
+  MDNS -.->|advertise / browse| VIEW
+
+  HS ==>|"WebRTC video track (DTLS-SRTP)"| VS
+  VS ==>|"WebRTC data channel: InputEvents"| HS
+
+  classDef p2p stroke-width:3px;
+  class HS,VS p2p;
+```
+
+The thick `==>` arrows are the **peer-to-peer** WebRTC media/data paths. They are
+direct between host and viewer and never traverse the signaling server. The thin
+`<-->` arrows are the bootstrap-only signaling exchange.
+
+If your Markdown renderer does not support Mermaid, here is the same topology in
+ASCII:
+
+```
+   HOST (Electron, Windows)            SIGNALING (node, one port)         VIEWER (browser / AI)
+   ─────────────────────────          ──────────────────────────         ─────────────────────
+   desktopCapturer ─┐                  WebSocket relay (rooms)            ViewerSession ─► StatsPanel
+                    ▼                   REST /health /sessions             ▲
+            HostSession ──► Adaptive        /discover /code                │
+                    │       Controller     mDNS _streamscreen._tcp     input-capture
+       inject IPC   ▼                  ──────────────────────────
+            InputInjector(nut.js)
+                    ▲                          ▲          ▲
+                    │   SDP/ICE (bootstrap)    │          │   SDP/ICE (bootstrap)
+                    └──────────────────────────┘          └──────────────────────┐
+                                                                                  │
+   HOST ===== WebRTC video track (DTLS-SRTP, P2P) ============================►  VIEWER
+   HOST ◄==== WebRTC data channel: InputEvents (DTLS-SRTP, P2P) ===============  VIEWER
+                       (P2P paths NEVER traverse the signaling server)
+```
+
+---
+
+## Signaling / SDP / ICE flow
+
+Signaling exists **only** to set up the WebRTC connection. The server groups
+peers into a *room* keyed by the 6–9 digit session code, relays SDP and ICE, and
+emits lifecycle events. It carries **no media and no input** — once the peer
+connection is established, application traffic is fully peer-to-peer.
+
+Negotiation uses the WebRTC **perfect-negotiation** pattern (`core/peer.ts`):
+the **host is impolite** (wins glare, offers first); the **viewer is polite**
+(rolls back on collision).
+
+```mermaid
+sequenceDiagram
+  participant H as Host (impolite)
+  participant S as Signaling server
+  participant V as Viewer (polite)
+
+  H->>S: join { role: host, code }
+  S-->>H: joined { from: hostId, code }
+
+  V->>S: join { role: viewer, code }
+  S-->>V: joined { from: viewerId }
+  S-->>V: peer-joined { from: hostId }
+  S-->>H: peer-joined { from: viewerId }
+
+  Note over H: viewer present + stream attached -> create offer
+  H->>S: offer { to: viewerId, sdp }
+  S-->>V: offer { from: hostId, sdp }
+  V->>S: answer { to: hostId, sdp }
+  S-->>H: answer { from: viewerId, sdp }
+
+  par ICE trickle (both directions)
+    H->>S: ice { candidate }
+    S-->>V: ice { from: hostId, candidate }
+    V->>S: ice { candidate }
+    S-->>H: ice { from: viewerId, candidate }
+  end
+
+  Note over H,V: DTLS handshake -> SRTP media + data channel OPEN
+  H-->>V: video track (P2P, encrypted)
+  V-->>H: InputEvents over data channel (P2P, encrypted)
+
+  Note over S: server is now idle for this session - no relay, no timer
+```
+
+Key points:
+
+- **Rooms by code.** A host without a code mints one; viewers must target an
+  existing room (`no-such-session` otherwise). One host + N viewers per room.
+- **The server overwrites `from`** with the sender's authoritative id, so peers
+  can't spoof each other within a room. `to` targets a specific peer; otherwise a
+  message broadcasts to the rest of the room.
+- **Auto-reconnect.** `SignalingClient` reconnects with exponential backoff
+  (250 ms -> 8 s) and replays the last `join`, so a dropped Wi‑Fi signaling socket
+  transparently rejoins. This is reconnection, **not** a session timer.
+- **Keepalive != timeout.** A WebSocket ping/pong heartbeat reaps *dead* sockets
+  (crashed peer, dropped Wi‑Fi) so `peer-left` fires promptly. It never ends a
+  *healthy* session. See [No-limits guarantee](#no-limits-guarantee).
+
+---
+
+## LAN discovery (mDNS)
+
+The signaling server advertises a `_streamscreen._tcp` service over mDNS/DNS-SD
+(Bonjour/Avahi) carrying the host name, signaling port, and (optionally) the
+session code in TXT records. Any machine on the same LAN can browse for these and
+present a one-tap list of nearby hosts — **zero configuration, no cloud, no
+accounts.**
+
+mDNS is **best-effort and fully guarded**: on locked-down networks or sandboxes
+where UDP multicast is blocked, advertise/browse degrade to graceful no-ops
+(`available = false`) instead of crashing. Manual code entry always works without
+discovery. Viewers reach discovery via `GET /api/discover`.
+
+---
+
+## The adaptive control loop
+
+The "auto-negotiate lag" engine (`core/adaptive.ts`, driven by
+`host/host-session.ts`) keeps the stream realtime on a busy network. It is a
+deterministic **AIMD** (additive-increase / multiplicative-decrease) congestion
+controller — no timers, no randomness, so it is directly unit-testable.
+
+```mermaid
+flowchart TB
+  T["every ~1s (ADAPTIVE_INTERVAL_MS)"] --> G["peer.getStats()"]
+  G --> S["AdaptiveStats:\nRTT, loss%, jitter,\navailableKbps, fps, w x h"]
+  S --> C{classify link}
+  C -->|"clean: RTT<target, loss<2%, low jitter"| INC["INCREASE\nx1.08, capped at availableKbps x1.05"]
+  C -->|"congested: loss>5% OR RTT>1.6xtarget OR jitter spike"| DEC["DECREASE\nx(0.85 -> 0.60 by severity)"]
+  C -->|ambiguous| HOLD["HOLD\nkeep steady"]
+  INC --> CLAMP["clamp to [minKbps, maxKbps]"]
+  DEC --> CLAMP
+  HOLD --> CLAMP
+  CLAMP --> D["AdaptiveDecision:\ntargetKbps, maxFramerate (15-60),\nscaleResolutionDownBy (1-4)"]
+  D --> A["peer.applyDecision()\nsender.setParameters()"]
+  A --> T
+```
+
+- **Inputs** come from the WebRTC stats API: candidate-pair RTT and
+  `availableOutgoingBitrate`; inbound/outbound and remote-inbound RTP for
+  loss, jitter, fps, and frame size.
+- **Outputs** are applied to the outbound video sender's first encoding:
+  `maxBitrate`, `maxFramerate`, `scaleResolutionDownBy`. Low-bandwidth links shed
+  framerate first, then resolution — degrading gracefully instead of stalling.
+- **No hard ceiling** other than the caller-supplied `maxKbps` (default 40 Mbps);
+  the controller never imposes a time-based throttle. The viewer additionally
+  surfaces Auto/High/Balanced/Low presets (`viewer/src/quality.ts`).
+
+---
+
+## The input pipeline
+
+Remote control flows viewer -> host over a reliable, ordered WebRTC **data
+channel** (label `input`), separate from the media track.
+
+```mermaid
+flowchart LR
+  E["DOM mouse/keyboard\n(viewer)"] --> N["normalize to 0..1\n(object-fit aware)\n+ modifier bitflags"]
+  N --> ENC["encodeInput()\ncompact JSON, 4-dp coords"]
+  ENC --> CH["data channel 'input'\n(DTLS-SRTP)"]
+  CH --> DEC["decodeInput()\n(host)"]
+  DEC --> MAP["map normalized->pixels,\nbutton enum, key codes,\nmodifier hold/release"]
+  MAP --> OS["nut.js OS injection\n(or Electron clipboard\nfor clipboard events)"]
+```
+
+- **Resolution independence.** Pointer coordinates are normalized fractions in
+  `[0,1]` of the remote screen, so they work regardless of either side's
+  resolution. The host maps them to pixels against the live screen size
+  (`normalizedToPixels`).
+- **Events.** `m-move`, `m-down`, `m-up`, `m-wheel`, `k-down`, `k-up`,
+  `clipboard`. Buttons: 0=left, 1=middle, 2=right. Modifier bitflags: 1=shift,
+  2=ctrl, 4=alt, 8=meta.
+- **Wire codec** (`core/input-codec.ts`) is compact JSON with coordinates rounded
+  to 4 decimals (sub-pixel on 4K) to keep pointer-move spam small; it is pure and
+  round-trip safe, with an exhaustiveness guard so a new event variant fails to
+  compile until handled.
+- **Key translation.** DOM `KeyboardEvent.code` (e.g. `KeyA`, `Digit1`,
+  `ArrowLeft`, `F5`) maps to nut.js `Key` enum names; modifiers are held/released
+  around the main key. The pure mapping is unit-tested without the native library.
+- **Graceful degradation.** The native injector (`@nut-tree-fork/nut-js`) is an
+  **optional** dependency loaded lazily. If absent, input becomes a logged no-op
+  and streaming continues. Clipboard events are handled by the Electron clipboard
+  in the main process rather than synthetic keystrokes.
+
+---
+
+## AI control layer (MCP + REST)
+
+`@stream-screen/ai` lets an AI agent (or any automation) drive a session as a
+*viewer*. One shared tool registry (`tools.ts`) generates **both** an MCP stdio
+server and a mirrored Express REST API, so the two transports can never diverge.
+
+```mermaid
+flowchart LR
+  AG["AI agent / script"] -->|MCP stdio| MCP["mcp-server.ts"]
+  AG -->|HTTP| RA["rest-api.ts"]
+  MCP --> RDS["RemoteDesktopSession"]
+  RA --> RDS
+  RDS -->|viewer Peer| CORE["@stream-screen/core"]
+  CORE -.->|WebRTC P2P| HOST["remote host"]
+  RDS --> OCR["tesseract.js (optional)"]
+  RDS --> WRTC["@roamhq/wrtc (optional)"]
+```
+
+Tools: `list_hosts`, `connect`, `disconnect`, `screenshot`, `ocr_screen`,
+`move_mouse`, `click`, `type_text`, `press_key`, `get_stats`. The node WebRTC
+runtime and OCR engine are optional dynamic imports; when missing, the server and
+its schemas stay valid and only the affected calls return a clear error.
+Screenshots are produced by converting raw I420 frames to PNG with a
+dependency-free encoder. **No call counts usage or expires a session.**
+
+---
+
+## Security model
+
+StreamScreen is **LAN-first** and trades WAN reach for simplicity and privacy.
+
+- **Transport encryption.** All WebRTC media and data are **DTLS-SRTP** encrypted
+  end-to-end by the browser/Electron WebRTC stack. Even on the LAN, media and
+  input are never sent in the clear.
+- **No relay, no cloud.** Media and input flow directly peer-to-peer. The
+  signaling server sees only SDP/ICE and room membership; it never sees pixels or
+  keystrokes. There is no third-party server in the data path.
+- **Session gating.** A session is gated by a **6–9 digit numeric code**. Viewers
+  must target an existing room; unknown codes are rejected (`no-such-session`).
+  Codes are minted with platform crypto where available.
+- **Identity within a room.** The server assigns each peer an authoritative id
+  and overwrites the `from` field on every relayed message, so peers in a room
+  cannot impersonate one another during signaling.
+- **Least privilege on the host.** The Electron host uses `contextIsolation`,
+  no `nodeIntegration` in the renderer, a preload contextBridge for IPC, and a
+  single-instance lock. OS input injection is an *optional* capability.
+- **CORS.** The REST surfaces use permissive CORS deliberately, because they are
+  intended to be reached from the LAN viewer/automation on other origins. Run the
+  signaling and AI servers on trusted networks.
+- **Threat model & limits.** The code gates *access*, but a short numeric code is
+  not a substitute for network-level isolation on hostile networks. There is no
+  built-in authentication beyond the code and no audit log. For untrusted
+  networks, place StreamScreen behind a VPN/firewall (WAN/VPN traversal is on the
+  roadmap; STUN/TURN hooks already exist in `Peer`).
+
+---
+
+## No-limits guarantee
+
+This is load-bearing for StreamScreen's "always free, unlimited time" promise and
+is enforced in code, not just by default config:
+
+- **No session timer.** Nowhere in the signaling server, host, viewer, or AI
+  layer is there a timer that ends or throttles a *healthy* session. A session
+  lives exactly as long as its sockets stay open. (Contrast: AnyDesk's free tier
+  ~15‑minute cutoff.)
+- **The only timers are safety mechanisms, not limits.** The signaling
+  heartbeat reaps *dead* sockets; the adaptive loop samples stats every ~1 s;
+  `SignalingClient` backoff reconnects. None of these end a live session.
+- **No usage metering or licensing.** No counters, no "commercial use" checks, no
+  watermarks, no viewer caps imposed by policy.
+- **No bitrate cap.** The only ceiling is the caller-supplied `maxKbps` (default
+  40 Mbps) and what the physical link sustains — the adaptive engine raises
+  quality whenever the link allows.
+- **Rooms disappear only when empty.** A room is reaped after the last socket
+  leaves — this is cleanup, not a timeout.
+
+These invariants are documented at their enforcement points in
+`signaling/src/server.ts`, `host/src/host-session.ts`, `core/src/adaptive.ts`,
+and `ai/src/session.ts`.
+</content>

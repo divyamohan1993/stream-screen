@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>StreamScreen e2e — host</title>
+    <style>
+      body { margin: 0; font-family: monospace; background: #111; color: #0f0; }
+      #lastInput { padding: 8px; white-space: pre; }
+      canvas { display: block; }
+    </style>
+  </head>
+  <body>
+    <canvas id="screen" width="640" height="480"></canvas>
+    <div id="status">host: booting</div>
+    <div id="frame">frame: 0</div>
+    <div id="lastInput">lastInput: none</div>
+
+    <script type="module">
+      import {
+        Peer,
+        SignalingClient,
+        AdaptiveController,
+      } from './core.bundle.js';
+
+      const params = new URLSearchParams(location.search);
+      const code = params.get('code') ?? '123456';
+      const wsUrl = `ws://${location.host}`;
+
+      const statusEl = document.getElementById('status');
+      const frameEl = document.getElementById('frame');
+      const lastInputEl = document.getElementById('lastInput');
+      const canvas = document.getElementById('screen');
+      const ctx = canvas.getContext('2d');
+
+      // --- Animated "screen": a moving gradient block + a frame counter. ---
+      let frame = 0;
+      function draw() {
+        frame += 1;
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.fillStyle = '#202830';
+        ctx.fillRect(0, 0, w, h);
+        const x = (frame * 4) % (w - 80);
+        ctx.fillStyle = `hsl(${(frame * 3) % 360}, 80%, 55%)`;
+        ctx.fillRect(x, h / 2 - 40, 80, 80);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '28px monospace';
+        ctx.fillText(`FRAME ${frame}`, 16, 40);
+        frameEl.textContent = `frame: ${frame}`;
+        requestAnimationFrame(draw);
+      }
+      requestAnimationFrame(draw);
+
+      // captureStream stands in for desktopCapturer on the real host.
+      const stream = canvas.captureStream(30);
+
+      // --- Test hooks the spec reads. ---
+      const state = {
+        ready: false,
+        connectionState: 'new',
+        dataChannelOpen: false,
+        receivedInputs: [],
+        lastInput: null,
+        adaptiveDecisions: [],
+      };
+      window.__host = {
+        getFrame: () => frame,
+        getState: () => ({ ...state, receivedInputs: [...state.receivedInputs] }),
+        getReceivedInputs: () => [...state.receivedInputs],
+        getLastInput: () => state.lastInput,
+      };
+
+      const signaling = new SignalingClient(wsUrl);
+      const peer = new Peer({ role: 'host', signaling });
+      const adaptive = new AdaptiveController();
+
+      peer.on('state', (s) => {
+        state.connectionState = s;
+        statusEl.textContent = `host: ${s}`;
+      });
+      peer.on('datachannel', (ch) => {
+        const markOpen = () => {
+          state.dataChannelOpen = true;
+        };
+        if (ch.readyState === 'open') markOpen();
+        ch.addEventListener?.('open', markOpen);
+        ch.onopen = markOpen;
+      });
+
+      peer.onInput((ev) => {
+        state.receivedInputs.push(ev);
+        state.lastInput = ev;
+        lastInputEl.textContent = `lastInput: ${JSON.stringify(ev)}`;
+        // Render the latest pointer position on the canvas so the input
+        // pipeline is observable visually as well.
+        if (ev.t === 'm-move' || ev.t === 'm-down' || ev.t === 'm-up') {
+          ctx.strokeStyle = '#ff0';
+          ctx.beginPath();
+          ctx.arc(ev.x * canvas.width, ev.y * canvas.height, 10, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      });
+
+      // Adaptive loop: sample real stats each tick and apply the decision to
+      // the outbound sender. This exercises the auto-negotiate-lag engine end
+      // to end against a live RTCRtpSender.
+      async function adaptiveTick() {
+        try {
+          const stats = await peer.getStats();
+          const decision = adaptive.update(stats);
+          state.adaptiveDecisions.push(decision);
+          await peer.applyDecision(decision);
+        } catch {
+          /* ignore until the connection is up */
+        }
+      }
+      setInterval(adaptiveTick, 500);
+
+      (async () => {
+        await signaling.connect();
+        await peer.start();
+        peer.attachStream(stream);
+        signaling.join({ code, role: 'host', name: 'e2e-host' });
+        state.ready = true;
+        statusEl.textContent = 'host: joined';
+      })().catch((err) => {
+        statusEl.textContent = `host: error ${String(err)}`;
+        window.__hostError = String(err);
+      });
+    </script>
+  </body>
+</html>

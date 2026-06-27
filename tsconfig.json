@@ -1,6 +1,9 @@
 {
   "files": [],
   "references": [
-    { "path": "packages/core" }
+    { "path": "packages/core" },
+    { "path": "packages/signaling" },
+    { "path": "packages/ai" },
+    { "path": "packages/host" }
   ]
 }

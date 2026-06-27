@@ -11,11 +11,12 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -b",
-    "typecheck": "tsc -b",
+    "build": "tsc -b && npm -w @stream-screen/viewer run typecheck",
+    "typecheck": "tsc -b && npm -w @stream-screen/viewer run typecheck",
     "test": "npm run test --workspaces --if-present",
     "dev:signaling": "npm -w @stream-screen/signaling run dev",
-    "e2e": "npm -w @stream-screen/e2e test"
+    "e2e": "npm -w @stream-screen/e2e test",
+    "verify": "npm run build && npm test && npm run e2e"
   },
   "devDependencies": {
     "typescript": "^5.5",
