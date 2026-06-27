@@ -503,7 +503,11 @@ validated against the 6–9 digit pattern and any unusable one is dropped; in
 particular the `/api/sessions` fallback redacts codes (e.g. `****56`) for
 unauthenticated callers, so `list_hosts` presents `STREAMSCREEN_TOKEN` as a bearer
 token for un-redacted codes and drops any redacted code that `connect` would
-reject. When `/api/discover` advertises a host's own `address`/`port`,
+reject. `STREAMSCREEN_TOKEN` is the single canonical name read on **both** sides —
+the signaling server uses it to un-redact `/api/sessions`, and the AI client sends
+it — so one token configures the whole flow; the legacy `STREAMSCREEN_REST_TOKEN`
+remains a backward-compatible alias on the server (the canonical name wins if both
+are set). When `/api/discover` advertises a host's own `address`/`port`,
 `list_hosts` carries that host's signaling endpoint
 (`ws://address:port`, IPv6 bracketed) through with the code, so a later
 `connect(code)` joins against **that** host's own signaling server rather than

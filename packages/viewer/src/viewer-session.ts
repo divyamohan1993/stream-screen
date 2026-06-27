@@ -186,7 +186,26 @@ export class ViewerSession {
     return this.state;
   }
 
-  private setState(state: SessionState, detail?: string): void {
+  /**
+   * Update lifecycle state and notify the UI.
+   *
+   * DEFENSE IN DEPTH against superseded connects (FINDING P2): once the session
+   * has been torn down (`closed`), a late state emission from an OLD, canceled
+   * attempt must never reach the UI. If the user retries or picks another host
+   * while a previous `connect()` is still awaiting the socket/join, App disconnects
+   * that old session — but the rejected async path of the OLD session would still
+   * call `setState('error', …)`, and App's GLOBAL state handler would bounce a
+   * newer connecting/connected session back to 'error'. So `setState` is a NO-OP
+   * once `closed`.
+   *
+   * The two INTENTIONAL terminal emissions that run as part of teardown itself —
+   * `disconnect()` surfacing 'disconnected' and the connect()/rebuild error paths
+   * surfacing 'error' — pass `force: true` so they are emitted exactly once even
+   * though they set `closed`. Any subsequent (late, superseded) setState is then
+   * suppressed by the guard.
+   */
+  private setState(state: SessionState, detail?: string, force = false): void {
+    if (this.closed && !force) return;
     this.state = state;
     this.handlers.onState?.(state, detail);
   }
@@ -258,13 +277,27 @@ export class ViewerSession {
       this.setState('waiting-for-host', 'Joined — waiting for host stream.');
       this.startStatsLoop();
     } catch (err) {
+      // Was this session ALREADY torn down before the failure surfaced? That is
+      // the superseded case (FINDING P2): the user retried / picked another host
+      // while this connect() was still awaiting the socket/join, App called
+      // disconnect() on us, and only NOW does our awaited path reject. We must NOT
+      // emit a late 'error' — App's global state handler would otherwise bounce a
+      // newer connecting/connected session back to 'error'.
+      const supersededBeforeFailure = this.closed;
       // ANY failure — connect, peer start, a rejected join such as
       // `no-such-session`, or a join-ack timeout — must fully tear down so no
       // dangling joined socket is left whose remembered join the SignalingClient
       // could reconnect and replay. disconnect() closes the peer and CLOSES the
       // SignalingClient (clearing its reconnect schedule) and stops the loop.
+      // (No-op if we were already disconnected externally.)
       this.disconnect();
-      this.setState('error', err instanceof Error ? err.message : 'Failed to connect');
+      // Only emit the connect-failure 'error' for a session that was still live
+      // when it failed. `force` is needed because disconnect() (just above) marks
+      // the session closed; the superseded guard above already excludes the
+      // late/stale case, so this never resurrects a torn-down session's state.
+      if (!supersededBeforeFailure) {
+        this.setState('error', err instanceof Error ? err.message : 'Failed to connect', true);
+      }
       throw err;
     }
   }
@@ -484,7 +517,9 @@ export class ViewerSession {
       // transparent recovery, so the session ends here — it imposes no time
       // limit; the path is reached only on a real join rejection/timeout.
       this.teardownForError();
-      this.setState('error', err instanceof Error ? err.message : 'Reconnection failed');
+      // `force`: teardownForError() marked the session closed, but this 'error' is
+      // the intentional terminal state for a failed rebuild.
+      this.setState('error', err instanceof Error ? err.message : 'Reconnection failed', true);
     } finally {
       this.rebuilding = false;
     }
@@ -774,6 +809,8 @@ export class ViewerSession {
     this.signaling?.close();
     this.signaling = null;
     this.stream = null;
-    this.setState('disconnected');
+    // `force`: `closed` was set at the top of this method, but this terminal
+    // 'disconnected' emission is the intentional one for a user-initiated teardown.
+    this.setState('disconnected', undefined, true);
   }
 }

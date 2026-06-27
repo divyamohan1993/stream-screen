@@ -132,8 +132,26 @@ export class SessionController {
         this.api.reportStatus(`${(d.targetKbps / 1000).toFixed(1)}Mbps`);
       },
     });
+    // Only treat the session as the live `current` AFTER start() resolves. If
+    // start() rejects (signaling down, host-exists / code already held, or
+    // capture failed), HostSession.start() stops itself and rethrows; we must
+    // NOT leave `current` pointing at that stopped, peerless session. Otherwise
+    // a later changeSource would take the `current` branch and call
+    // switchSource() on a dead session (no peer to replaceVideoTrack on) instead
+    // of doing a fresh join — and the operator could never recover by selecting
+    // a source. Clear `current` and discard the stopped session on failure so a
+    // subsequent changeSource performs a full startSession (fresh join). No
+    // session time limit or usage cap is introduced here.
+    try {
+      await session.start();
+    } catch (err) {
+      // start() already stopped itself on failure; ensure it is fully torn down
+      // and drop our reference so the next changeSource starts fresh.
+      session.stop();
+      this.session = null;
+      throw err;
+    }
     this.session = session;
-    await session.start();
   }
 
   /** Tear down the live session, if any. */

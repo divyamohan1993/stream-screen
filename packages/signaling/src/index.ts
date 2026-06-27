@@ -73,11 +73,21 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
   // Optional hardening config (all opt-in; zero-config defaults stay friendly):
   //   STREAMSCREEN_ALLOWED_ORIGINS  comma-separated browser Origin allowlist
   //                                 (use '*' to allow any — explicit opt-out).
-  //   STREAMSCREEN_REST_TOKEN       bearer token that unlocks raw codes on
-  //                                 /api/sessions; without it that endpoint is
-  //                                 always redacted.
+  //   STREAMSCREEN_TOKEN            CANONICAL bearer token that unlocks raw codes
+  //                                 on /api/sessions; without it that endpoint is
+  //                                 always redacted. This is the SAME env var the
+  //                                 AI client (packages/ai) reads to authenticate
+  //                                 its /api/sessions fallback, so list_hosts gets
+  //                                 un-redacted, joinable codes in the documented
+  //                                 single-token setup.
+  //   STREAMSCREEN_REST_TOKEN      backward-compatible ALIAS for the above. When
+  //                                 both are set, STREAMSCREEN_TOKEN wins.
   const allowedOrigins = parseList(process.env.STREAMSCREEN_ALLOWED_ORIGINS);
-  const restToken = process.env.STREAMSCREEN_REST_TOKEN || undefined;
+  // Prefer the canonical STREAMSCREEN_TOKEN (matches the AI client + docs); fall
+  // back to the legacy STREAMSCREEN_REST_TOKEN alias so existing deployments that
+  // only set the old name keep working.
+  const restToken =
+    process.env.STREAMSCREEN_TOKEN || process.env.STREAMSCREEN_REST_TOKEN || undefined;
   // STREAMSCREEN_TRUST_PROXY: opt in to honoring X-Forwarded-For for the
   // join-failure throttle (only when behind a TRUSTED reverse proxy). Off by
   // default so direct LAN clients cannot spoof XFF to evade the throttle.

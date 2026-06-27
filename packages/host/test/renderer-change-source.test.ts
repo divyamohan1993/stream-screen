@@ -147,6 +147,88 @@ describe('SessionController source switch (P2 host-exists race regression)', () 
     await expect(controller.changeSource(cfg, 'screen:1')).rejects.toThrow('boom');
   });
 
+  it('clears `current` when start() rejects, and a later changeSource does a FRESH start (not switchSource on a dead session)', async () => {
+    // FINDING (P2) renderer.ts:136 — SessionController stored the new HostSession
+    // BEFORE start() resolved. If the initial start REJECTED (signaling down,
+    // host-exists / code already held, or capture failed), HostSession.start()
+    // stops itself and rethrows, but `current` STILL pointed at that stopped,
+    // peerless session. A later source change then took the `current` branch and
+    // called switchSource() on a session with NO peer instead of doing a fresh
+    // startSession — so the host control window could never recover by selecting
+    // a source. FIX: only set `current` AFTER start() resolves; clear it (null)
+    // and discard the stopped session if start() rejects.
+    const api = makeApi();
+    const built: FakeHostSession[] = [];
+    let failNextStart = true;
+    const factory = (opts: HostSessionOptions): HostSession => {
+      const s = new FakeHostSession(opts);
+      if (failNextStart) {
+        failNextStart = false;
+        // Mimic HostSession.start(): on failure it stops itself and rethrows.
+        s.start = vi.fn(async () => {
+          s.stopCalls += 1;
+          s.advertised = false;
+          throw new Error('host-exists');
+        });
+      }
+      built.push(s);
+      return s as unknown as HostSession;
+    };
+    const controller = new SessionController(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      api as any,
+      () => {},
+      factory,
+    );
+
+    // Initial start rejects (e.g. signaling down / host-exists).
+    await expect(controller.startSession(cfg, 'screen:0')).rejects.toThrow('host-exists');
+
+    // CRUX: `current` must be null — the stopped, peerless session is discarded.
+    expect(controller.current).toBeNull();
+    expect(built).toHaveLength(1);
+    expect(built[0].advertised).toBe(false);
+
+    // A subsequent changeSource must perform a FRESH start (full join) rather
+    // than switchSource on the dead first session.
+    await controller.changeSource(cfg, 'screen:1');
+
+    // A brand-new HostSession was constructed and started for the recovery.
+    expect(built).toHaveLength(2);
+    expect(built[1].startCalls).toBe(1);
+    expect(built[1].advertised).toBe(true);
+    // No switchSource was attempted on the dead first session.
+    expect(built[0].switchSourceCalls).toEqual([]);
+    // The new live session is the controller's current session.
+    expect(controller.current).toBe(built[1] as unknown as HostSession);
+  });
+
+  it('sets `current` when start() succeeds, and a later changeSource uses switchSource IN PLACE', async () => {
+    const api = makeApi();
+    const built: FakeHostSession[] = [];
+    const factory = (opts: HostSessionOptions): HostSession => {
+      const s = new FakeHostSession(opts);
+      built.push(s);
+      return s as unknown as HostSession;
+    };
+    const controller = new SessionController(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      api as any,
+      () => {},
+      factory,
+    );
+
+    await controller.startSession(cfg, 'screen:0');
+    // start() resolved => current is the live session.
+    expect(controller.current).toBe(built[0] as unknown as HostSession);
+
+    await controller.changeSource(cfg, 'screen:1');
+    // In-place switch: no second session built, switchSource was used.
+    expect(built).toHaveLength(1);
+    expect(built[0].switchSourceCalls).toEqual(['screen:1']);
+    expect(controller.current).toBe(built[0] as unknown as HostSession);
+  });
+
   it('falls back to a full start when there is no live session yet', async () => {
     const api = makeApi();
     const built: FakeHostSession[] = [];

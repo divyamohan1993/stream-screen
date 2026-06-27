@@ -137,6 +137,13 @@ export function App(): React.JSX.Element {
         signalingUrl: signalingUrl ?? defaultSignalingUrl(),
         handlers: {
           onState: (st, detail) => {
+            // DEFENSE IN DEPTH against superseded connects (FINDING P2): only the
+            // CURRENT session may drive global UI state. If the user retried or
+            // picked another host, App constructed a newer session and overwrote
+            // sessionRef; a late state event from THIS (now-stale) session must be
+            // ignored so a canceled attempt's 'error' can never overwrite the newer
+            // session's connecting/connected state and bounce the UI back to error.
+            if (sessionRef.current !== session) return;
             setState(st);
             if (st === 'error') setError(detail ?? 'Connection error');
             // On connect, ask the host for its monitor list.

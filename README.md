@@ -292,7 +292,11 @@ teardown discipline guards the **ICE-reconnect rebuild**: if the rebuild's fresh
 join is rejected or times out (e.g. the host left during the reconnect grace
 period) the viewer fully tears the failed rebuild down — closing the new peer and
 the signaling client and stopping the stats loop — and ends cleanly in `error`
-rather than leaving a peer and a reconnecting socket dangling. By default — with no
+rather than leaving a peer and a reconnecting socket dangling. If you retry or
+pick another host while a previous connect is still in flight, the viewer ignores
+the late `error` from that **superseded** attempt — only the current session may
+drive UI state — so a newer connecting/connected session is never bounced back to
+`error`. By default — with no
 `STREAMSCREEN_ALLOWED_ORIGINS` configured — the signaling server accepts WS
 handshakes whose browser `Origin` is loopback, the same host as the server (on
 **any** port, so the Vite dev viewer on `:5173` reaches signaling on `:8787`), or
@@ -346,7 +350,11 @@ file-transfer signaling) and a reliable binary `file` channel (the file bytes).
   re-captures and swaps the outbound track via `replaceVideoTrack` **without
   leaving and rejoining the signaling room**, so it can never lose the session to
   a `host-exists` rejection (the old code stopped the session and immediately
-  re-joined with the same code, racing ahead of the server-observed leave).
+  re-joined with the same code, racing ahead of the server-observed leave). If an
+  initial start **fails** (signaling down, code already held, or capture error),
+  the host clears the failed session instead of keeping a dead, peerless reference,
+  so the next source selection performs a fresh join and **recovers** rather than
+  attempting an in-place swap on a session that has no peer.
 
 - **Session recording.** The viewer can record the incoming remote `MediaStream`
   with the browser's `MediaRecorder` and save a downloadable **`.webm`**. Recording
@@ -666,7 +674,7 @@ Per-package tests can also be run directly, e.g.
 | `STREAMSCREEN_HOST_NAME` | signaling, host | machine hostname | advertised name |
 | `STREAMSCREEN_SIGNALING_URL` | host, ai | `ws://127.0.0.1:8787` | signaling WS URL |
 | `STREAMSCREEN_SIGNALING_HTTP_URL` | ai | derived from WS URL | signaling REST base for `list_hosts` |
-| `STREAMSCREEN_TOKEN` | ai | – | bearer token for `/api/sessions` to get un-redacted codes |
+| `STREAMSCREEN_TOKEN` | signaling, ai | – | bearer token: signaling un-redacts `/api/sessions` codes for callers that present it; ai sends it. Legacy alias `STREAMSCREEN_REST_TOKEN` still accepted (canonical wins if both set) |
 | `STREAMSCREEN_ALLOWED_ORIGINS` | signaling | – | comma-separated WS Origin allowlist (or `*`); default accepts loopback/LAN/same-host |
 | `STREAMSCREEN_CODE` | host | minted | fixed session code |
 | `STREAMSCREEN_AI_MODE` | ai | `mcp` | `rest` to run the REST API |
