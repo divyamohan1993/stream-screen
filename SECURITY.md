@@ -107,6 +107,17 @@ already in the room but unapproved, or one that joins before passing its
 PIN/consent, **receives nothing**: no video, no audio, no input. Only `open` mode
 (no auth) attaches to everyone, which is its intended behavior.
 
+The same authorization gate applies to **host-pushed file transfers**. In any
+protected mode a host `sendFile` is delivered **only to currently authorized
+viewers** — a no-target send fans out to each authorized viewer as an independent
+transfer rather than broadcasting to every open connection, and an explicit send
+to an unauthorized viewer is **refused**. Defensively, the **viewer also ignores
+inbound file offers (and their chunks/progress) until it is authorized**: while
+the auth handshake is still pending the control/file channels are open, so a
+viewer that has not yet received `auth-result{ok:true}` drops any inbound file
+outright instead of auto-accepting it. In `open` mode (no auth) host file sends
+broadcast to all, which is the intended behavior.
+
 ### Channel binding (anti-MITM)
 
 The `channelBinding` is the canonical (sorted) concatenation of the
@@ -119,7 +130,18 @@ proof it could relay — would not match. The auth fails closed.
 ### Online brute-force defense (lockout)
 
 The PIN is intentionally low-entropy, so the connection layer rate-limits
-guessing per **(source identity + peer id)**:
+guessing per **source identity**. The lockout key is the viewer's **socket
+source address as supplied by the signaling server** (the same value signaling
+uses for its join-throttle — `req.socket.remoteAddress`, honoring
+`STREAMSCREEN_TRUST_PROXY`), delivered to the host as host-only metadata on
+`peer-joined`. This is deliberately **reconnect-resistant**: the per-connection
+peer UUID and the per-`RTCPeerConnection` DTLS channel binding are both minted
+fresh on every join, so keying on either would let an attacker reset the counter
+by disconnecting and rejoining after each wrong guess. Keying on the stable
+source address means failures keep accumulating across reconnects. (If an older
+signaling server does not supply the address, the host falls back to the
+per-connection channel binding, which at least rate-limits within one
+connection.)
 
 - After a threshold of consecutive failed proofs (default 5) the key is **locked
   out** with **exponential backoff** (base 1s, doubling, capped at ~30 min).

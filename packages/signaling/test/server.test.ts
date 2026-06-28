@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import type { SignalMessage } from '@stream-screen/core';
 import { SignalingServer, generateCode, isLanOrDevOrigin } from '../src/server.js';
@@ -371,6 +371,99 @@ describe('SignalingServer', () => {
     } finally {
       await proxied.close();
     }
+  });
+
+  it("delivers the joining viewer's stable socket source address to the host as peer-joined.sourceAddr", async () => {
+    // P1 lockout keying: the host needs an identity for the viewer that survives
+    // disconnect+rejoin (unlike the per-connection peer UUID / DTLS binding).
+    // Signaling supplies it as 'sourceAddr' on the host's peer-joined — the SAME
+    // value used as the join-throttle key (socket remoteAddress, default config).
+    const host = await connect(port);
+    send(host, { type: 'join', role: 'host', code: '770077' });
+    const code = (await nextMessage(host, 'joined')).code!;
+
+    const viewer = await connect(port);
+    send(viewer, { type: 'join', role: 'viewer', code });
+    const viewerId = (await nextMessage(viewer, 'joined')).from!;
+
+    const peerJoined = await nextMessage(host, 'peer-joined');
+    expect(peerJoined.from).toBe(viewerId);
+    expect(peerJoined.role).toBe('viewer');
+    // Default config (trustProxy OFF) keys on the real TCP peer = loopback.
+    expect(typeof peerJoined.sourceAddr).toBe('string');
+    expect(peerJoined.sourceAddr).toMatch(/127\.0\.0\.1|::1|::ffff:127\.0\.0\.1/);
+
+    host.close();
+    viewer.close();
+  });
+
+  it('keys peer-joined.sourceAddr on the trusted X-Forwarded-For when trustProxy is enabled (consistent with the throttle)', async () => {
+    // The address the host keys lockouts on MUST match the throttle key. With
+    // trustProxy ON the throttle honors the left-most XFF, so sourceAddr must
+    // carry that same client address — not the proxy's socket peer.
+    const proxied = new SignalingServer({ port: 0, heartbeatMs: 0, trustProxy: true });
+    try {
+      const p = proxied.port;
+      const host = await connect(p);
+      send(host, { type: 'join', role: 'host', code: '771177' });
+      const code = (await nextMessage(host, 'joined')).code!;
+
+      const clientAddr = '198.51.100.23';
+      const viewer = await connect(p, { 'x-forwarded-for': clientAddr });
+      send(viewer, { type: 'join', role: 'viewer', code });
+      await nextMessage(viewer, 'joined');
+
+      const peerJoined = await nextMessage(host, 'peer-joined');
+      expect(peerJoined.role).toBe('viewer');
+      expect(peerJoined.sourceAddr).toBe(clientAddr);
+
+      host.close();
+      viewer.close();
+    } finally {
+      await proxied.close();
+    }
+  });
+
+  it('does NOT leak a viewer source address to other viewers (host-only metadata)', async () => {
+    // sourceAddr is host-only: a second viewer learning a peer joined must NOT
+    // receive the first viewer's address. On join, viewerB receives a
+    // peer-joined for EACH already-present peer (the host and viewerA), in
+    // arbitrary order; collect both and assert NONE carries a sourceAddr.
+    const host = await connect(port);
+    send(host, { type: 'join', role: 'host', code: '772277' });
+    const code = (await nextMessage(host, 'joined')).code!;
+
+    const viewerA = await connect(port);
+    send(viewerA, { type: 'join', role: 'viewer', code });
+    await nextMessage(viewerA, 'joined');
+    // Host gets A's peer-joined (with sourceAddr); drain it.
+    await nextMessage(host, 'peer-joined');
+
+    const viewerB = await connect(port);
+    // Collect EVERY peer-joined viewerB receives. On join it learns about BOTH
+    // already-present peers (host + viewerA); the two messages can arrive in the
+    // same tick, so a persistent collector (attached before join) avoids a
+    // listener race.
+    const seenByB: SignalMessage[] = [];
+    viewerB.on('message', (data: Buffer) => {
+      const m = JSON.parse(data.toString('utf8')) as SignalMessage;
+      if (m.type === 'peer-joined') seenByB.push(m);
+    });
+
+    send(viewerB, { type: 'join', role: 'viewer', code });
+    await nextMessage(viewerB, 'joined');
+
+    // Wait until both joiner-side peer-joined notifications have arrived.
+    await vi.waitUntil(() => seenByB.length >= 2, { timeout: 3000, interval: 20 });
+
+    const roles = seenByB.map((m) => m.role).sort();
+    expect(roles).toEqual(['host', 'viewer']);
+    // NONE of these viewer-facing peer-joined messages may carry a sourceAddr.
+    for (const m of seenByB) expect(m.sourceAddr).toBeUndefined();
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
   });
 
   it('rejects browser-origin WS handshakes unless allowlisted', async () => {

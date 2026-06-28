@@ -541,7 +541,7 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
     // already present so a viewer immediately knows the host id to offer to.
     for (const other of room.peers.values()) {
       if (other.id === peer.id) continue;
-      this.send(other.socket, {
+      const arrived: SignalMessage = {
         type: 'peer-joined',
         from: peer.id,
         room: code,
@@ -549,7 +549,19 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
         role: peer.role,
         name: peer.name,
         ts: Date.now(),
-      });
+      };
+      // HOST-ONLY metadata: tell the host the joining VIEWER's stable socket
+      // source address (the SAME value used as the join-throttle key — socket
+      // remoteAddress, trust-proxy aware). Unlike the per-connection peer UUID
+      // / DTLS channel binding, this survives disconnect+rejoin, so the host can
+      // key PIN-lockout state on an identity an attacker cannot rotate by
+      // reconnecting. It carries NO secret (no PIN/token/proof), only a coarse
+      // network identity. Sent ONLY to the host, and only for viewer arrivals,
+      // so we never leak one viewer's address to another viewer.
+      if (other.role === 'host' && peer.role === 'viewer') {
+        arrived.sourceAddr = remoteAddr;
+      }
+      this.send(other.socket, arrived);
       this.send(socket, {
         type: 'peer-joined',
         from: other.id,

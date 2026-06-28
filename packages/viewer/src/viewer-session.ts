@@ -519,6 +519,10 @@ export class ViewerSession {
       true,
     );
     peer.onFileChunk((buf: ArrayBuffer) => {
+      // P2 (defensive): drop inbound file chunks while still gated. We never
+      // accepted a gated offer, so any chunk arriving now is for a transfer we
+      // are refusing — discard it rather than assembling unauthorized bytes.
+      if (this.isFileGated()) return;
       this.fileManager?.onChunk(buf);
     });
 
@@ -744,6 +748,17 @@ export class ViewerSession {
   }
 
   /**
+   * Whether inbound host file transfers must be refused right now. True while the
+   * session is GATED — the host required authorization (an `auth-challenge`
+   * arrived) and we have not yet received `auth-result{ok:true}`. In `'open'` mode
+   * no challenge ever arrives, so `authRequired` stays false and this returns
+   * false (inbound files flow as today). Once authorized this returns false too.
+   */
+  private isFileGated(): boolean {
+    return this.authRequired && !this.authorized;
+  }
+
+  /**
    * Route an inbound {@link ControlMessage}. File-offer/complete and inbound
    * chunks are delegated to the {@link FileTransferManager}; file-accept/reject
    * release/abort our outbound senders; chat/monitors are surfaced to the UI.
@@ -760,6 +775,14 @@ export class ViewerSession {
         this.handlers.onMonitorSwitched?.(m.id);
         break;
       case 'file-offer':
+        // P2 (defensive): never auto-accept or process an inbound host file
+        // until we are authorized. In a protected mode the control/file channels
+        // are open while the auth handshake is still pending, so a host could push
+        // a file before its `auth-result{ok:true}`. While the session is GATED
+        // (auth required and not yet authorized) we DROP the offer outright: do not
+        // create a receiver, do not auto-ACCEPT, do not surface it to the UI. In
+        // `'open'` mode no challenge ever arrives so this never gates.
+        if (this.isFileGated()) break;
         // Let the manager create the receiver; surface the offer to the UI.
         this.fileManager?.onControl(m);
         this.handlers.onFileTransfer?.({
@@ -773,6 +796,8 @@ export class ViewerSession {
         });
         break;
       case 'file-complete':
+        // Gated: ignore stray completes for an offer we never accepted.
+        if (this.isFileGated()) break;
         this.fileManager?.onControl(m);
         this.handlers.onFileTransfer?.({
           id: m.id,
@@ -808,6 +833,8 @@ export class ViewerSession {
         break;
       }
       case 'file-progress':
+        // Gated: ignore inbound progress for a push we are not accepting.
+        if (this.isFileGated()) break;
         // Inbound progress for a transfer the host is pushing to us.
         this.handlers.onFileTransfer?.({
           id: m.id,

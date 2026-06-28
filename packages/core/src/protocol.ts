@@ -51,6 +51,19 @@ export interface SignalMessage {
    * defaults.
    */
   iceServers?: RTCIceServer[];
+  /**
+   * Host-only metadata the signaling server MAY attach to a `peer-joined`
+   * message: the joining viewer's socket source address as seen by signaling
+   * (e.g. `req.socket.remoteAddress`, honoring STREAMSCREEN_TRUST_PROXY). It is
+   * a COARSE network identity, not a secret — it carries no PIN, token, or proof
+   * material. The host uses it to key PIN-lockout state on an identity that is
+   * STABLE across reconnects, since both the minted peer UUID and the DTLS
+   * channel binding are per-connection and so cannot defend against an attacker
+   * who disconnects and rejoins after each wrong PIN. OPTIONAL and additive:
+   * absent on every other message type and on signaling servers that predate
+   * this field, so peers without it simply fall back to the per-connection key.
+   */
+  sourceAddr?: string;
 }
 
 /**
@@ -146,6 +159,10 @@ export function isSignalMessage(v: unknown): v is SignalMessage {
   // Additive/backward-compatible: `iceServers` is optional, but when present it
   // must be a well-formed list so a malformed distribution can't leak through.
   if (o.iceServers !== undefined && !isIceServerList(o.iceServers)) return false;
+  // Additive/backward-compatible: `sourceAddr` (the viewer's coarse socket
+  // source address that signaling attaches to `peer-joined`) is optional, but
+  // when present it must be a string so a malformed value can't leak through.
+  if (o.sourceAddr !== undefined && typeof o.sourceAddr !== 'string') return false;
   return true;
 }
 

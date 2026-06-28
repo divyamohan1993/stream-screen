@@ -361,6 +361,19 @@ export class HostSession {
    */
   private readonly viewerNames = new Map<string, string | undefined>();
   /**
+   * The viewer's STABLE socket source address (as seen by signaling), keyed by
+   * the per-connection viewer id, captured from the 'peer-joined' message's
+   * optional {@link SignalMessage.sourceAddr}. Unlike the per-connection peer id
+   * and DTLS channel binding — BOTH of which the signaling server / browser mint
+   * fresh on every reconnect — this address is STABLE across disconnect/rejoin
+   * from the same network source. It is the lockout-key identity (see
+   * {@link lockoutKeyFor}) so an attacker cannot reset the PIN-failure counter by
+   * reconnecting after each wrong guess. Carries NO secret — only a coarse
+   * network identity. Absent when older signaling does not attach it (then the
+   * lockout falls back to the per-connection channel binding — prior behavior).
+   */
+  private readonly viewerSourceAddrs = new Map<string, string>();
+  /**
    * Disposer for the {@link Peer.onControlOpen} subscription that drives the
    * access handshake; removed on {@link stop}.
    */
@@ -535,6 +548,17 @@ export class HostSession {
           // auth frames sent over a not-yet-open control channel are silently
           // dropped — leaving the viewer stuck. Auth (re)starts in onControlOpen.
           this.viewerNames.set(msg.from, msg.name);
+          // P1: stash the viewer's STABLE socket source address (host-only
+          // signaling metadata, no secret). The PIN-failure lockout is keyed on
+          // this — NOT the per-connection viewer id / DTLS channel binding —
+          // because both of those are minted fresh on every reconnect, letting an
+          // attacker reset the lockout by disconnecting after each wrong guess.
+          // A stable address survives reconnects, so failures keep accumulating
+          // toward the threshold. Absent on older signaling (then we fall back to
+          // the channel binding — unchanged behavior). See lockoutKeyFor.
+          if (typeof msg.sourceAddr === 'string' && msg.sourceAddr.length > 0) {
+            this.viewerSourceAddrs.set(msg.from, msg.sourceAddr);
+          }
         }
       });
       signaling.on('peer-left', (msg) => {
@@ -544,6 +568,12 @@ export class HostSession {
         this.authorizedViewers.delete(msg.from);
         this.pendingChallenges.delete(msg.from);
         this.viewerNames.delete(msg.from);
+        // Drop the per-connection -> source-address mapping. The LOCKOUT STATE
+        // itself (keyed on the stable source address inside LockoutTracker) is
+        // intentionally NOT cleared here: that would defeat P1 — a reconnect must
+        // keep accumulating failures under the same address. Only the
+        // per-connection lookup entry goes; the next join re-stashes it.
+        this.viewerSourceAddrs.delete(msg.from);
         if (msg.role === 'viewer') this.opts.onViewerLeft?.(msg.from);
       });
 
@@ -711,16 +741,35 @@ export class HostSession {
   }
 
   /**
-   * Lockout/consent identity for a viewer. The renderer has no raw source IP, so
-   * the DTLS CHANNEL BINDING (stable per DTLS session, distinct per transport)
-   * serves as the network-source surrogate in the lockout key, combined with the
-   * signaling peer id. A re-terminated-DTLS MITM gets a different binding (and a
-   * failing proof anyway), so this is a sound, fail-closed identity.
+   * Lockout identity for a viewer — the key the {@link LockoutTracker} accumulates
+   * PIN failures under. It MUST be STABLE across disconnect/rejoin, otherwise an
+   * attacker resets the online-brute-force counter by reconnecting after each
+   * wrong guess and never reaches the threshold.
+   *
+   * The per-connection viewer id AND the DTLS channel binding are both minted
+   * fresh on every join (a new peer UUID from signaling; a new binding per
+   * RTCPeerConnection), so NEITHER can anchor the lockout. The STABLE anchor is
+   * the viewer's SOCKET SOURCE ADDRESS as seen by signaling, delivered as the
+   * host-only {@link SignalMessage.sourceAddr} on 'peer-joined' and stashed in
+   * {@link viewerSourceAddrs}. We key BOTH `ip` and `peerId` on that address so
+   * the composed lockout key is identical across reconnects from the same source.
+   *
+   * FALLBACK: when signaling did not attach a sourceAddr (older server), we
+   * revert to the PRIOR behavior — { ip: channelBinding, peerId: viewerId } —
+   * which at least rate-limits within a single connection. We PREFER sourceAddr
+   * whenever present. Either way the channel binding remains in the PROOF
+   * verification (anti-MITM); only the LOCKOUT KEY changes here.
    */
   private lockoutKeyFor(viewerId: string, channelBinding: string): {
     ip: string;
     peerId: string;
   } {
+    const stable = this.viewerSourceAddrs.get(viewerId);
+    if (stable) {
+      // Anchor the WHOLE key on the stable source so reconnects (fresh viewerId
+      // and channel binding) compose the exact same key and keep accumulating.
+      return { ip: stable, peerId: stable };
+    }
     return { ip: channelBinding || 'unknown', peerId: viewerId };
   }
 
@@ -1097,11 +1146,66 @@ export class HostSession {
    * with control-channel offer/accept/progress/complete and SCTP backpressure.
    * The viewer drives acceptance by replying `file-accept` (routed in
    * {@link handleControl} via the sender registered here).
+   *
+   * AUTHORIZATION (P2). The naive broadcast (no `viewerId` => target undefined)
+   * pushed the offer + every chunk to EVERY Peer connection. In a protected mode
+   * unapproved viewers still have open control/file channels and the viewer
+   * auto-accepts inbound offers before it has an auth result, so a host-pushed
+   * file would reach a viewer that has NOT passed PIN/consent. So:
+   *
+   *   - OPEN mode: every viewer is implicitly authorized — broadcast to all,
+   *     exactly the historical behavior (a single send with target undefined).
+   *   - PROTECTED modes, no `viewerId`: send the offer + chunks ONLY to the
+   *     CURRENTLY AUTHORIZED viewers (one independent transfer each), never a
+   *     broadcast to all connections. No authorized viewers => nothing is sent.
+   *   - PROTECTED modes, explicit `viewerId`: REQUIRE it to be authorized; an
+   *     unauthorized target is refused (throws) — never leaked a file.
    */
   async sendFile(
     file: OutboundFile,
     onProgress?: (sent: number, total: number) => void,
     viewerId?: string,
+  ): Promise<void> {
+    const peer = this.peer;
+    if (!peer) throw new Error('HostSession.sendFile: session not started');
+
+    // P2 authorization gate. 'open' mode keeps the legacy single broadcast
+    // (target undefined => all connections). Protected modes never broadcast to
+    // all: restrict to authorized targets.
+    if (this.accessMode !== 'open') {
+      if (viewerId !== undefined) {
+        // Explicit target must be authorized, else refuse — never leak a file to
+        // an un-approved viewer.
+        if (!this.isAuthorized(viewerId)) {
+          throw new Error(
+            `HostSession.sendFile: viewer "${viewerId}" is not authorized to receive files`,
+          );
+        }
+      } else {
+        // No target: fan out to each currently-authorized viewer as an
+        // INDEPENDENT transfer. An unapproved viewer (still holding open
+        // control/file channels) is never in this set, so the offer + chunks
+        // never reach it. Nothing to do if no one is authorized yet.
+        const targets = [...this.authorizedViewers];
+        await Promise.all(
+          targets.map((t) => this.sendFileTo(file, t, onProgress)),
+        );
+        return;
+      }
+    }
+    await this.sendFileTo(file, viewerId, onProgress);
+  }
+
+  /**
+   * Internal single-target (or, in 'open' mode, broadcast when `viewerId` is
+   * undefined) file send. Authorization is enforced by the public
+   * {@link sendFile} BEFORE this runs; this method performs the actual
+   * offer/accept/chunk transfer and per-transfer handler cleanup.
+   */
+  private async sendFileTo(
+    file: OutboundFile,
+    viewerId: string | undefined,
+    onProgress?: (sent: number, total: number) => void,
   ): Promise<void> {
     const peer = this.peer;
     if (!peer) throw new Error('HostSession.sendFile: session not started');
@@ -1271,6 +1375,7 @@ export class HostSession {
     this.authorizedViewers.clear();
     this.pendingChallenges.clear();
     this.viewerNames.clear();
+    this.viewerSourceAddrs.clear();
     this.consent.clear();
     this.lockout.clear();
     this.streamAttached = false;

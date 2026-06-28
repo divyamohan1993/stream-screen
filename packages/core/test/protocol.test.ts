@@ -34,6 +34,24 @@ describe('protocol guards', () => {
     ).toBe(true);
   });
 
+  it('accepts a peer-joined with and without the optional sourceAddr (additive)', () => {
+    // Back-compat: a peer-joined with no sourceAddr is still valid.
+    expect(isSignalMessage({ type: 'peer-joined', from: 'v1' })).toBe(true);
+    // Host-only metadata: a stable socket source address as a plain string.
+    expect(
+      isSignalMessage({ type: 'peer-joined', from: 'v1', sourceAddr: '192.168.1.42' }),
+    ).toBe(true);
+    expect(
+      isSignalMessage({ type: 'peer-joined', from: 'v1', sourceAddr: '::ffff:10.0.0.5' }),
+    ).toBe(true);
+  });
+
+  it('rejects a peer-joined whose sourceAddr is not a string', () => {
+    expect(isSignalMessage({ type: 'peer-joined', from: 'v1', sourceAddr: 42 })).toBe(false);
+    expect(isSignalMessage({ type: 'peer-joined', from: 'v1', sourceAddr: {} })).toBe(false);
+    expect(isSignalMessage({ type: 'peer-joined', from: 'v1', sourceAddr: null })).toBe(false);
+  });
+
   it('rejects a signal message with a malformed iceServers field', () => {
     expect(isSignalMessage({ type: 'joined', iceServers: 'nope' })).toBe(false);
     expect(isSignalMessage({ type: 'joined', iceServers: [{ urls: 42 }] })).toBe(false);
