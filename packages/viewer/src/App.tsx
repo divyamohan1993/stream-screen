@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   CTRL_ALT_DEL,
   SPECIAL_KEYS,
+  parseIceServers,
   type AdaptiveDecision,
   type AdaptiveStats,
   type InputEvent,
@@ -148,7 +149,7 @@ export function App(): React.JSX.Element {
   }, []);
 
   const connect = useCallback(
-    async (code: string, signalingUrl?: string) => {
+    async (code: string, signalingUrl?: string, iceServers?: string) => {
       // Tear down any existing session BEFORE creating a new one. Otherwise a
       // failed/old session lingers — its SignalingClient keeps reconnecting and
       // replaying its remembered join, and its stats loop keeps running — while
@@ -165,12 +166,19 @@ export function App(): React.JSX.Element {
       setAuthChallenge(null);
       setAuthDenied(false);
       setAuthSubmitting(false);
+      // Parse any advanced local STUN/TURN override the user typed into the
+      // ConnectScreen. parseIceServers NEVER throws — garbage/empty → []. An
+      // empty list is passed as undefined so it counts as "no local override"
+      // and the server-distributed list from the `joined` ack (when present) is
+      // used instead. Both empty → LAN-only default, unchanged.
+      const parsedIce = iceServers ? parseIceServers(iceServers) : [];
       const session = new ViewerSession({
         code,
         // When a discovered host was picked, connect to ITS signaling server
         // (its advertised address:port); manual code entry has no override and
         // falls back to the viewer's default endpoint.
         signalingUrl: signalingUrl ?? defaultSignalingUrl(),
+        iceServers: parsedIce.length > 0 ? parsedIce : undefined,
         handlers: {
           onState: (st, detail) => {
             // DEFENSE IN DEPTH against superseded connects (FINDING P2): only the

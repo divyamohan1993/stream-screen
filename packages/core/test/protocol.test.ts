@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { isSignalMessage, isInputEvent, isValidSessionCode } from '../src/protocol.js';
+import {
+  isSignalMessage,
+  isInputEvent,
+  isValidSessionCode,
+  isIceServerList,
+} from '../src/protocol.js';
 
 describe('protocol guards', () => {
   it('accepts valid signal messages', () => {
@@ -13,6 +18,38 @@ describe('protocol guards', () => {
     expect(isSignalMessage({})).toBe(false);
     expect(isSignalMessage({ type: 'nope' })).toBe(false);
     expect(isSignalMessage('join')).toBe(false);
+  });
+
+  it('accepts a joined ack carrying an optional iceServers list (additive)', () => {
+    expect(isSignalMessage({ type: 'joined', from: 'h' })).toBe(true);
+    expect(isSignalMessage({ type: 'joined', iceServers: [] })).toBe(true);
+    expect(
+      isSignalMessage({
+        type: 'joined',
+        iceServers: [
+          { urls: 'stun:stun.example.com:3478' },
+          { urls: ['turn:t.example.com:3478'], username: 'u', credential: 'p' },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects a signal message with a malformed iceServers field', () => {
+    expect(isSignalMessage({ type: 'joined', iceServers: 'nope' })).toBe(false);
+    expect(isSignalMessage({ type: 'joined', iceServers: [{ urls: 42 }] })).toBe(false);
+    expect(
+      isSignalMessage({ type: 'joined', iceServers: [{ urls: 'stun:x', username: 5 }] }),
+    ).toBe(false);
+  });
+
+  it('isIceServerList validates list shape', () => {
+    expect(isIceServerList([])).toBe(true);
+    expect(isIceServerList([{ urls: 'stun:x.example.com' }])).toBe(true);
+    expect(isIceServerList([{ urls: ['turn:x'], username: 'u', credential: 'p' }])).toBe(true);
+    expect(isIceServerList('nope')).toBe(false);
+    expect(isIceServerList([{ urls: 42 }])).toBe(false);
+    expect(isIceServerList([{ urls: ['a', 1] }])).toBe(false);
+    expect(isIceServerList([{ urls: 'stun:x', credential: 9 }])).toBe(false);
   });
 
   it('accepts valid input events', () => {

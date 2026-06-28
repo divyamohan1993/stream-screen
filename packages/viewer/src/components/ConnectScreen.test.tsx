@@ -186,4 +186,46 @@ describe('ConnectScreen', () => {
     const input = screen.getByLabelText(/session code/i) as HTMLInputElement;
     expect(input.value).toBe('');
   });
+
+  it('threads the advanced ICE servers (STUN/TURN) field through onConnect', () => {
+    // "Connect from anywhere": the optional advanced ICE override is passed RAW
+    // (third arg) so App can parse it via core parseIceServers.
+    const onConnect = vi.fn();
+    render(<ConnectScreen onConnect={onConnect} />);
+    fireEvent.change(screen.getByLabelText(/session code/i), { target: { value: '123456' } });
+    fireEvent.change(screen.getByLabelText(/ice servers/i), {
+      target: { value: 'turn:user:pass@turn.example.com:3478' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    expect(onConnect).toHaveBeenCalledWith(
+      '123456',
+      undefined,
+      'turn:user:pass@turn.example.com:3478',
+    );
+  });
+
+  it('an empty ICE field leaves onConnect at its minimal arity (LAN-only default)', () => {
+    const onConnect = vi.fn();
+    render(<ConnectScreen onConnect={onConnect} />);
+    fireEvent.change(screen.getByLabelText(/session code/i), { target: { value: '123456' } });
+    // Leave the ICE field blank → no third argument; behavior unchanged.
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    expect(onConnect).toHaveBeenCalledWith('123456');
+    expect(onConnect.mock.calls[0]).toHaveLength(1);
+  });
+
+  it('persists the configured ICE servers and restores them on next mount', () => {
+    const first = render(<ConnectScreen onConnect={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText(/session code/i), { target: { value: '123456' } });
+    fireEvent.change(screen.getByLabelText(/ice servers/i), {
+      target: { value: 'stun:stun.example.com:3478' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^connect$/i }));
+    first.unmount();
+
+    // Remount: the ICE field is seeded from the persisted value.
+    render(<ConnectScreen onConnect={vi.fn()} />);
+    const restored = screen.getByLabelText(/ice servers/i) as HTMLInputElement;
+    expect(restored.value).toBe('stun:stun.example.com:3478');
+  });
 });

@@ -96,7 +96,8 @@ body {
   border-color: var(--accent);
 }
 
-.signaling-input {
+.signaling-input,
+.ice-input {
   font-family: var(--mono);
   font-size: 0.9rem;
   padding: 0.55rem 0.75rem;
@@ -107,9 +108,21 @@ body {
   width: 100%;
 }
 
-.signaling-input:focus {
+.signaling-input:focus,
+.ice-input:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+.advanced-ice {
+  margin-top: 0.75rem;
+}
+
+.advanced-ice > summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--muted, var(--text));
+  user-select: none;
 }
 
 button {
@@ -151,7 +164,8 @@ textarea:focus-visible,
 /* The session-code/signaling inputs already restyle their border on focus; add
    the accent outline too so keyboard focus is unmistakable. */
 .code-input:focus-visible,
-.signaling-input:focus-visible {
+.signaling-input:focus-visible,
+.ice-input:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-color: var(--accent);

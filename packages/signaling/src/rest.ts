@@ -7,6 +7,7 @@
  *   GET  /health         -> { ok, service, sessions, uptimeMs, discovery }
  *   GET  /api/sessions   -> SessionInfo[]   (active rooms on this server)
  *   GET  /api/discover   -> DiscoveredHost[] (mDNS browse of the LAN)
+ *   GET  /api/ice        -> { iceServers }  (operator STUN/TURN config; [] = LAN-only)
  *   POST /api/code       -> { code }        (mint a fresh session code)
  *
  * It is designed to share a single HTTP server with the WebSocket signaling
@@ -37,6 +38,15 @@ export interface RestDeps {
   mintCode: () => string;
   /** LAN discovery façade used by /api/discover. */
   discovery: Discovery;
+  /**
+   * Operator-configured ICE servers exposed at `GET /api/ice` for clients that
+   * prefer to fetch the STUN/TURN config over REST instead of reading it off the
+   * WebSocket `joined` ack. The SAME list the signaling server distributes to
+   * both peers. Omitted/empty => `[]` => LAN-only default (unchanged behavior).
+   * This is read-only, non-secret config (no session codes), so it is returned
+   * to any caller subject only to the existing CORS policy.
+   */
+  iceServers?: () => RTCIceServer[];
   /** Browse timeout for /api/discover, in ms. */
   discoverTimeoutMs?: number;
   /**
@@ -105,6 +115,13 @@ function handle(req: IncomingMessage, res: ServerResponse, deps: RestDeps): void
       .browse({ timeoutMs: deps.discoverTimeoutMs ?? 1500 })
       .then((hosts: DiscoveredHost[]) => sendJson(res, 200, hosts))
       .catch(() => sendJson(res, 200, []));
+    return;
+  }
+
+  if (method === 'GET' && path === '/api/ice') {
+    // Read-only STUN/TURN config so a client can match the peers' ICE servers.
+    // Not a secret (no session code), so no token gate — just the CORS policy.
+    sendJson(res, 200, { iceServers: deps.iceServers ? deps.iceServers() : [] });
     return;
   }
 

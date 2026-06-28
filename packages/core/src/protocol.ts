@@ -41,6 +41,16 @@ export interface SignalMessage {
   payload?: unknown;
   ts?: number;
   message?: string;
+  /**
+   * Optional ICE-server list the signaling server hands BOTH peers on the
+   * `joined` acknowledgement so host and viewer negotiate against the SAME
+   * STUN/TURN configuration (required for symmetric NAT traversal). OPT-IN and
+   * additive: absent (or empty) means LAN-only with no ICE servers, the default
+   * behavior. The operator configures these on the server (self-hosted coturn or
+   * a STUN URL); see {@link parseIceServers}. Never carries third-party
+   * defaults.
+   */
+  iceServers?: RTCIceServer[];
 }
 
 /**
@@ -130,8 +140,36 @@ const INPUT_TYPES = new Set<InputEvent['t']>([
 /** Runtime guard: is `v` a structurally-valid {@link SignalMessage}? */
 export function isSignalMessage(v: unknown): v is SignalMessage {
   if (v === null || typeof v !== 'object') return false;
-  const t = (v as { type?: unknown }).type;
-  return typeof t === 'string' && SIGNAL_TYPES.has(t as SignalMessage['type']);
+  const o = v as Record<string, unknown>;
+  const t = o.type;
+  if (typeof t !== 'string' || !SIGNAL_TYPES.has(t as SignalMessage['type'])) return false;
+  // Additive/backward-compatible: `iceServers` is optional, but when present it
+  // must be a well-formed list so a malformed distribution can't leak through.
+  if (o.iceServers !== undefined && !isIceServerList(o.iceServers)) return false;
+  return true;
+}
+
+/**
+ * Runtime guard for the optional {@link SignalMessage.iceServers} field: an array
+ * of `RTCIceServer`-shaped objects, each with a string or string[] `urls` and
+ * optional string `username`/`credential`. An empty array is valid (LAN-only).
+ */
+export function isIceServerList(v: unknown): v is RTCIceServer[] {
+  if (!Array.isArray(v)) return false;
+  return v.every(isIceServer);
+}
+
+/** Runtime guard for a single `RTCIceServer`. */
+function isIceServer(v: unknown): v is RTCIceServer {
+  if (v === null || typeof v !== 'object') return false;
+  const o = v as Record<string, unknown>;
+  const urlsOk =
+    typeof o.urls === 'string' ||
+    (Array.isArray(o.urls) && o.urls.every((u) => typeof u === 'string'));
+  if (!urlsOk) return false;
+  if (o.username !== undefined && typeof o.username !== 'string') return false;
+  if (o.credential !== undefined && typeof o.credential !== 'string') return false;
+  return true;
 }
 
 /** Runtime guard: is `v` a structurally-valid {@link InputEvent}? */

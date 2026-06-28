@@ -117,6 +117,18 @@ vi.mock('@stream-screen/core', async () => {
     ...actual,
     Peer: FakePeer,
     SignalingClient: FakeSignalingClient,
+    // Real-shaped guard so HostSession.start can validate the `joined` ack's
+    // optional iceServers (ICE config integration). Empty/absent => LAN-only.
+    isIceServerList: (v: unknown): boolean =>
+      Array.isArray(v) &&
+      v.every(
+        (s) =>
+          s !== null &&
+          typeof s === 'object' &&
+          (typeof (s as { urls?: unknown }).urls === 'string' ||
+            (Array.isArray((s as { urls?: unknown }).urls) &&
+              ((s as { urls: unknown[] }).urls).every((u) => typeof u === 'string'))),
+      ),
     FileTransferManager: FakeFileTransferManager,
     createSender: vi.fn(),
     __FakeMediaStream: FakeMediaStream,

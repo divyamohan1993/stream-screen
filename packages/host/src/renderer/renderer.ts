@@ -30,6 +30,11 @@ export interface SessionConfig {
   accessMode?: AccessMode;
   /** Host PIN verifier for 'pin'/'pin-and-prompt' modes; null otherwise. */
   verifier?: VerifierRecord | null;
+  /**
+   * OPT-IN local STUN/TURN override (NAT traversal). Empty/absent => LAN-only.
+   * The signaling `joined` ack's list still takes precedence in HostSession.
+   */
+  iceServers?: RTCIceServer[];
 }
 
 /** A factory for {@link HostSession} (overridable in tests). */
@@ -135,6 +140,8 @@ export class SessionController {
       // controller-owned ConsentManager so the consent UI drives the same gate.
       accessMode: cfg.accessMode ?? 'open',
       verifier: cfg.verifier ?? null,
+      // Local STUN/TURN override; the joined-ack list still wins in HostSession.
+      iceServers: cfg.iceServers,
       consent: this.consent,
       onAuthResult: (viewerId, ok) => {
         this.onStatusText(ok ? `Viewer ${viewerId} authorized` : `Viewer ${viewerId} denied`);
@@ -285,6 +292,7 @@ async function boot(): Promise<void> {
     hostName: cfg.hostName,
     accessMode: cfg.accessMode,
     verifier: cfg.verifier,
+    iceServers: cfg.iceServers,
   };
 
   $source.addEventListener('change', () => {

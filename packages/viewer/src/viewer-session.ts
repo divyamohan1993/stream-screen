@@ -2,6 +2,7 @@ import {
   Peer,
   SignalingClient,
   isValidSessionCode,
+  isIceServerList,
   createSender,
   FileTransferManager,
   AUTH_DOMAIN,
@@ -125,7 +126,15 @@ export interface ViewerSessionOptions {
   signalingUrl: string;
   /** Display name shown to the host. Defaults to `web-viewer`. */
   name?: string;
-  /** Optional ICE servers (LAN-first: usually empty / host-candidate only). */
+  /**
+   * Optional LOCAL ICE-server override (STUN/TURN). OPT-IN; LAN-first defaults
+   * leave this empty (host candidates only, no third-party servers). When the
+   * signaling server distributes an ICE list on the `joined` ack, that
+   * server-distributed list is used so BOTH peers match; this local override
+   * takes precedence over it (and over the LAN-only default) when provided,
+   * letting an operator point a single viewer at a known STUN/TURN set without
+   * reconfiguring the server. Absent/empty everywhere => LAN-only, unchanged.
+   */
   iceServers?: RTCIceServer[];
   /** Stats polling interval, ms. Defaults to 1000. */
   statsIntervalMs?: number;
@@ -243,10 +252,33 @@ export class ViewerSession {
    * through and this stays null.
    */
   private pendingStream: MediaStream | null = null;
+  /**
+   * ICE servers distributed by the signaling server on the most recent `joined`
+   * ack (the server-distributed STUN/TURN list — see {@link
+   * isIceServerList}). Captured during the join handshake and used to build the
+   * {@link Peer} so BOTH host and viewer negotiate against the SAME config. A
+   * local {@link ViewerSessionOptions.iceServers} override, when supplied, takes
+   * precedence over this. `null` until a `joined` ack has been observed; an empty
+   * array means the server explicitly distributed no servers (LAN-only).
+   */
+  private serverIceServers: RTCIceServer[] | null = null;
 
   constructor(opts: ViewerSessionOptions) {
     this.opts = opts;
     this.handlers = opts.handlers ?? {};
+  }
+
+  /**
+   * The ICE servers this session will (or did) build its {@link Peer} with: the
+   * local {@link ViewerSessionOptions.iceServers} override when non-empty,
+   * otherwise the server-distributed list from the `joined` ack, otherwise an
+   * empty array (LAN-only default). Returns a defensive copy. Exposed for the UI
+   * and for tests asserting the configured negotiation set.
+   */
+  get effectiveIceServers(): RTCIceServer[] {
+    const local = this.opts.iceServers;
+    const chosen = local && local.length > 0 ? local : (this.serverIceServers ?? []);
+    return chosen.map((s) => ({ ...s }));
   }
 
   /** Current lifecycle state. */
@@ -324,11 +356,8 @@ export class ViewerSession {
       this.onPeerLeft(m);
     });
 
-    this.buildPeer(signaling);
-
     try {
       await signaling.connect();
-      await this.peer!.start();
       // Join the room by code, as a viewer, then WAIT for the server's `joined`
       // acknowledgement before we resolve / enter waiting-for-host / start the
       // stats loop. Per the shared signaling contract the server replies `joined`
@@ -345,6 +374,14 @@ export class ViewerSession {
           name: this.opts.name ?? 'web-viewer',
         });
       });
+      // Build + start the Peer ONLY AFTER the join ack so it is constructed with
+      // the SAME ICE config the server distributed to both peers (captured into
+      // `serverIceServers` during the handshake). The host does not emit its
+      // offer until it observes our `peer-joined` — which the server only routes
+      // AFTER acknowledging our join — so the peer's `offer` handler is wired in
+      // time. Local override > server list > LAN-only default.
+      const peer = this.buildPeer(signaling);
+      await peer.start();
       // Only AFTER a confirmed join do we install the persistent signaling error
       // handler (so a later signaling error surfaces as session error) and begin
       // the session. Wiring it before the handshake would let the join-ack's own
@@ -393,7 +430,16 @@ export class ViewerSession {
     const timeoutMs = this.opts.joinTimeoutMs ?? VIEWER_JOIN_ACK_TIMEOUT_MS;
     return new Promise<void>((resolve, reject) => {
       let settled = false;
-      const onJoined = (): void => finish();
+      const onJoined = (m: SignalMessage): void => {
+        // Capture the server-distributed ICE list (if any) so the Peer is built
+        // to negotiate against the SAME STUN/TURN config as the host. Validate
+        // defensively: a malformed field is ignored (LAN-only). An absent field
+        // leaves the prior value untouched (additive/backward-compatible).
+        if (isIceServerList(m.iceServers)) {
+          this.serverIceServers = m.iceServers.map((s) => ({ ...s }));
+        }
+        finish();
+      };
       const onError = (m: SignalMessage): void =>
         finish(new ViewerJoinRejectedError(m.message ?? 'signaling viewer join rejected'));
       const finish = (err?: Error): void => {
@@ -432,7 +478,10 @@ export class ViewerSession {
     const peer = new Peer({
       role: 'viewer',
       signaling,
-      iceServers: this.opts.iceServers,
+      // Negotiate against the SAME STUN/TURN config as the host: prefer a local
+      // override, else the server-distributed list from the `joined` ack, else
+      // none (LAN-only default). `effectiveIceServers` returns a defensive copy.
+      iceServers: this.effectiveIceServers,
     });
     this.peer = peer;
 
@@ -585,14 +634,14 @@ export class ViewerSession {
         this.onPeerLeft(m);
       });
 
-      const peer = this.buildPeer(signaling);
       await signaling.connect();
-      await peer.start();
       // Announce ourselves on the fresh socket and AWAIT the `joined`
       // acknowledgement before treating the rebuilt peer as live — don't start
       // relying on a rebuilt peer before it has actually re-joined the room. A
       // rejection (e.g. the host has since gone away — `no-such-session`) or a
       // handshake timeout throws to the catch below. CONNECT-TIME bound only.
+      // The ack also refreshes the server-distributed ICE list so the rebuilt
+      // peer keeps negotiating against the SAME STUN/TURN config.
       await this.awaitJoinAck(signaling, () => {
         signaling.join({
           code: this.opts.code,
@@ -600,6 +649,10 @@ export class ViewerSession {
           name: this.opts.name ?? 'web-viewer',
         });
       });
+      // Build + start the rebuilt peer AFTER the ack so it picks up the (possibly
+      // refreshed) server-distributed ICE config, mirroring the initial connect.
+      const peer = this.buildPeer(signaling);
+      await peer.start();
       // Re-install the persistent signaling error handler only after the rebuilt
       // socket has confirmed its re-join.
       signaling.on('error', (m: SignalMessage) => {

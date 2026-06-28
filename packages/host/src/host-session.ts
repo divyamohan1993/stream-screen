@@ -23,6 +23,7 @@ import {
   createSender,
   CTRL_ALT_DEL,
   FileTransferManager,
+  isIceServerList,
   KEY_MODS,
   NONCE_BYTES,
   Peer,
@@ -280,6 +281,14 @@ export class HostSession {
   private signaling: SignalingClient | null = null;
   private peer: Peer | null = null;
   private stream: MediaStream | null = null;
+  /**
+   * The ICE servers (STUN/TURN) the {@link Peer} was constructed with for this
+   * session. Resolved at {@link start} time: the server-distributed list on the
+   * `joined` ack takes precedence (so host + viewer match), falling back to the
+   * local override from {@link HostSessionOptions.iceServers} (env
+   * STREAMSCREEN_ICE_SERVERS). Empty by default — LAN-only, behavior unchanged.
+   */
+  private resolvedIceServers: RTCIceServer[] = [];
   private adaptiveTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
   private lastDecision: AdaptiveDecision | null = null;
@@ -373,6 +382,17 @@ export class HostSession {
     return this.activeSourceId;
   }
 
+  /**
+   * The ICE servers (STUN/TURN) in effect for this session's {@link Peer} —
+   * resolved at {@link start} time from the signaling `joined` ack (server
+   * distributed, takes precedence) or the local override env. Empty before
+   * {@link start} and whenever neither source supplies any (LAN-only default).
+   * Returns a defensive copy so callers cannot mutate internal state.
+   */
+  get currentIceServers(): RTCIceServer[] {
+    return this.resolvedIceServers.map((s) => ({ ...s }));
+  }
+
   /** The most recent adaptive decision, or null before the first tick. */
   get currentDecision(): AdaptiveDecision | null {
     return this.lastDecision;
@@ -445,10 +465,33 @@ export class HostSession {
       this.signaling = signaling;
       await signaling.connect();
 
+      // Join the room keyed by the session code, as the host, then WAIT for the
+      // server's acknowledgement before treating the room as ours. Per the shared
+      // signaling contract the server replies `joined` on success or `error`
+      // (code/message `host-exists`) when the code is already held by a live host.
+      // Without this handshake a rejected join would still proceed to capture and
+      // advertise a usable-looking code we do not actually own. A rejection or a
+      // handshake timeout throws and is cleaned up by the catch below.
+      //
+      // The `joined` ack may also carry the operator's server-distributed ICE
+      // (STUN/TURN) list — captured here so the host builds its Peer against the
+      // SAME config the viewer will (required for symmetric NAT traversal). We
+      // join BEFORE constructing the Peer specifically so that list is available
+      // to the per-viewer RTCPeerConnections. Viewers cannot have joined yet (we
+      // have not acked), so wiring the Peer + signaling viewer handlers after the
+      // join loses no events.
+      const ackIce = await this.awaitHostJoinAck(signaling, () => {
+        signaling.join({ code: this.opts.code, role: 'host', name: this.opts.hostName });
+      });
+
+      // Resolve the effective ICE list: server-distributed (ack) wins, else the
+      // local override env (opts.iceServers), else [] — LAN-only, unchanged.
+      this.resolvedIceServers = this.resolveIceServers(ackIce);
+
       const peer = new Peer({
         role: 'host',
         signaling,
-        iceServers: this.opts.iceServers,
+        iceServers: this.resolvedIceServers,
       });
       this.peer = peer;
 
@@ -489,17 +532,6 @@ export class HostSession {
 
       await peer.start();
 
-      // Join the room keyed by the session code, as the host, then WAIT for the
-      // server's acknowledgement before treating the room as ours. Per the shared
-      // signaling contract the server replies `joined` on success or `error`
-      // (code/message `host-exists`) when the code is already held by a live host.
-      // Without this handshake a rejected join would still proceed to capture and
-      // advertise a usable-looking code we do not actually own. A rejection or a
-      // handshake timeout throws and is cleaned up by the catch below.
-      await this.awaitHostJoinAck(signaling, () => {
-        signaling.join({ code: this.opts.code, role: 'host', name: this.opts.hostName });
-      });
-
       // Tell the encoder this is screen content: optimize for sharp static text
       // over motion smoothness. Without this hint the encoder treats it as camera
       // video and blurs text. Paired with degradationPreference 'maintain-resolution'
@@ -535,21 +567,30 @@ export class HostSession {
    * wired so the reply can never be missed. CONNECT-TIME HANDSHAKE ONLY — it
    * imposes no session duration limit.
    */
-  private awaitHostJoinAck(signaling: SignalingClient, sendJoin: () => void): Promise<void> {
+  private awaitHostJoinAck(
+    signaling: SignalingClient,
+    sendJoin: () => void,
+  ): Promise<RTCIceServer[]> {
     const timeoutMs = this.opts.joinTimeoutMs ?? JOIN_ACK_TIMEOUT_MS;
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<RTCIceServer[]>((resolve, reject) => {
       let settled = false;
-      const onJoined = (): void => finish();
+      // Capture the server-distributed ICE list (if any) off the `joined` ack so
+      // the host negotiates against the SAME STUN/TURN config as the viewer.
+      // Validate before trusting it; a malformed field is ignored (LAN-only).
+      const onJoined = (m: SignalMessage): void => {
+        const ice = isIceServerList(m.iceServers) ? m.iceServers : [];
+        finish(undefined, ice);
+      };
       const onError = (m: SignalMessage): void =>
         finish(new HostJoinRejectedError(m.message ?? 'signaling host join rejected'));
-      const finish = (err?: Error): void => {
+      const finish = (err?: Error, ice: RTCIceServer[] = []): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         signaling.off('joined', onJoined);
         signaling.off('error', onError);
         if (err) reject(err);
-        else resolve();
+        else resolve(ice);
       };
       const timer = setTimeout(
         () =>
@@ -565,6 +606,21 @@ export class HostSession {
       signaling.on('error', onError);
       sendJoin();
     });
+  }
+
+  /**
+   * Resolve the ICE servers (STUN/TURN) to use for this session's {@link Peer}.
+   *
+   * Precedence per the "connect from anywhere" design: the server-distributed
+   * list on the `joined` ack wins (so BOTH peers negotiate against the same
+   * STUN/TURN config), falling back to the LOCAL override from
+   * {@link HostSessionOptions.iceServers} (env STREAMSCREEN_ICE_SERVERS, parsed
+   * in main). When neither supplies any, the result is `[]` — LAN-only, no ICE
+   * servers, behavior unchanged. Pure: no side effects, easy to unit-test.
+   */
+  private resolveIceServers(fromJoinedAck: RTCIceServer[]): RTCIceServer[] {
+    if (fromJoinedAck.length > 0) return fromJoinedAck;
+    return this.opts.iceServers ?? [];
   }
 
   /**

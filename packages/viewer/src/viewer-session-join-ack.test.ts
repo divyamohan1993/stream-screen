@@ -153,7 +153,10 @@ describe('ViewerSession join-ack lifecycle (FINDING P2)', () => {
     // SignalingClient's reconnect/replay path can never fire.
     expect(sig.joins).toBe(1);
     expect(sig.closed).toBe(true);
-    expect(FakePeer.current?.closed).toBe(true);
+    // The Peer is now built only AFTER a confirmed join (so it can be constructed
+    // with the server-distributed ICE config). A rejected join therefore never
+    // creates a peer at all — nothing to close.
+    expect(FakePeer.instances).toHaveLength(0);
   });
 
   it('a rejected join never starts the stats loop (no stats polled even after time passes)', async () => {
@@ -162,10 +165,10 @@ describe('ViewerSession join-ack lifecycle (FINDING P2)', () => {
       armNext = (s) => (s.rejectWith = 'no-such-session');
       const { session } = makeSession({ statsIntervalMs: 100 });
       await expect(session.connect()).rejects.toThrow();
-      const peer = FakePeer.instances[0]!;
       await vi.advanceTimersByTimeAsync(1000);
-      // The stats loop was never armed, so getStats was never polled.
-      expect(peer.statsCalls).toBe(0);
+      // The peer is built only after a confirmed join, so a rejected join creates
+      // none and the stats loop is never armed: no peer, no polls.
+      expect(FakePeer.instances).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }

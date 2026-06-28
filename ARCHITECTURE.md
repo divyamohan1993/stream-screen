@@ -215,6 +215,51 @@ Key points:
   any prior session before creating a new one, guaranteeing at most one live
   session.
 
+### ICE servers — "connect from anywhere" (opt-in, self-hosted)
+
+By default the peers are configured with **no ICE servers** (`iceServers: []`),
+which is correct and sufficient for the LAN/loopback case: WebRTC gathers host
+candidates and connects directly. Connecting across the internet is an
+**additive, opt-in** layer that introduces STUN (hole-punching) and a
+self-hosted TURN relay (fallback for symmetric NAT / CGNAT) **without** changing
+the default and **without** hardcoding any third-party server.
+
+The mechanism is deliberately small and lives mostly in `core`:
+
+- **`core/ice-config.ts` → `parseIceServers(input)`** is a pure, never-throwing
+  parser. It accepts either a JSON `RTCIceServer[]` (string or already-parsed) or
+  a compact `scheme:host:port` / `turn(s):user:pass@host:port` list, lowercases
+  the scheme, splits credentials on the **last** `@`, and **drops** blank /
+  garbage / unknown-scheme entries (fully empty → `[]`). `serializeIceServers` is
+  its inverse for round-tripping/logging. Garbage in can therefore never throw or
+  inject a malformed server.
+- **The signaling server parses the operator config once** (`STREAMSCREEN_ICE_SERVERS`
+  via `parseIceServers`) and **distributes the result to _both_ peers on the
+  `joined` acknowledgement** (`SignalMessage.iceServers`). This is the crucial
+  step: symmetric-NAT traversal requires the host and viewer to negotiate against
+  the **same** STUN/TURN set, and routing it through the one component both peers
+  already talk to guarantees they match. The field is optional and omitted when
+  the list is empty, so the wire format stays backward-compatible (`isSignalMessage`
+  rejects only a *malformed* `iceServers`; absent/empty is fine, and the new
+  `isIceServerList` guard validates the field).
+- **Each app reads `joined.iceServers`** (validating with `isIceServerList`) and
+  passes it as `PeerOptions.iceServers`. **`core/peer.ts`** stores a defensive
+  copy and constructs **every** per-viewer `RTCPeerConnection` as
+  `new RTC({ iceServers })` (empty array when omitted); `Peer.getIceServers()`
+  exposes the configured list (defensive copy) for observability.
+
+Because the only behavioral change is which `iceServers` array reaches the
+`RTCPeerConnection` constructor, the LAN path is provably unaffected: the e2e
+suite runs the **same real two-Chromium WebRTC session** with a STUN-only list
+*and* with an empty list and asserts both still connect and stream live decoded
+video (`e2e/tests/ice-servers.spec.ts`). ICE servers only assist *path
+discovery*; access control (session code + optional PIN/consent) and DTLS-SRTP
+encryption are unchanged — even TURN relays only ciphertext. The operator's two
+deployment options (a VPN overlay like WireGuard/Tailscale, or public signaling
+over `wss://` plus self-hosted STUN/coturn) are documented in the README's
+[Connecting from anywhere](./README.md#connecting-from-anywhere-beyond-your-lan)
+section.
+
 ---
 
 ## LAN discovery (mDNS)

@@ -82,6 +82,7 @@ declare global {
       getActiveMonitor(): string;
       getReceivedFiles(): ReceivedFile[];
       getReceivedLatency(): LatencyReport[];
+      getIceServers(): RTCIceServer[];
       getAuthState(): HostAuthState;
       setAutoAdaptive(enabled: boolean): void;
       getVideoSenderParams(): VideoSenderParams | null;
@@ -97,6 +98,7 @@ declare global {
     __viewer: {
       getState(): ViewerState;
       getAuthState(): ViewerAuthState;
+      getIceServers(): RTCIceServer[];
       getVideoSize(): { width: number; height: number };
       isVideoPlaying(): boolean;
       getDecodedFrameCount(): number;

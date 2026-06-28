@@ -41,6 +41,7 @@
       import {
         Peer,
         SignalingClient,
+        parseIceServers,
         createSender,
         createReceiver,
         ReceiverRouter,
@@ -58,6 +59,12 @@
       // encrypted control channel; the PIN itself never crosses the wire.
       const viewerPin = params.get('pin') ?? '';
       const wsUrl = `ws://${location.host}`;
+      // OPT-IN ICE servers ("connect from anywhere"). Absent => LAN-only,
+      // unchanged behavior. The compact/JSON string is parsed exactly as an
+      // operator-supplied STREAMSCREEN_ICE_SERVERS value would be; in production
+      // the signaling server distributes this list on the `joined` ack so both
+      // peers match. Here the spec supplies it per-peer to prove the plumbing.
+      const iceServers = parseIceServers(params.get('ice'));
 
       const statusEl = document.getElementById('status');
       const video = document.getElementById('remote');
@@ -85,7 +92,7 @@
       let remoteStream = null;
 
       const signaling = new SignalingClient(wsUrl);
-      const peer = new Peer({ role: 'viewer', signaling });
+      const peer = new Peer({ role: 'viewer', signaling, iceServers });
 
       // ---------------------------------------------------------------------
       // Access-mode auth (connection consent + access PIN), viewer side.
@@ -202,6 +209,10 @@
           authMode: state.authMode,
           authResult: state.authResult,
         }),
+        // The configured ICE list this viewer's peer is using (defensive copy
+        // from core). Empty array == LAN-only default. The ice-servers spec
+        // asserts this matches what was supplied so the plumbing is observable.
+        getIceServers: () => peer.getIceServers(),
         getVideoSize: () => ({ width: video.videoWidth, height: video.videoHeight }),
         isVideoPlaying: () => video.videoWidth > 0 && video.videoHeight > 0 && !video.paused,
         // Decoded-frame counter for the receive side — strictly increases while

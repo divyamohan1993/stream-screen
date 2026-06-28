@@ -8,6 +8,7 @@
 
 export * from './protocol.js';
 export * from './peer.js';
+export * from './ice-config.js';
 export * from './signaling-client.js';
 export * from './adaptive.js';
 export * from './input-codec.js';

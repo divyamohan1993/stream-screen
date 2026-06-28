@@ -56,6 +56,15 @@ export interface HostBootConfig {
    * use to recompute the expected proof.
    */
   verifier: VerifierRecord | null;
+  /**
+   * OPT-IN STUN/TURN servers for "connect from anywhere" (NAT traversal). Parsed
+   * once in main from the STREAMSCREEN_ICE_SERVERS env (via core parseIceServers)
+   * and handed to the renderer so the HostSession can use it as a LOCAL OVERRIDE.
+   * The server-distributed list on the signaling `joined` ack still takes
+   * precedence so both peers match. Empty by default — LAN-only, no ICE servers,
+   * behavior unchanged.
+   */
+  iceServers: RTCIceServer[];
 }
 
 /** The API exposed on `window.streamscreen` in the renderer. */

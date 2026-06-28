@@ -157,10 +157,25 @@ export class Peer {
   constructor(opts: PeerOptions) {
     this.role = opts.role;
     this.signaling = opts.signaling;
-    this.iceServers = opts.iceServers ?? [];
+    // Defensive copy: the configured ICE list (often distributed by the
+    // signaling server's `joined` ack so both peers match) must not change out
+    // from under us if the caller mutates the array it passed.
+    this.iceServers = (opts.iceServers ?? []).map((s) => ({ ...s }));
     this.RTC = resolveRTC(opts);
     // Host is impolite (wins glare and offers first); viewer is polite.
     this.polite = this.role === 'viewer';
+  }
+
+  /**
+   * The ICE servers (STUN/TURN) this peer configures every `RTCPeerConnection`
+   * with. Empty by default — LAN-only, no ICE servers, behavior unchanged. When
+   * non-empty (operator opted in via {@link PeerOptions.iceServers}, typically
+   * distributed by the signaling server's `joined` ack so both peers match),
+   * hole-punching and relay fallback become available for connecting across the
+   * internet. Returns a defensive copy so callers cannot mutate internal state.
+   */
+  getIceServers(): RTCIceServer[] {
+    return this.iceServers.map((s) => ({ ...s }));
   }
 
   /** Subscribe to a peer lifecycle/data event. */

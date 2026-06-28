@@ -37,6 +37,7 @@ machine.
   - [1. Signaling server](#1-signaling-server-zero-config-lan)
   - [2. Electron host (Windows)](#2-electron-host-windows)
   - [3. Web viewer](#3-web-viewer)
+- [Connecting from anywhere (beyond your LAN)](#connecting-from-anywhere-beyond-your-lan)
 - [The adaptive realtime engine](#the-adaptive-realtime-engine-auto-negotiate-lag)
 - [AI-friendly control: MCP + REST](#ai-friendly-control-mcp--rest)
 - [Building the Windows host (.exe)](#building-the-windows-host-exe)
@@ -105,7 +106,7 @@ What a modern remote desktop should have, and where StreamScreen stands:
 | **Session recording** | ✅ Implemented | Viewer-side MediaRecorder → downloadable `.webm` |
 | **In-session chat** | ✅ Implemented | Text both directions over the `control` data channel |
 | **Special key combos / Ctrl+Alt+Del** | ✅ Implemented | Ctrl+Alt+Del, Win, Alt+Tab, Win+R/D, Alt+F4, Esc + arbitrary chords |
-| WAN / VPN traversal (public IP) | ⛔ Not yet | LAN-first by design; STUN/TURN hooks exist |
+| **WAN traversal (connect from anywhere)** | ✅ Implemented (opt-in) | Operator-supplied STUN/TURN via `STREAMSCREEN_ICE_SERVERS`, distributed to both peers on the `joined` ack; LAN-only by default. See [Connecting from anywhere](#connecting-from-anywhere-beyond-your-lan) |
 
 > The two rows that matter most for "free vs AnyDesk": **no time limit** and **no
 > bitrate cap** — both are not just defaults but *guarantees enforced in the
@@ -338,6 +339,125 @@ allowlist (or `*`) to override. It renders the remote
 screen, captures mouse/keyboard (with resolution-independent coordinates,
 pointer lock, fullscreen, clipboard sync), and shows a **live adaptive-stats
 dashboard** (RTT, loss, jitter, fps, resolution, current bitrate decision).
+
+---
+
+## Connecting from anywhere (beyond your LAN)
+
+StreamScreen is **LAN-first**: out of the box it never touches a third-party
+server, and the steps above just work on the same Wi‑Fi/LAN. Connecting across
+the internet is an **opt-in** layer you self-host — nothing here is hardcoded,
+no relay account is required, and there is still **no time limit or usage cap**.
+There are two ways to do it; pick one.
+
+### Option 1 — VPN overlay (recommended, zero-config, fully free)
+
+Put the remote machine on the **same virtual LAN** with a peer-to-peer VPN, then
+connect *exactly as you would on Wi‑Fi* — by code or from the discovered host
+list. Nothing about StreamScreen changes; the overlay just makes the two
+machines look local to each other.
+
+- **[Tailscale](https://tailscale.com/)** (WireGuard-based, easiest): install it
+  on both machines and sign in. Each gets a stable `100.x.y.z` address. Start the
+  signaling server and host normally; on the viewer, point the signaling override
+  at the host's Tailscale address (e.g. `100.101.102.103:8787`). Done.
+- **[WireGuard](https://www.wireguard.com/)** (manual, fully self-hosted): stand
+  up a small WireGuard network and use the in-tunnel addresses the same way.
+
+Because every machine is now on one private overlay, you **expose no ports** to
+the public internet, traffic stays **end-to-end encrypted by the VPN _and_ by
+WebRTC's DTLS-SRTP**, and you need **no STUN/TURN** at all. This is the
+recommended path for almost everyone.
+
+### Option 2 — public signaling + self-hosted ICE (no VPN)
+
+If you cannot run a VPN overlay, expose the signaling server and let WebRTC
+traverse NAT itself. Two pieces:
+
+**(a) Make the signaling server reachable.** Give it a public host/port and put
+it behind TLS — browsers will only open a `wss://` (secure) WebSocket from a
+non-local page. Either terminate TLS at a reverse proxy (nginx/Caddy) in front of
+the signaling port, or use a tunnel such as
+[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+which gives you an HTTPS/WSS URL with no inbound ports opened:
+
+```bash
+# Tunnel the local signaling server; cloudflared prints a public https URL.
+cloudflared tunnel --url http://localhost:8787
+#   -> https://something.trycloudflare.com   (use wss://something.trycloudflare.com in the viewer)
+```
+
+Then in the viewer's connect form, set the **signaling-server override** to that
+`wss://…` URL and enter the code as usual.
+
+**(b) Configure ICE servers so WebRTC can cross NAT.** Once peers are on
+different networks they need help discovering a working path:
+
+- A **STUN** server lets each peer learn its public address and **hole-punch**
+  directly. STUN is cheap, stateless, and works for *many* home routers. STUN
+  alone is enough surprisingly often.
+- A **TURN** relay is the fallback for **symmetric NAT / CGNAT / strict
+  firewalls**, where hole-punching fails. TURN relays the media through a server
+  you run — so it still costs you nothing but your own bandwidth.
+
+You supply these via the `STREAMSCREEN_ICE_SERVERS` env var on the **signaling
+server**. The server parses it once and hands the **same list to both peers** on
+the `joined` acknowledgement, so the host and the viewer always negotiate against
+an identical STUN/TURN configuration (required — mismatched lists break symmetric
+NAT traversal). Accepts a JSON array, or a compact `scheme:host:port` /
+`turn:user:pass@host:port` list:
+
+```bash
+# STUN only (often enough for home NATs):
+STREAMSCREEN_ICE_SERVERS="stun:stun.your-domain.example:3478" npm run dev:signaling
+
+# STUN + self-hosted TURN (covers symmetric NAT / CGNAT):
+STREAMSCREEN_ICE_SERVERS="stun:stun.your-domain.example:3478, turn:streamscreen:s3cr3t@turn.your-domain.example:3478" \
+  npm run dev:signaling
+
+# Equivalent JSON form:
+STREAMSCREEN_ICE_SERVERS='[{"urls":"stun:stun.your-domain.example:3478"},
+  {"urls":"turn:turn.your-domain.example:3478","username":"streamscreen","credential":"s3cr3t"}]' \
+  npm run dev:signaling
+```
+
+Leaving `STREAMSCREEN_ICE_SERVERS` **unset (the default) keeps behavior exactly
+LAN-only** — no ICE servers, no third-party contact.
+
+#### Minimal self-hosted TURN (coturn)
+
+[coturn](https://github.com/coturn/coturn) is a free, open-source TURN/STUN
+server. A minimal `/etc/turnserver.conf` for StreamScreen:
+
+```ini
+# Listen for STUN+TURN on the standard port.
+listening-port=3478
+# Public IP clients should reach this server on (the relay endpoint).
+external-ip=YOUR.PUBLIC.IP
+realm=your-domain.example
+
+# Long-term credentials. Either a static user...
+user=streamscreen:s3cr3t
+# ...or a time-limited shared-secret scheme (rotate-free, recommended):
+#   use-auth-secret
+#   static-auth-secret=REPLACE_WITH_A_LONG_RANDOM_SECRET
+# With use-auth-secret, generate short-lived username:credential pairs and put
+# THOSE in STREAMSCREEN_ICE_SERVERS (regenerate before they expire).
+
+# Lock it down a little.
+no-tcp-relay
+fingerprint
+```
+
+Run it (`turnserver -c /etc/turnserver.conf`), open UDP/TCP `3478` (and the relay
+port range) on the firewall, and reference it from `STREAMSCREEN_ICE_SERVERS` as
+above. For TLS-wrapped TURN use the `turns:` scheme on port `5349` with a cert.
+
+> **Security still applies.** ICE servers only help peers *find a path*; they do
+> not bypass access control. The **session code** plus any **access PIN / consent
+> prompt** (`STREAMSCREEN_ACCESS_MODE`, see [Security](#security)) still gate
+> *who* may connect, and media remains **end-to-end encrypted (DTLS-SRTP)** —
+> even when relayed through your own TURN server, which sees only ciphertext.
 
 ---
 
@@ -706,6 +826,7 @@ Per-package tests can also be run directly, e.g.
 | `STREAMSCREEN_SIGNALING_HTTP_URL` | ai | derived from WS URL | signaling REST base for `list_hosts` |
 | `STREAMSCREEN_TOKEN` | signaling, ai | – | bearer token: signaling un-redacts `/api/sessions` codes for callers that present it; ai sends it. Legacy alias `STREAMSCREEN_REST_TOKEN` still accepted (canonical wins if both set) |
 | `STREAMSCREEN_ALLOWED_ORIGINS` | signaling | – | comma-separated WS Origin allowlist (or `*`); default accepts loopback/LAN/same-host |
+| `STREAMSCREEN_ICE_SERVERS` | signaling | – | opt-in STUN/TURN for [connecting from anywhere](#connecting-from-anywhere-beyond-your-lan). JSON array or compact `stun:host:port` / `turn:user:pass@host:port` list; distributed to both peers on the `joined` ack. Unset = LAN-only (no ICE servers) |
 | `STREAMSCREEN_CODE` | host | minted | fixed session code |
 | `STREAMSCREEN_ACCESS_MODE` | host | `open` | access control: `open` (code only), `prompt` (human Accept), `pin` (PIN proof), `pin-and-prompt` (both). See [Security](#security) |
 | `STREAMSCREEN_PIN` | host | – | plaintext access PIN for `pin` / `pin-and-prompt` modes (≥6 chars, not all-same / not sequential); read once, never persisted. Stored only as a PBKDF2 verifier |

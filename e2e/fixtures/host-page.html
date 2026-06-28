@@ -38,6 +38,7 @@
       import {
         Peer,
         SignalingClient,
+        parseIceServers,
         AdaptiveController,
         createReceiver,
         createSender,
@@ -99,6 +100,11 @@
       // Consent decision for prompt modes: 'accept' | 'reject' | 'timeout'.
       // 'timeout' means the host never responds, exercising the fail-closed path.
       const consent = params.get('consent') ?? 'accept';
+      // OPT-IN ICE servers ("connect from anywhere"). Absent => LAN-only,
+      // unchanged behavior. Parsed exactly as the signaling server would parse
+      // an operator's STREAMSCREEN_ICE_SERVERS value before distributing it on
+      // the `joined` ack so both peers negotiate against the same STUN/TURN set.
+      const iceServers = parseIceServers(params.get('ice'));
       // When `audio=1`, the host mixes a synthetic loopback/system-audio track
       // (oscillator -> MediaStreamDestination) into the captured stream so the
       // viewer can prove system-audio streaming over WebRTC.
@@ -221,6 +227,10 @@
         getActiveMonitor: () => activeMonitor,
         getReceivedFiles: () => state.receivedFiles.map((f) => ({ ...f })),
         getReceivedLatency: () => state.receivedLatency.map((l) => ({ ...l })),
+        // The configured ICE list this host's peer is using (defensive copy from
+        // core). Empty array == LAN-only default. The ice-servers spec asserts
+        // this so the opt-in plumbing is observable on the host side too.
+        getIceServers: () => peer.getIceServers(),
         // --- Auth (access mode) observation surface for the auth/consent specs. ---
         getAuthState: () => ({
           accessMode: state.accessMode,
@@ -282,7 +292,7 @@
       };
 
       const signaling = new SignalingClient(wsUrl);
-      const peer = new Peer({ role: 'host', signaling });
+      const peer = new Peer({ role: 'host', signaling, iceServers });
       const adaptive = new AdaptiveController();
 
       // ---------------------------------------------------------------------

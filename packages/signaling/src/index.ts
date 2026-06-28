@@ -26,6 +26,7 @@ import { hostname } from 'node:os';
 import { networkInterfaces } from 'node:os';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { parseIceServers } from '@stream-screen/core';
 import { SignalingServer } from './server.js';
 import { Discovery } from './discovery.js';
 import { createRestServer } from './rest.js';
@@ -95,6 +96,15 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
   // default so direct LAN clients cannot spoof XFF to evade the throttle.
   const trustProxy = opts.trustProxy ?? parseBool(process.env.STREAMSCREEN_TRUST_PROXY);
 
+  // OPT-IN "connect from anywhere": the operator supplies their OWN STUN/TURN
+  // servers (e.g. self-hosted coturn or a STUN URL) via STREAMSCREEN_ICE_SERVERS
+  // in either the compact form ('stun:host:port, turn:user:pass@host:port') or a
+  // JSON RTCIceServer[]. We parse it ONCE here with the core parser (never
+  // throws) and hand the SAME list to BOTH the WS server (distributed on every
+  // `joined` ack) and the REST surface (GET /api/ice) so both peers match.
+  // Unset => [] => LAN-only, no third-party servers, behavior unchanged.
+  const iceServers = parseIceServers(process.env.STREAMSCREEN_ICE_SERVERS);
+
   // Build HTTP (REST) first, then attach WS to it so they share a port.
   const http = createRestServer({
     listSessions: () => signaling.listSessions(),
@@ -102,8 +112,9 @@ export async function start(opts: StartOptions = {}): Promise<StreamScreenSignal
     discovery,
     allowedOrigins,
     token: restToken,
+    iceServers: () => signaling.getIceServers(),
   });
-  const signaling = new SignalingServer({ server: http, allowedOrigins, trustProxy });
+  const signaling = new SignalingServer({ server: http, allowedOrigins, trustProxy, iceServers });
 
   await new Promise<void>((resolve, reject) => {
     http.once('error', reject);

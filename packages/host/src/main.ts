@@ -34,7 +34,7 @@ import { hostname } from 'node:os';
 import { existsSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import type { InputEvent, MonitorInfo } from '@stream-screen/core';
+import { parseIceServers, type InputEvent, type MonitorInfo } from '@stream-screen/core';
 import { InputInjector } from './input-injector.js';
 import { generateSessionCode } from './host-session.js';
 import { resolveAccessConfig, type AccessConfig } from './access-config.js';
@@ -62,6 +62,23 @@ function resolveSignalingUrl(): string {
 }
 
 /**
+ * Resolve the operator's LOCAL ICE-server override (STUN/TURN) from the
+ * STREAMSCREEN_ICE_SERVERS env, parsed via the core {@link parseIceServers}
+ * (which accepts JSON or the compact `scheme:user:pass@host:port` form and NEVER
+ * throws). This is the "connect from anywhere" opt-in: nothing is hardcoded, no
+ * third-party server is contacted, and an unset/garbage value yields `[]` —
+ * LAN-only, behavior unchanged.
+ *
+ * It is a LOCAL OVERRIDE only: the signaling server's `joined` ack can still
+ * distribute a list that takes precedence (so host + viewer match). The host
+ * session resolves the final precedence; here we just parse what the operator
+ * set on THIS machine and hand it to the renderer in the boot config.
+ */
+function resolveIceServers(): RTCIceServer[] {
+  return parseIceServers(process.env.STREAMSCREEN_ICE_SERVERS);
+}
+
+/**
  * The boot config for this run — the session code is fixed for the app's life.
  *
  * `accessMode`/`verifier` start at the safe default ('open', no verifier) and are
@@ -77,6 +94,8 @@ const bootConfig: HostBootConfig = {
   hostName: process.env.STREAMSCREEN_HOST_NAME ?? hostname(),
   accessMode: 'open',
   verifier: null,
+  // Opt-in STUN/TURN local override (empty by default => LAN-only, unchanged).
+  iceServers: resolveIceServers(),
 };
 
 const injector = new InputInjector();
@@ -323,6 +342,14 @@ if (!gotLock) {
     // STREAMSCREEN_CODE pins the code across restarts; otherwise it is generated.
     console.log(
       `[StreamScreen Host] ready — code ${bootConfig.code} on ${bootConfig.signalingUrl} (host "${bootConfig.hostName}")`,
+    );
+    // Surface the ICE (STUN/TURN) posture so the operator can confirm whether the
+    // opt-in "connect from anywhere" path is active. Default is LAN-only (no ICE
+    // servers); the signaling `joined` ack may still distribute a list at runtime.
+    console.log(
+      bootConfig.iceServers.length > 0
+        ? `[StreamScreen Host] ICE: ${bootConfig.iceServers.length} local STUN/TURN server(s) configured (override; joined-ack list still takes precedence)`
+        : `[StreamScreen Host] ICE: none configured locally — LAN-only unless the signaling server distributes a list`,
     );
 
     app.on('activate', () => {

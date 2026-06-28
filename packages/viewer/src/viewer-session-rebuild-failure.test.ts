@@ -150,19 +150,23 @@ describe('ViewerSession ICE-rebuild failure teardown (FINDING P2 viewer-session.
     // Arm the rebuild's fresh SignalingClient to reject (host left during grace).
     armNext = (s) => (s.rejectWith = 'no-such-session');
 
+    // The old peer is closed at the top of the rebuild.
+    const oldPeer = FakePeer.instances[0]!;
+
     // Hard ICE failure → immediate rebuild.
     FakePeer.current!.emitState('failed');
     await vi.advanceTimersByTimeAsync(0);
 
-    // A fresh peer + signaling were created for the rebuild...
-    expect(FakePeer.instances).toHaveLength(2);
+    // A fresh signaling socket is created and joined for the rebuild. The fresh
+    // PEER, however, is now built only AFTER the join ack (so it inherits the
+    // server-distributed ICE config) — a rejected rebuild join never creates it.
     expect(FakeSignaling.instances).toHaveLength(2);
-    const freshPeer = FakePeer.instances[1]!;
+    expect(FakePeer.instances).toHaveLength(1);
     const freshSignaling = FakeSignaling.instances[1]!;
 
-    // ...and BOTH are fully closed on the rejection (so the SignalingClient's
-    // lastJoin can never be reconnected/replayed).
-    expect(freshPeer.closed).toBe(true);
+    // The old peer is closed and the fresh signaling is fully closed on the
+    // rejection (so the SignalingClient's lastJoin can never be reconnected).
+    expect(oldPeer.closed).toBe(true);
     expect(freshSignaling.closed).toBe(true);
     expect(freshSignaling.joins).toBe(1);
 
@@ -172,18 +176,15 @@ describe('ViewerSession ICE-rebuild failure teardown (FINDING P2 viewer-session.
 
   it('stops the stats loop after a rejected rebuild (no further poll calls)', async () => {
     await connected({ statsIntervalMs: 100 });
-    const freshPeerCountBefore = FakePeer.instances.length;
 
     armNext = (s) => (s.rejectWith = 'no-such-session');
     FakePeer.current!.emitState('failed');
     await vi.advanceTimersByTimeAsync(0);
 
-    const freshPeer = FakePeer.instances[freshPeerCountBefore]!;
-    const pollsAfterTeardown = freshPeer.statsCalls;
     // Advance well past several stats intervals: the loop must be stopped, so no
-    // additional polls happen on either the fresh peer or the (nulled) old one.
+    // additional polls happen on the (nulled) old peer. No fresh peer was built
+    // (rejected rebuild join), so the whole set must show zero polls.
     await vi.advanceTimersByTimeAsync(1000);
-    expect(freshPeer.statsCalls).toBe(pollsAfterTeardown);
     for (const p of FakePeer.instances) expect(p.statsCalls).toBe(0);
   });
 
@@ -195,34 +196,36 @@ describe('ViewerSession ICE-rebuild failure teardown (FINDING P2 viewer-session.
     await vi.advanceTimersByTimeAsync(0);
 
     const freshSignaling = FakeSignaling.instances[1]!;
-    // Let plenty of time pass — nothing should re-join or build another peer.
+    // Let plenty of time pass — nothing should re-join or build another peer. The
+    // rejected rebuild join never built a fresh peer, so the count stays at 1.
     await vi.advanceTimersByTimeAsync(20000);
     expect(freshSignaling.joins).toBe(1);
     expect(FakeSignaling.instances).toHaveLength(2);
-    expect(FakePeer.instances).toHaveLength(2);
+    expect(FakePeer.instances).toHaveLength(1);
     expect(session.currentState).toBe('error');
   });
 
   it('tears down the same way when the rebuild join TIMES OUT', async () => {
     const { session } = await connected({ statsIntervalMs: 100, joinTimeoutMs: 2000 });
+    const oldPeer = FakePeer.instances[0]!;
 
     // Arm the rebuild's fresh socket to never reply → join-ack timeout.
     armNext = (s) => (s.silent = true);
     FakePeer.current!.emitState('failed');
-    // Drive the rebuild far enough to create the fresh peer/signaling and arm
-    // the join-ack timer, then fire the timeout.
+    // Drive the rebuild far enough to create the fresh signaling and arm the
+    // join-ack timer, then fire the timeout. The fresh peer is built only after a
+    // successful ack, so a timed-out rebuild never creates one.
     await vi.advanceTimersByTimeAsync(2000);
 
-    const freshPeer = FakePeer.instances[1]!;
     const freshSignaling = FakeSignaling.instances[1]!;
-    expect(freshPeer.closed).toBe(true);
+    expect(oldPeer.closed).toBe(true);
     expect(freshSignaling.closed).toBe(true);
     expect(session.currentState).toBe('error');
 
     // And no replay afterwards.
     await vi.advanceTimersByTimeAsync(20000);
     expect(freshSignaling.joins).toBe(1);
-    expect(FakePeer.instances).toHaveLength(2);
+    expect(FakePeer.instances).toHaveLength(1);
   });
 
   it('a SUCCESSFUL rebuild still reaches connected (teardown only on failure)', async () => {

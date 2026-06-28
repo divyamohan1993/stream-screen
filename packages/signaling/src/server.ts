@@ -105,6 +105,18 @@ export interface SignalingServerOptions {
   /** Sliding window (ms) for {@link maxJoinFailures}. */
   joinFailWindowMs?: number;
   /**
+   * OPT-IN STUN/TURN configuration distributed to EVERY joiner (host + viewers)
+   * on the `joined` acknowledgement so BOTH peers negotiate against the SAME ICE
+   * servers — the prerequisite for symmetric NAT traversal / "connect from
+   * anywhere". The operator supplies their own self-hosted servers (e.g. coturn
+   * or a STUN URL); nothing is hardcoded and no third-party server is contacted.
+   *
+   * Absent or empty (the DEFAULT) means LAN-only: no ICE servers are sent and
+   * the WebRTC layer behaves exactly as before. A defensive copy is stored so a
+   * later mutation of the caller's array cannot change what the server hands out.
+   */
+  iceServers?: RTCIceServer[];
+  /**
    * Whether to trust a reverse proxy's `X-Forwarded-For` header when deriving
    * the remote address used for the join-failure throttle.
    *
@@ -177,6 +189,11 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
   private readonly maxJoinFailures: number;
   private readonly joinFailWindowMs: number;
   private readonly trustProxy: boolean;
+  /**
+   * Operator-configured ICE servers, distributed to every joiner on the `joined`
+   * ack. Stored as a defensive deep-copy; empty array means LAN-only (default).
+   */
+  private readonly iceServers: RTCIceServer[];
   /** Sliding-window failed-join counters, keyed by remote address. */
   private readonly joinFailures = new Map<string, { count: number; first: number }>();
   private heartbeat?: ReturnType<typeof setInterval>;
@@ -191,6 +208,9 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
     this.maxJoinFailures = opts.maxJoinFailures ?? DEFAULT_MAX_JOIN_FAILURES;
     this.joinFailWindowMs = opts.joinFailWindowMs ?? DEFAULT_JOIN_FAIL_WINDOW_MS;
     this.trustProxy = opts.trustProxy ?? false;
+    // Defensive deep-copy so a later mutation of the caller's array (or its
+    // entries) cannot change what we distribute. Empty/omitted => LAN-only.
+    this.iceServers = cloneIceServers(opts.iceServers);
 
     // Resolve the Origin policy once. `['*']` is an explicit allow-all opt-out;
     // an empty/undefined list means "non-browser clients only".
@@ -250,6 +270,14 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
     }
     // 4. Default LAN/dev policy.
     return isLanOrDevOrigin(origin, req.headers.host);
+  }
+
+  /**
+   * The ICE servers this server distributes on the `joined` ack (defensive
+   * copy). Empty when none were configured (LAN-only default).
+   */
+  getIceServers(): RTCIceServer[] {
+    return cloneIceServers(this.iceServers);
   }
 
   /** The bound port (useful when constructed with `port: 0`). */
@@ -492,8 +520,12 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
     };
     room.peers.set(peer.id, peer);
 
-    // Acknowledge the joiner with its identity + the resolved code.
-    this.send(socket, {
+    // Acknowledge the joiner with its identity + the resolved code, and — when
+    // the operator configured ICE servers — the SAME STUN/TURN list every other
+    // peer in this room receives, so host and viewer negotiate against an
+    // identical config (required for NAT traversal). Omitted when empty so the
+    // LAN-only default keeps the ack byte-for-byte unchanged.
+    const joined: SignalMessage = {
       type: 'joined',
       from: peer.id,
       code,
@@ -501,7 +533,9 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
       role,
       name,
       ts: Date.now(),
-    });
+    };
+    if (this.iceServers.length > 0) joined.iceServers = cloneIceServers(this.iceServers);
+    this.send(socket, joined);
 
     // Notify existing peers that someone arrived, and tell the joiner who is
     // already present so a viewer immediately knows the host id to offer to.
@@ -807,6 +841,24 @@ function isPrivateLanHost(h: string): boolean {
   if (/^f[cd][0-9a-f]*:/.test(host)) return true;
   if (/^fe[89ab][0-9a-f]*:/.test(host)) return true;
   return false;
+}
+
+/**
+ * Defensive deep-copy of an ICE-server list. Returns a fresh array of fresh
+ * entries (with `urls` cloned when it is an array) so neither the caller's
+ * original array nor an entry can be mutated to change what the server hands out
+ * or what `getIceServers()` later returns. `undefined`/empty yields `[]`.
+ */
+function cloneIceServers(servers: RTCIceServer[] | undefined): RTCIceServer[] {
+  if (!servers || servers.length === 0) return [];
+  return servers.map((s) => {
+    const copy: RTCIceServer = {
+      urls: Array.isArray(s.urls) ? [...s.urls] : s.urls,
+    };
+    if (s.username !== undefined) copy.username = s.username;
+    if (s.credential !== undefined) copy.credential = s.credential;
+    return copy;
+  });
 }
 
 function parseMessage(data: RawData): SignalMessage | undefined {
