@@ -345,10 +345,26 @@ export class HostSession {
   private readonly pendingChallenges = new Map<string, Uint8Array>();
   /**
    * Whether the shared media stream has been attached to the peer yet. In
-   * non-'open' modes we delay {@link Peer.attachStream} until the first viewer
-   * is authorized, so an unauthorized viewer never triggers media negotiation.
+   * 'open' mode we attach session-wide (replay-to-new) exactly once. In
+   * non-'open' modes this flag is unused — media is attached PER authorized
+   * viewer via {@link Peer.attachStreamTo} (see {@link authorizeViewer}), never
+   * session-wide, so an unapproved viewer can never receive the screen.
    */
   private streamAttached = false;
+  /**
+   * Display names captured at JOIN time, keyed by viewer id. The access
+   * handshake is (re)started not from the signaling join (which fires before the
+   * viewer's WebRTC control channel exists — auth frames sent then are silently
+   * dropped) but from {@link Peer.onControlOpen}, which fires once that viewer's
+   * control channel is actually open. The callback only gets the viewer id, so
+   * the join-time name is stashed here for the challenge/consent record.
+   */
+  private readonly viewerNames = new Map<string, string | undefined>();
+  /**
+   * Disposer for the {@link Peer.onControlOpen} subscription that drives the
+   * access handshake; removed on {@link stop}.
+   */
+  private disposeControlOpen: (() => void) | null = null;
 
   constructor(opts: HostSessionOptions) {
     this.opts = opts;
@@ -512,13 +528,13 @@ export class HostSession {
       signaling.on('peer-joined', (msg) => {
         if (msg.role === 'viewer' && msg.from) {
           this.opts.onViewerJoined?.(msg.from);
-          // In a non-'open' mode, begin the access handshake for this viewer.
-          // The challenge is sent over the (encrypted) control data channel — NOT
-          // over signaling — so the secret/nonce never transit the relay. We start
-          // it after a short turn so the control channel has a chance to open; if
-          // it is not yet open the send is a no-op and the viewer (which knows the
-          // mode is gated) will not be authorized — fail-closed.
-          if (this.accessMode !== 'open') this.beginAuth(msg.from, msg.name);
+          // Stash the join-time name so the access handshake (driven later by
+          // onControlOpen, which only carries the viewer id) can use it for the
+          // challenge / consent record. We do NOT begin auth here: the signaling
+          // join fires BEFORE this viewer's WebRTC control channel exists, and
+          // auth frames sent over a not-yet-open control channel are silently
+          // dropped — leaving the viewer stuck. Auth (re)starts in onControlOpen.
+          this.viewerNames.set(msg.from, msg.name);
         }
       });
       signaling.on('peer-left', (msg) => {
@@ -527,10 +543,26 @@ export class HostSession {
         this.viewerLatency.delete(msg.from);
         this.authorizedViewers.delete(msg.from);
         this.pendingChallenges.delete(msg.from);
+        this.viewerNames.delete(msg.from);
         if (msg.role === 'viewer') this.opts.onViewerLeft?.(msg.from);
       });
 
       await peer.start();
+
+      // ACCESS HANDSHAKE TIMING (P1-A). In any non-'open' mode, begin the access
+      // handshake for a viewer the moment ITS control data channel opens — the
+      // ONLY point at which sendControl(..., viewerId) is actually delivered.
+      // Starting from the signaling join (above) raced ahead of the channel and
+      // dropped the initial auth-challenge/auth-result. onControlOpen fires once
+      // per connection (and replays already-open channels to a late subscriber),
+      // so every gated viewer gets exactly one challenge at the right time. The
+      // challenge/consent flows over the encrypted control channel; signaling
+      // never carries any secret.
+      if (this.accessMode !== 'open') {
+        this.disposeControlOpen = peer.onControlOpen((viewerId) => {
+          this.beginAuth(viewerId, this.viewerNames.get(viewerId));
+        });
+      }
 
       // Tell the encoder this is screen content: optimize for sharp static text
       // over motion smoothness. Without this hint the encoder treats it as camera
@@ -662,10 +694,12 @@ export class HostSession {
   }
 
   /**
-   * Idempotently attach the captured stream to the peer. Called immediately in
-   * 'open' mode, and lazily on the FIRST viewer authorization in non-'open'
-   * modes. Attaching is a session-wide operation (the Peer replays media to
-   * every connection), so we do it exactly once.
+   * Idempotently attach the captured stream SESSION-WIDE (to every existing
+   * connection + replayed onto any future one). Used ONLY by 'open' mode, where
+   * there is no per-viewer gating and every viewer is meant to receive the
+   * screen. Protected modes never call this — they attach per authorized viewer
+   * via {@link Peer.attachStreamTo} (see {@link authorizeViewer}) so the stream
+   * is never replayed to an unapproved or later-joining viewer.
    */
   private ensureStreamAttached(): void {
     if (this.streamAttached) return;
@@ -752,7 +786,7 @@ export class HostSession {
   private async runConsentThenAuthorize(viewerId: string, peerInfo: PeerInfo): Promise<void> {
     const decision = await this.consent.request(peerInfo);
     if (decision === 'accept') {
-      this.authorizeViewer(viewerId);
+      await this.authorizeViewer(viewerId);
     } else {
       this.denyViewer(viewerId);
     }
@@ -813,14 +847,26 @@ export class HostSession {
       });
       return;
     }
-    this.authorizeViewer(viewerId);
+    await this.authorizeViewer(viewerId);
   }
 
-  /** Mark a viewer authorized: attach media (once) + accept input + ack. */
-  private authorizeViewer(viewerId: string): void {
+  /**
+   * Mark a viewer authorized: attach media to ONLY this viewer + accept input +
+   * ack. The media attach is PER viewer (P1-B): {@link Peer.attachStreamTo}
+   * adds tracks to exactly this connection and does NOT set the session-wide
+   * localStream, so the screen is never replayed onto another existing
+   * connection nor auto-attached to a later/unapproved viewer. (Open mode uses
+   * the session-wide {@link ensureStreamAttached} instead — handled in start().)
+   * The ack is sent only after the attach renegotiation has been kicked off.
+   */
+  private async authorizeViewer(viewerId: string): Promise<void> {
     this.authorizedViewers.add(viewerId);
-    this.ensureStreamAttached();
-    this.peer?.sendControl({ t: 'auth-result', v: 1, ok: true }, viewerId);
+    const peer = this.peer;
+    const stream = this.stream;
+    if (peer && stream) {
+      await peer.attachStreamTo(viewerId, stream);
+    }
+    peer?.sendControl({ t: 'auth-result', v: 1, ok: true }, viewerId);
     this.opts.onAuthResult?.(viewerId, true);
   }
 
@@ -1176,6 +1222,10 @@ export class HostSession {
       clearInterval(this.adaptiveTimer);
       this.adaptiveTimer = null;
     }
+    if (this.disposeControlOpen) {
+      this.disposeControlOpen();
+      this.disposeControlOpen = null;
+    }
     if (this.stream) {
       for (const track of this.stream.getTracks()) track.stop();
       this.stream = null;
@@ -1188,6 +1238,7 @@ export class HostSession {
     this.viewerLatency.clear();
     this.authorizedViewers.clear();
     this.pendingChallenges.clear();
+    this.viewerNames.clear();
     this.consent.clear();
     this.lockout.clear();
     this.streamAttached = false;

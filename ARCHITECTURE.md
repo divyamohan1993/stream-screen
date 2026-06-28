@@ -693,6 +693,15 @@ V → H   auth-response  { nonceV, proof, name? }
 H → V   auth-result    { ok }            (reason-free on failure)
 ```
 
+**Handshake timing.** The host starts the handshake for a viewer the instant
+**that viewer's `control` data channel opens** (`Peer.onControlOpen`), not at the
+signaling `peer-joined` (which fires *before* the viewer's `RTCPeerConnection` and
+its `control` channel exist). Sending on a not-yet-open channel silently drops the
+frame, so starting at the signaling join would lose the initial
+`auth-challenge`/`auth-result` and strand the viewer. `onControlOpen` fires once
+per connection and replays already-open channels to late subscribers, so every
+gated viewer is challenged exactly once at the right moment.
+
 The proof is:
 
 ```
@@ -722,6 +731,14 @@ rejected **before any KDF/HMAC runs**, so an attacker can never make the host bu
 PBKDF2 CPU. Success resets the key; keys are isolated so one client cannot lock
 out another. State is in-memory in v1 (cleared on restart; persistence is a noted
 follow-up).
+
+**Per-authorized media attach.** In a protected mode the host attaches the screen
+**per authorized viewer** via `Peer.attachStreamTo(remoteId, stream)` — adding
+tracks to exactly that one connection — rather than the session-wide
+`Peer.attachStream`, which adds tracks to every connection *and* stores the stream
+so later/new connections replay it. So an unapproved viewer already in the room,
+or one that joins before passing its PIN/consent, **receives nothing**. Only
+`open` mode uses the session-wide attach (attach-all + replay-to-new), unchanged.
 
 **Fail-closed.** A PIN mode requested without a valid `STREAMSCREEN_PIN` resolves
 to an internal `refuse` mode and rejects **all** connections (never a silent

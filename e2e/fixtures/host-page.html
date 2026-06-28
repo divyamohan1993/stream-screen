@@ -213,8 +213,39 @@
         return sum;
       }
 
+      // --- P1-B: per-connection media isolation (attachStreamTo) ----------
+      // In 'isolate' mode the host NEVER calls the session-wide attachStream();
+      // instead the spec attaches the stream to EXACTLY ONE viewer (by the label
+      // that viewer announced over the control channel) via peer.attachStreamTo,
+      // proving the stream reaches only that connection and is NOT replayed onto
+      // the other viewer's connection nor auto-attached to a later one.
+      const labelToRemote = new Map(); // 'A' -> remoteId (announced via chat)
+      const attachedRemotes = new Set();
+      // --- P1-A: per-connection control-channel readiness (onControlOpen) ---
+      // Record the remoteId each time a viewer's control channel reaches 'open'.
+      // The spec asserts this fires once PER connection (not once for the session).
+      const controlOpenEvents = [];
+
       window.__host = {
         getFrame: () => frame,
+        // P1-A observation: the remoteIds whose control channel has opened, in
+        // order, one entry per connection. Proves onControlOpen is per-viewer.
+        getControlOpenEvents: () => [...controlOpenEvents],
+        // The labels viewers have announced (so the spec can wait until both
+        // viewers are known before choosing which one to attach media to).
+        getKnownViewerLabels: () => [...labelToRemote.keys()],
+        // P1-B action: attach the host stream to ONLY the viewer that announced
+        // `label`, via the per-connection primitive. Returns false if that label
+        // is not yet known. Idempotent per remoteId (attach a viewer once).
+        attachStreamToLabel: async (label) => {
+          const remoteId = labelToRemote.get(label);
+          if (!remoteId) return false;
+          if (attachedRemotes.has(remoteId)) return true;
+          attachedRemotes.add(remoteId);
+          await peer.attachStreamTo(remoteId, stream);
+          state.streamAttached = true;
+          return true;
+        },
         getState: () => ({
           ...state,
           receivedInputs: [...state.receivedInputs],
@@ -348,7 +379,7 @@
       // is a no-op while the control channel is still opening). The viewer's
       // arriving auth-response stops the retries.
       async function sendChallenge(remoteId) {
-        if (accessMode === 'open') return;
+        if (accessMode === 'open' || accessMode === 'isolate') return;
         if (authSessions.has(remoteId)) return; // one challenge per viewer
         const verifier = await ensureVerifier();
         const channelBinding = peer.getChannelBinding(remoteId);
@@ -486,7 +517,9 @@
       // session and stops the retries.
       const challengeTimers = new Map(); // remoteId -> interval id
       peer.on('state', (s, remoteId) => {
-        if (accessMode === 'open' || !remoteId) return;
+        // 'isolate' runs no auth handshake — it exercises ONLY per-connection
+        // media attach (P1-B) and onControlOpen (P1-A), driven by the spec.
+        if (accessMode === 'open' || accessMode === 'isolate' || !remoteId) return;
         if (s === 'connected' || s === 'completed') {
           if (challengeTimers.has(remoteId)) return;
           // Track whether the viewer has answered at least once so we stop
@@ -563,6 +596,11 @@
             break;
           case 'chat':
             state.chats.push(m);
+            // P1-B: a viewer announces its test label as `label:<X>` so the spec
+            // can attach media to a specific viewer's connection by label.
+            if (typeof m.text === 'string' && m.text.startsWith('label:') && remoteId) {
+              labelToRemote.set(m.text.slice('label:'.length), remoteId);
+            }
             break;
           case 'latency':
             // Viewer-reported real-time telemetry: record the parsed values so the
@@ -635,14 +673,26 @@
       }
       setInterval(adaptiveTick, 500);
 
+      // P1-A: record per-connection control-channel readiness. onControlOpen
+      // fires once per viewer the moment ITS control channel opens (and replays
+      // already-open channels to a late subscriber). The isolation spec asserts
+      // this fires once per connection, proving the signal is per-viewer.
+      peer.onControlOpen((remoteId) => {
+        controlOpenEvents.push(remoteId);
+      });
+
       (async () => {
         await signaling.connect();
         await peer.start();
         // OPEN mode (default): attach immediately — preserves legacy behavior so
-        // every existing spec keeps passing unchanged. In any auth mode the media
-        // is withheld until a viewer is authorized (see handleAuthResponse).
+        // every existing spec keeps passing unchanged. 'isolate' mode NEVER
+        // session-wide-attaches: the spec drives per-viewer attachStreamTo to
+        // prove no media leaks to the other connection (P1-B). In any auth mode
+        // the media is withheld until a viewer is authorized (handleAuthResponse).
         if (accessMode === 'open') {
           attachStreamOnce();
+        } else if (accessMode === 'isolate') {
+          /* no session-wide attach; spec calls attachStreamToLabel per viewer */
         } else if (needsPin) {
           // Pre-build the verifier so the first challenge isn't delayed by the
           // 600k-iteration KDF mid-handshake.

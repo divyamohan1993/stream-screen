@@ -72,7 +72,11 @@ runs **peer-to-peer over the already-encrypted DTLS data channel**:
 2. **Challenge.** On a new viewer the host sends an `auth-challenge` over the
    control data channel containing a fresh random host nonce, the salt, the
    iteration count, and the **channel binding** (see below). The salt/iterations
-   are public KDF parameters; the derived key is not sent.
+   are public KDF parameters; the derived key is not sent. The handshake starts
+   when **that viewer's `control` data channel becomes open** (not at the
+   signaling join, which fires before the channel exists) — the only moment an
+   auth frame can actually be delivered, so the challenge is never silently
+   dropped.
 3. **Proof.** The viewer derives the same key from the PIN it was given and the
    salt, then computes
    `HMAC-SHA256(derivedKey, "streamscreen-auth-v1" || nonceH || nonceV || channelBinding)`
@@ -84,6 +88,15 @@ runs **peer-to-peer over the already-encrypted DTLS data channel**:
 
 Because the proof binds a per-handshake host nonce, a captured proof cannot be
 replayed against a fresh challenge.
+
+### Per-authorized media attach (no stream leak)
+
+In any protected mode the host attaches the screen **per authorized viewer** — to
+exactly the one connection it just authorized — never session-wide. There is no
+shared/stored stream that replays onto other connections, so a viewer that is
+already in the room but unapproved, or one that joins before passing its
+PIN/consent, **receives nothing**: no video, no audio, no input. Only `open` mode
+(no auth) attaches to everyone, which is its intended behavior.
 
 ### Channel binding (anti-MITM)
 

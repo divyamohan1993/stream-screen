@@ -76,6 +76,12 @@ declare global {
     __host: {
       getFrame(): number;
       getState(): HostState;
+      /** P1-A: remoteIds whose control channel has opened, in order (one per connection). */
+      getControlOpenEvents(): string[];
+      /** Labels viewers have announced over the control channel. */
+      getKnownViewerLabels(): string[];
+      /** P1-B: attach the host stream to ONLY the viewer that announced `label`. */
+      attachStreamToLabel(label: string): Promise<boolean>;
       getReceivedInputs(): InputEvent[];
       getLastInput(): InputEvent | null;
       getChats(): ChatMsg[];

@@ -58,6 +58,11 @@
       // The PIN the viewer presents. Only used to derive a proof over the
       // encrypted control channel; the PIN itself never crosses the wire.
       const viewerPin = params.get('pin') ?? '';
+      // Optional test label this viewer announces over the control channel (as a
+      // `chat` "label:<X>") once its channels are open, so the host fixture can
+      // map this connection's remoteId to a stable label and attach media to it
+      // specifically (P1-B per-connection isolation spec). Absent => no announce.
+      const viewerLabel = params.get('label') ?? '';
       const wsUrl = `ws://${location.host}`;
       // OPT-IN ICE servers ("connect from anywhere"). Absent => LAN-only,
       // unchanged behavior. The compact/JSON string is parsed exactly as an
@@ -435,9 +440,19 @@
         video.play().catch(() => {});
       });
 
+      let labelAnnounced = false;
+      function announceLabel() {
+        if (labelAnnounced || !viewerLabel) return;
+        labelAnnounced = true;
+        // The control channel is open here, so this send actually lands. The host
+        // records remoteId -> label and can then attachStreamTo this connection.
+        peer.sendControl({ t: 'chat', text: `label:${viewerLabel}`, ts: Date.now() });
+      }
       peer.on('datachannel', (ch) => {
         const markOpen = () => {
           state.dataChannelOpen = true;
+          // Announce our label once the control channel is open.
+          if (ch.label === 'control') announceLabel();
         };
         if (ch.readyState === 'open') markOpen();
         ch.addEventListener?.('open', markOpen);

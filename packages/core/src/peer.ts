@@ -10,8 +10,16 @@ import { isControlMessage } from './protocol.js';
 import type { SignalingClient } from './signaling-client.js';
 import { decodeInput, encodeInput } from './input-codec.js';
 
-/** Events emitted by a {@link Peer}. */
-export type PeerEvent = 'track' | 'datachannel' | 'state' | 'stats';
+/**
+ * Events emitted by a {@link Peer}.
+ *
+ * `controlopen` fires (with the remote id as its single argument) for each
+ * connection the moment ITS `control` data channel transitions to open. The host
+ * uses this to (re)start the connection-consent / access-PIN handshake at the
+ * only time auth frames can actually be delivered — a `control` channel that is
+ * not yet open silently drops sends.
+ */
+export type PeerEvent = 'track' | 'datachannel' | 'state' | 'stats' | 'controlopen';
 
 /** Options for constructing a {@link Peer}. */
 export interface PeerOptions {
@@ -72,6 +80,12 @@ interface RemoteConnection {
   inputChannel: RTCDataChannel | null;
   controlChannel: RTCDataChannel | null;
   fileChannel: RTCDataChannel | null;
+  /**
+   * True once this connection's `control` data channel has reached the open
+   * state at least once. Drives the `controlopen` event / {@link Peer.isControlOpen}
+   * and lets late subscribers learn an already-open channel.
+   */
+  controlOpen: boolean;
   // Perfect-negotiation bookkeeping (per connection).
   makingOffer: boolean;
   ignoreOffer: boolean;
@@ -131,6 +145,7 @@ export class Peer {
   private readonly inputHandlers = new Set<(e: InputEvent, remoteId: string) => void>();
   private readonly controlHandlers = new Set<(m: ControlMessage, remoteId: string) => void>();
   private readonly fileChunkHandlers = new Set<(buf: ArrayBuffer, remoteId: string) => void>();
+  private readonly controlOpenHandlers = new Set<(remoteId: string) => void>();
 
   /**
    * Small playout latency target (seconds) applied to inbound video receivers to
@@ -220,6 +235,7 @@ export class Peer {
       inputChannel: null,
       controlChannel: null,
       fileChannel: null,
+      controlOpen: false,
       makingOffer: false,
       ignoreOffer: false,
       pendingCandidates: [],
@@ -484,6 +500,16 @@ export class Peer {
 
   private bindControlChannel(conn: RemoteConnection, channel: RTCDataChannel): void {
     conn.controlChannel = channel;
+    // Signal per-connection control-channel readiness. This is the only moment
+    // ControlMessages (auth-challenge/auth-result, etc.) can actually be sent to
+    // this viewer — a not-yet-open channel drops sends. Fire once, the first time
+    // the channel is open: either it is already open at bind time (some stacks /
+    // test stubs), or we wait for its `onopen`.
+    if (channel.readyState === 'open') {
+      this.markControlOpen(conn);
+    } else {
+      channel.onopen = () => this.markControlOpen(conn);
+    }
     channel.onmessage = (ev: MessageEvent) => {
       try {
         const data = typeof ev.data === 'string' ? ev.data : String(ev.data);
@@ -495,6 +521,53 @@ export class Peer {
         /* drop malformed control frame */
       }
     };
+  }
+
+  /**
+   * Mark a connection's `control` channel open (idempotent) and notify
+   * subscribers exactly once. Both the `controlopen` event and any
+   * {@link onControlOpen} callbacks fire with the remote id.
+   */
+  private markControlOpen(conn: RemoteConnection): void {
+    if (conn.controlOpen) return;
+    conn.controlOpen = true;
+    for (const cb of this.controlOpenHandlers) cb(conn.remoteId);
+    this.emit('controlopen', conn.remoteId);
+  }
+
+  /**
+   * Subscribe to per-connection `control`-channel readiness. The callback fires
+   * with a remote id the first time THAT viewer's `control` data channel becomes
+   * open — the only point at which {@link sendControl} to that viewer will be
+   * delivered. The host uses this to (re)start the connection-consent /
+   * access-PIN handshake at the right time.
+   *
+   * Late subscription is safe: any connection whose control channel is ALREADY
+   * open when you subscribe is delivered synchronously to your callback, so a
+   * caller that attaches after a channel opened still learns about it. Use
+   * {@link isControlOpen} for a point-in-time query instead.
+   *
+   * Returns a disposer that unregisters this exact handler.
+   */
+  onControlOpen(cb: (remoteId: string) => void): () => void {
+    this.controlOpenHandlers.add(cb);
+    // Replay already-open channels to this subscriber so late subscribers do not
+    // miss the edge they registered to observe.
+    for (const conn of this.connections.values()) {
+      if (conn.controlOpen) cb(conn.remoteId);
+    }
+    return () => {
+      this.controlOpenHandlers.delete(cb);
+    };
+  }
+
+  /**
+   * Whether a specific viewer's `control` data channel is currently open (and
+   * therefore {@link sendControl} to it will be delivered). Returns false for an
+   * unknown remote id.
+   */
+  isControlOpen(remoteId: string): boolean {
+    return this.connections.get(remoteId)?.controlOpen ?? false;
   }
 
   private bindFileChannel(conn: RemoteConnection, channel: RTCDataChannel): void {
@@ -625,6 +698,34 @@ export class Peer {
       for (const track of s.getTracks()) {
         conn.pc.addTrack(track, s);
       }
+    }
+  }
+
+  /**
+   * Attach a local {@link MediaStream} to EXACTLY ONE connection (the viewer
+   * named by `remoteId`), adding its tracks to that connection's senders and
+   * renegotiating only that connection. Unlike {@link attachStream}, this does
+   * NOT set the session-wide `localStream`, so the stream is NOT replayed onto
+   * other existing connections and — critically — is NOT auto-attached to any
+   * connection created later. New/unapproved viewers therefore receive nothing.
+   *
+   * This is the media primitive for protected access modes (prompt / pin /
+   * pin-and-prompt): the host attaches the screen ONLY to each viewer it has
+   * authorized, one at a time, instead of leaking it session-wide. Open mode
+   * keeps using {@link attachStream} (attach-all + replay-to-new), unchanged.
+   *
+   * Resolves once the tracks are added (each `addTrack` fires
+   * `onnegotiationneeded`, the single offer path). A no-op (resolves) when
+   * `remoteId` names no current connection or the stream has no tracks. Calling
+   * it more than once for the same viewer with the same tracks would double-add
+   * senders, so callers should attach a given viewer once.
+   */
+  async attachStreamTo(remoteId: string, s: MediaStream): Promise<void> {
+    if (!this.running) throw new Error('Peer.attachStreamTo: call start() first');
+    const conn = this.connections.get(remoteId);
+    if (!conn) return;
+    for (const track of s.getTracks()) {
+      conn.pc.addTrack(track, s);
     }
   }
 
@@ -1074,6 +1175,7 @@ export class Peer {
     this.inputHandlers.clear();
     this.controlHandlers.clear();
     this.fileChunkHandlers.clear();
+    this.controlOpenHandlers.clear();
   }
 }
 

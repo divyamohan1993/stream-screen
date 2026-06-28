@@ -30,14 +30,22 @@ interface SentControl {
 const peerBus: {
   controlHandlers: ((m: ControlMessage, viewerId: string) => void)[];
   inputHandler: ((e: InputEvent, viewerId: string) => void) | null;
+  controlOpenHandlers: ((remoteId: string) => void)[];
+  openViewers: Set<string>;
   sent: SentControl[];
+  /** Session-wide attachStream() calls (open mode). */
   attachCount: number;
+  /** Per-viewer attachStreamTo() calls (protected modes), in order. */
+  attachedTo: string[];
   channelBinding: string;
 } = {
   controlHandlers: [],
   inputHandler: null,
+  controlOpenHandlers: [],
+  openViewers: new Set(),
   sent: [],
   attachCount: 0,
+  attachedTo: [],
   channelBinding: 'fpHost|fpViewer',
 };
 
@@ -67,6 +75,21 @@ vi.mock('@stream-screen/core', async () => {
     async start(): Promise<void> {}
     attachStream(): void {
       peerBus.attachCount += 1;
+    }
+    async attachStreamTo(remoteId: string): Promise<void> {
+      peerBus.attachedTo.push(remoteId);
+    }
+    onControlOpen(cb: (remoteId: string) => void): () => void {
+      peerBus.controlOpenHandlers.push(cb);
+      // LATE-SUBSCRIBER SAFE: replay channels already open to this subscriber,
+      // matching the real Peer contract the host relies on.
+      for (const id of peerBus.openViewers) cb(id);
+      return () => {
+        peerBus.controlOpenHandlers = peerBus.controlOpenHandlers.filter((h) => h !== cb);
+      };
+    }
+    isControlOpen(remoteId: string): boolean {
+      return peerBus.openViewers.has(remoteId);
     }
     async replaceVideoTrack(): Promise<boolean> {
       return true;
@@ -170,8 +193,11 @@ const CB = 'fpHost|fpViewer';
 function resetBus(): void {
   peerBus.controlHandlers = [];
   peerBus.inputHandler = null;
+  peerBus.controlOpenHandlers = [];
+  peerBus.openViewers = new Set();
   peerBus.sent = [];
   peerBus.attachCount = 0;
+  peerBus.attachedTo = [];
   peerBus.channelBinding = CB;
   signalingBus = null;
 }
@@ -209,9 +235,23 @@ async function startSession(opts: StartOpts): Promise<{
   return { session, inputs };
 }
 
-/** Fire a viewer joining the room. */
+/**
+ * Fire a viewer joining the room, then open its WebRTC control channel. The
+ * real flow is: signaling 'peer-joined' (name captured) → the Peer stands up
+ * that viewer's RTCPeerConnection → its 'control' channel opens (onControlOpen),
+ * which is when the host begins auth. This helper reproduces that ordering so
+ * the host's onControlOpen-driven auth (P1-A) actually fires.
+ */
 function viewerJoins(viewerId: string, name?: string): void {
   signalingBus!.emit('peer-joined', { type: 'peer-joined', role: 'viewer', from: viewerId, name });
+  openControl(viewerId);
+}
+
+/** Open a viewer's control channel, notifying onControlOpen subscribers once. */
+function openControl(viewerId: string): void {
+  if (peerBus.openViewers.has(viewerId)) return;
+  peerBus.openViewers.add(viewerId);
+  for (const cb of [...peerBus.controlOpenHandlers]) cb(viewerId);
 }
 
 /** Deliver a control message from a viewer to the host's handlers. */
@@ -281,7 +321,9 @@ describe('HostSession access gating', () => {
 
       const resp = await buildResponse('viewer-1', PIN);
       deliverControl(resp, 'viewer-1');
-      await vi.waitFor(() => expect(peerBus.attachCount).toBe(1));
+      // Media is attached PER authorized viewer (attachStreamTo), NOT session-wide.
+      await vi.waitFor(() => expect(peerBus.attachedTo).toEqual(['viewer-1']));
+      expect(peerBus.attachCount).toBe(0);
       expect(authResults('viewer-1')).toContain(true);
       expect(session.isAuthorized('viewer-1')).toBe(true);
       session.stop();
@@ -371,7 +413,9 @@ describe('HostSession access gating', () => {
 
       consent.accept();
       await vi.waitFor(() => expect(session.isAuthorized('viewer-1')).toBe(true));
-      expect(peerBus.attachCount).toBe(1);
+      // Per-viewer attach, never session-wide.
+      expect(peerBus.attachedTo).toEqual(['viewer-1']);
+      expect(peerBus.attachCount).toBe(0);
       expect(authResults('viewer-1')).toContain(true);
 
       peerBus.inputHandler!({ t: 'm-move', x: 0.2, y: 0.2 }, 'viewer-1');
@@ -408,7 +452,8 @@ describe('HostSession access gating', () => {
 
       consent.accept();
       await vi.waitFor(() => expect(session.isAuthorized('viewer-1')).toBe(true));
-      expect(peerBus.attachCount).toBe(1);
+      expect(peerBus.attachedTo).toEqual(['viewer-1']);
+      expect(peerBus.attachCount).toBe(0);
       session.stop();
     });
 
@@ -422,6 +467,106 @@ describe('HostSession access gating', () => {
         expect(authResults('viewer-1').some((ok) => ok === false)).toBe(true),
       );
       expect(consent.pending).toHaveLength(0);
+      expect(peerBus.attachCount).toBe(0);
+      session.stop();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // P1 security regressions: control-channel-timed auth (P1-A) and per-viewer
+  // (non-session-wide) media attach (P1-B). These fail against the pre-fix host
+  // (auth begun from the signaling join; session-wide attachStream on authorize).
+  // ---------------------------------------------------------------------------
+  describe('P1-A: auth begins on control-channel open, not signaling join', () => {
+    it('does NOT send the challenge at signaling join — only once the control channel opens', async () => {
+      const { session } = await startSession({ mode: 'pin' });
+      // Viewer joins signaling, but its WebRTC control channel is NOT open yet.
+      signalingBus!.emit('peer-joined', {
+        type: 'peer-joined',
+        role: 'viewer',
+        from: 'viewer-late',
+      });
+      // Pre-fix the host called beginAuth() here and the challenge was dropped on
+      // the closed channel. Post-fix no challenge is even attempted until open.
+      expect(
+        peerBus.sent.some((s) => s.to === 'viewer-late' && s.msg.t === 'auth-challenge'),
+      ).toBe(false);
+
+      // Now the control channel opens — THIS is when auth must (re)start, and the
+      // challenge is actually deliverable.
+      openControl('viewer-late');
+      expect(
+        peerBus.sent.some((s) => s.to === 'viewer-late' && s.msg.t === 'auth-challenge'),
+      ).toBe(true);
+      session.stop();
+    });
+
+    it('prompt mode: consent request is raised on control-open, not before', async () => {
+      const consent = new ConsentManager();
+      const { session } = await startSession({ mode: 'prompt', consent });
+      signalingBus!.emit('peer-joined', {
+        type: 'peer-joined',
+        role: 'viewer',
+        from: 'viewer-late',
+        name: 'Late',
+      });
+      // No consent yet — the control channel has not opened.
+      expect(consent.pending).toHaveLength(0);
+      openControl('viewer-late');
+      await vi.waitFor(() => expect(consent.pending).toHaveLength(1));
+      session.stop();
+    });
+  });
+
+  describe('P1-B: media attaches per authorized viewer, never session-wide', () => {
+    it('an unapproved viewer already in the room never receives media (or input) after another is approved', async () => {
+      const { session, inputs } = await startSession({ mode: 'pin' });
+      // TWO viewers join and both open their control channels.
+      viewerJoins('viewer-A');
+      viewerJoins('viewer-B');
+      // Only viewer-A passes the PIN.
+      const respA = await buildResponse('viewer-A', PIN);
+      deliverControl(respA, 'viewer-A');
+      await vi.waitFor(() => expect(session.isAuthorized('viewer-A')).toBe(true));
+
+      // Media attached ONLY to viewer-A; NEVER session-wide (which would replay
+      // the stream onto viewer-B's already-open connection). viewer-B gets nothing.
+      expect(peerBus.attachedTo).toEqual(['viewer-A']);
+      expect(peerBus.attachCount).toBe(0);
+      expect(session.isAuthorized('viewer-B')).toBe(false);
+
+      // viewer-A's input flows; viewer-B's input (unauthorized) is dropped.
+      peerBus.inputHandler!({ t: 'm-move', x: 0.3, y: 0.3 }, 'viewer-A');
+      peerBus.inputHandler!({ t: 'm-move', x: 0.9, y: 0.9 }, 'viewer-B');
+      expect(inputs).toHaveLength(1);
+      expect(inputs[0]!.viewerId).toBe('viewer-A');
+      session.stop();
+    });
+
+    it('a viewer that joins AFTER an approval does not auto-receive the replayed stream', async () => {
+      const { session } = await startSession({ mode: 'pin' });
+      viewerJoins('viewer-A');
+      const respA = await buildResponse('viewer-A', PIN);
+      deliverControl(respA, 'viewer-A');
+      await vi.waitFor(() => expect(session.isAuthorized('viewer-A')).toBe(true));
+
+      // A NEW viewer joins after viewer-A was approved. Session-wide attach would
+      // have stored localStream and replayed it onto viewer-B's fresh connection;
+      // per-viewer attach does not, so viewer-B receives nothing until it authorizes.
+      viewerJoins('viewer-B');
+      // viewer-B is challenged (P1-A) but not authorized, and gets no media.
+      expect(
+        peerBus.sent.some((s) => s.to === 'viewer-B' && s.msg.t === 'auth-challenge'),
+      ).toBe(true);
+      expect(peerBus.attachedTo).toEqual(['viewer-A']);
+      expect(peerBus.attachCount).toBe(0);
+      expect(session.isAuthorized('viewer-B')).toBe(false);
+
+      // When viewer-B finally authorizes, IT gets its own per-connection attach.
+      const respB = await buildResponse('viewer-B', PIN);
+      deliverControl(respB, 'viewer-B');
+      await vi.waitFor(() => expect(session.isAuthorized('viewer-B')).toBe(true));
+      expect(peerBus.attachedTo).toEqual(['viewer-A', 'viewer-B']);
       expect(peerBus.attachCount).toBe(0);
       session.stop();
     });
