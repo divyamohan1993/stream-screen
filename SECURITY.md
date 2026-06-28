@@ -27,6 +27,14 @@ with no third-party cloud in the path.
 - **WebSocket Origin allowlisting.** The signaling server enforces an Origin
   allowlist (`STREAMSCREEN_ALLOWED_ORIGINS`); by default it accepts only
   loopback / LAN / same-host origins.
+- **Malformed-frame resilience (no crash).** The signaling server validates and
+  coerces join fields before using them — a non-string `code`/`room` is rejected
+  with a protocol error, and a missing/non-string `name`/`role` is coerced to a
+  safe default (a non-`'host'` role is always treated as a viewer). Per-frame
+  processing is wrapped so that any unexpected throw from a malformed client
+  frame is turned into a generic protocol error for that one socket and
+  swallowed — a single bad frame can never crash the process or disturb other
+  live sessions.
 - **Optional, sandboxed-by-absence input.** Remote input injection on the host
   depends on the optional `@nut-tree-fork/nut-js` native module. If it is not
   installed, the host still streams but cannot inject input — input is the only

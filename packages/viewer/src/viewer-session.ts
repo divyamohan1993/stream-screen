@@ -965,6 +965,18 @@ export class ViewerSession {
     const peer = this.peer;
     if (!challenge || !peer) return;
     if (challenge.mode !== 'pin' && challenge.mode !== 'pin-and-prompt') return;
+    // CONSUME the challenge NOW — synchronously, before the first `await` and
+    // before the proof is sent. Key derivation is async, so two rapid
+    // submitPin() calls (a double-click or an Enter-repeat) would otherwise both
+    // read the SAME `pendingChallenge` and each send an `auth-response` carrying
+    // the SAME host nonce. The host consumes that nonce on the first valid
+    // response; the duplicate then hits its `!nonceH` path, and the host replies
+    // with a DENIAL that removes the just-authorized viewer. Clearing
+    // `pendingChallenge` here makes a second call see `null` and no-op — it stays
+    // a no-op until a FRESH `auth-challenge` (new nonce) re-arms the session. This
+    // composes with the fresh-challenge retry: a wrong PIN -> host sends a new
+    // challenge -> {@link onAuthChallenge} re-arms `pendingChallenge`.
+    this.pendingChallenge = null;
     const salt = fromBase64(challenge.salt);
     const nonceH = fromBase64(challenge.nonceH);
     const nonceV = randomBytes(NONCE_BYTES);
@@ -977,7 +989,7 @@ export class ViewerSession {
       nonceV,
       channelBinding,
     });
-    // The challenge has been consumed; on a denial the host sends a FRESH
+    // The challenge was consumed above; on a denial the host sends a FRESH
     // challenge (new nonce) which re-arms us — we never resubmit this nonce.
     peer.sendControl({
       t: 'auth-response',

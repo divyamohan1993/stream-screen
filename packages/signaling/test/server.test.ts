@@ -696,6 +696,93 @@ describe('SignalingServer', () => {
     host.close();
     viewer.close();
   });
+
+  // ---------------------------------------------------------------------------
+  // P1 crash/DoS: malformed `join` fields and unexpected throws while
+  // processing a frame must NEVER take down the server/process. `isSignalMessage`
+  // (core) only validates `type`, so an authenticated socket can send a numeric
+  // `code` / non-string `name`, and the old `.trim()` threw out of the WS
+  // `message` handler and crashed the whole signaling process. These tests pin
+  // that a bad frame yields an error response (or safe ignore) AND the server
+  // stays alive and keeps serving other clients.
+  // ---------------------------------------------------------------------------
+
+  /** Send arbitrary (possibly protocol-invalid) JSON without TS coercion. */
+  function sendRaw(ws: WebSocket, obj: unknown): void {
+    ws.send(JSON.stringify(obj));
+  }
+
+  /** A fresh client can still complete a full host join (server is alive). */
+  async function expectServerStillServes(): Promise<void> {
+    const probe = await connect(port);
+    sendRaw(probe, { type: 'join', role: 'host', name: 'Probe', code: '900900' });
+    const joined = await nextMessage(probe, 'joined');
+    expect(joined.code).toBe('900900');
+    probe.close();
+  }
+
+  it('returns invalid-join for a numeric `code` and does NOT crash the process', async () => {
+    const client = await connect(port);
+    // {"type":"join","role":"viewer","code":123} — code is a NUMBER. The old
+    // handler did `(msg.code ?? '').trim()` -> TypeError -> process crash.
+    sendRaw(client, { type: 'join', role: 'viewer', code: 123 });
+    const err = await nextMessage(client, 'error');
+    expect(err.message).toBe('invalid-join');
+    client.close();
+
+    // The server must still be alive and able to serve a brand-new client.
+    await expectServerStillServes();
+  });
+
+  it('treats a non-string `name` as a coercible value (no crash, valid join)', async () => {
+    const client = await connect(port);
+    // name is a NUMBER; the old `(msg.name ?? '').trim()` would throw. It must
+    // now coerce to the role default and complete the join.
+    sendRaw(client, { type: 'join', role: 'host', name: 42, code: '700700' });
+    const joined = await nextMessage(client, 'joined');
+    expect(joined.code).toBe('700700');
+    // Coerced empty -> role default name 'host'.
+    expect(joined.name).toBe('host');
+    client.close();
+
+    await expectServerStillServes();
+  });
+
+  it('rejects a non-string `room` alias with invalid-join without crashing', async () => {
+    const client = await connect(port);
+    sendRaw(client, { type: 'join', role: 'viewer', room: { evil: true } });
+    const err = await nextMessage(client, 'error');
+    expect(err.message).toBe('invalid-join');
+    client.close();
+
+    await expectServerStillServes();
+  });
+
+  it('survives a frame that would otherwise throw, and keeps serving other clients', async () => {
+    // A bystander host that must keep working after a malicious peer misbehaves.
+    const bystander = await connect(port);
+    sendRaw(bystander, { type: 'join', role: 'host', name: 'Bystander', code: '800800' });
+    await nextMessage(bystander, 'joined');
+
+    // Attacker sends a malformed join (numeric code) that previously crashed the
+    // process. The server must respond with an error and keep the bystander's
+    // session fully functional.
+    const attacker = await connect(port);
+    sendRaw(attacker, { type: 'join', role: 'viewer', code: 555 });
+    const err = await nextMessage(attacker, 'error');
+    expect(err.message).toBe('invalid-join');
+    attacker.close();
+
+    // The bystander's session is intact: ping still answered with pong.
+    const pongPromise = nextMessage(bystander, 'pong');
+    send(bystander, { type: 'ping', ts: Date.now() });
+    const pong = await pongPromise;
+    expect(pong.type).toBe('pong');
+
+    // And brand-new clients can still join.
+    await expectServerStillServes();
+    bystander.close();
+  });
 });
 
 describe('isLanOrDevOrigin (default WS origin policy)', () => {

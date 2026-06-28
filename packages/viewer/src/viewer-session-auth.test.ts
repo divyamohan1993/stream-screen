@@ -388,4 +388,74 @@ describe('ViewerSession auth (consent + PIN)', () => {
     };
     expect(containsPin(session, 0)).toBe(false);
   });
+
+  it('P2 double-submit: two RAPID submitPin() calls send only ONE auth-response for the same nonce', async () => {
+    const verifier = await makeVerifier(PIN, 1000);
+    const nonceH = randomBytes(NONCE_BYTES);
+    const session = await connectedSession();
+    const peer = FakePeer.current!;
+
+    peer.deliver(challengeFor(verifier, 'pin', nonceH));
+    // The session is armed with exactly one pending challenge.
+    expect(session.currentAuthChallenge).toEqual({ mode: 'pin', needsPin: true });
+
+    // Fire TWO submits WITHOUT awaiting the first — exactly what a double-click /
+    // Enter-repeat does while the async PBKDF2 derivation of the first is still in
+    // flight. The challenge is consumed synchronously by the first call, so the
+    // second sees no pending challenge and is a no-op.
+    const p1 = session.submitPin(PIN);
+    const p2 = session.submitPin(PIN);
+    await Promise.all([p1, p2]);
+
+    // Only ONE response for the host's nonce — the duplicate never reaches the
+    // host (which would have consumed the nonce and DENIED the second, removing
+    // the just-authorized viewer).
+    const responses = peer.sentControl.filter((m) => m.t === 'auth-response');
+    expect(responses.length).toBe(1);
+    // And the challenge is no longer armed once consumed.
+    expect(session.currentAuthChallenge).toBeNull();
+  });
+
+  it('P2 double-submit: after a FRESH auth-challenge re-arms the session, submit works again', async () => {
+    const verifier = await makeVerifier(PIN, 1000);
+    const nonceH1 = randomBytes(NONCE_BYTES);
+    const nonceH2 = randomBytes(NONCE_BYTES);
+    expect(toBase64(nonceH1)).not.toBe(toBase64(nonceH2));
+
+    const session = await connectedSession();
+    const peer = FakePeer.current!;
+
+    // First challenge: a double-submit yields exactly one response, then the
+    // session is disarmed (challenge consumed).
+    peer.deliver(challengeFor(verifier, 'pin', nonceH1));
+    await Promise.all([session.submitPin(PIN), session.submitPin(PIN)]);
+    expect(peer.sentControl.filter((m) => m.t === 'auth-response').length).toBe(1);
+    expect(session.currentAuthChallenge).toBeNull();
+
+    // A bare retry against the consumed challenge is inert (no fresh nonce yet).
+    await session.submitPin(PIN);
+    expect(peer.sentControl.filter((m) => m.t === 'auth-response').length).toBe(1);
+
+    // The host re-issues a FRESH challenge (new nonce). This re-arms the session
+    // and a subsequent submit goes through, binding the NEW nonce.
+    peer.deliver(challengeFor(verifier, 'pin', nonceH2));
+    expect(session.currentAuthChallenge).toEqual({ mode: 'pin', needsPin: true });
+
+    await session.submitPin(PIN);
+    const responses = peer.sentControl.filter((m) => m.t === 'auth-response') as Extract<
+      ControlMessage,
+      { t: 'auth-response' }
+    >[];
+    expect(responses.length).toBe(2);
+
+    // The fresh proof verifies against nonceH2 and not the consumed nonceH1.
+    const fresh = responses[1]!;
+    const okFresh = await verifyProofAgainst(verifier, fromBase64(fresh.proof), {
+      domain: AUTH_DOMAIN,
+      nonceH: nonceH2,
+      nonceV: fromBase64(fresh.nonceV),
+      channelBinding: CHANNEL_BINDING,
+    });
+    expect(okFresh).toBe(true);
+  });
 });

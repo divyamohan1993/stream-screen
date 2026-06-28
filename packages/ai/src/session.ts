@@ -295,6 +295,16 @@ export class RemoteDesktopSession {
   private peer: SessionPeer | null = null;
   private rtcCtor: typeof RTCPeerConnection | null;
   private connectedCode: string | null = null;
+  /**
+   * The resolved signaling endpoint (WebSocket URL) the current session is
+   * connected to — captured alongside {@link connectedCode} so idempotency keys
+   * on BOTH the code AND the endpoint. In multi-host/multi-server setups a
+   * numeric code is not globally unique (code collisions across servers, or an
+   * explicit `signalingUrl` override), so comparing the code alone would let a
+   * `connect(code, otherEndpoint)` short-circuit while still targeting the OLD
+   * host. `null` whenever {@link connectedCode} is `null` (disconnected).
+   */
+  private connectedEndpoint: string | null = null;
 
   /**
    * The explicit ICE-server OVERRIDE for this session: the local
@@ -503,23 +513,38 @@ export class RemoteDesktopSession {
 
   /**
    * Connect to a host by its session code as a viewer. Idempotent for the same
-   * code; reconnecting to a different code disconnects first.
+   * code AT THE SAME ENDPOINT; reconnecting to a different code OR a different
+   * resolved endpoint disconnects first and reconnects.
    *
    * `endpoint` (the host's signaling WebSocket URL, e.g. `ws://192.168.1.50:8787`)
    * is optional. When omitted, a code discovered via the last {@link listHosts}
    * is joined against the endpoint it was advertised at; an unknown (manually
    * entered) code falls back to the configured {@link SessionOptions.signalingUrl}.
+   *
+   * Idempotency keys on BOTH the code AND the resolved endpoint: a numeric code
+   * is not globally unique across signaling servers (code collisions, or an
+   * explicit endpoint override), so a later `connect(code, otherEndpoint)` must
+   * switch hosts rather than silently no-op against the old one.
    */
   async connect(code: string, endpoint?: string): Promise<void> {
     if (!isValidSessionCode(code)) {
       throw new Error(`Invalid session code "${code}": expected 6–9 digits.`);
     }
-    if (this.connected && this.connectedCode === code) return;
+
+    // Resolve the target endpoint FIRST (explicit override / discovered / default)
+    // so idempotency compares the actual server this connect would join against —
+    // not just the code. Same precedence as a fresh connect uses below.
+    const signalingUrl = this.resolveSignalingUrl(code, endpoint);
+
+    // Short-circuit ONLY when BOTH the code and the resolved endpoint already
+    // match the live session. A matching code at a DIFFERENT endpoint falls
+    // through to disconnect+reconnect so control/capture target the new host.
+    if (this.connected && this.connectedCode === code && this.connectedEndpoint === signalingUrl)
+      return;
     if (this.connected) this.disconnect();
 
     const ctor = await this.ensureRtc();
 
-    const signalingUrl = this.resolveSignalingUrl(code, endpoint);
     const signaling: SessionSignaling = this.opts.signalingClientFactory
       ? this.opts.signalingClientFactory(signalingUrl)
       : new SignalingClient(signalingUrl);
@@ -582,6 +607,7 @@ export class RemoteDesktopSession {
     this.signaling = signaling as unknown as SignalingClient;
     this.peer = peer;
     this.connectedCode = code;
+    this.connectedEndpoint = signalingUrl;
   }
 
   /**
@@ -658,6 +684,7 @@ export class RemoteDesktopSession {
       this.videoSink = null;
     }
     this.connectedCode = null;
+    this.connectedEndpoint = null;
     this.lastFrame = null;
     this.frameSink = null;
     this.lastMonitors = null;

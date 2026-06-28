@@ -384,43 +384,64 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
     };
 
     socket.on('message', (data: RawData) => {
-      const msg = parseMessage(data);
-      if (!msg) {
-        this.sendError(socket, 'invalid-json');
-        return;
-      }
+      // HARDENING (P1 crash/DoS): the `message` handler runs as a `ws`
+      // EventEmitter listener, so ANY synchronous throw here escapes as an
+      // unhandled exception and takes down the whole signaling PROCESS — a
+      // single malformed client frame would be a trivial denial-of-service that
+      // kills every other live session. So the entire per-frame processing is
+      // wrapped: any unexpected throw is caught, turned into a generic protocol
+      // error for the offending socket, and swallowed. One bad frame can never
+      // crash the server or disturb other clients. (Per-field validation below
+      // still produces specific errors like `invalid-join` on the common paths;
+      // this catch is the last-resort safety net for anything we missed.)
+      try {
+        const msg = parseMessage(data);
+        if (!msg) {
+          this.sendError(socket, 'invalid-json');
+          return;
+        }
 
-      switch (msg.type) {
-        case 'join': {
-          if (peer) {
-            this.sendError(socket, 'already-joined');
+        switch (msg.type) {
+          case 'join': {
+            if (peer) {
+              this.sendError(socket, 'already-joined');
+              return;
+            }
+            peer = this.handleJoin(socket, msg, remoteAddr);
+            if (peer) clearJoinTimer();
             return;
           }
-          peer = this.handleJoin(socket, msg, remoteAddr);
-          if (peer) clearJoinTimer();
-          return;
-        }
-        case 'ping': {
-          this.send(socket, { type: 'pong', ts: Date.now() });
-          return;
-        }
-        case 'pong': {
-          if (peer) peer.alive = true;
-          return;
-        }
-        case 'offer':
-        case 'answer':
-        case 'ice': {
-          if (!peer) {
-            this.sendError(socket, 'not-joined');
+          case 'ping': {
+            this.send(socket, { type: 'pong', ts: Date.now() });
             return;
           }
-          this.relay(peer, msg);
-          return;
+          case 'pong': {
+            if (peer) peer.alive = true;
+            return;
+          }
+          case 'offer':
+          case 'answer':
+          case 'ice': {
+            if (!peer) {
+              this.sendError(socket, 'not-joined');
+              return;
+            }
+            this.relay(peer, msg);
+            return;
+          }
+          default: {
+            // Unknown / non-relayable type from a client; ignore safely.
+            return;
+          }
         }
-        default: {
-          // Unknown / non-relayable type from a client; ignore safely.
-          return;
+      } catch {
+        // Last-resort safety net: a malformed frame slipped past validation and
+        // threw. Never let it crash the process — respond with a generic error
+        // and keep serving every other client.
+        try {
+          this.sendError(socket, 'invalid-message');
+        } catch {
+          /* socket already gone; nothing more to do */
         }
       }
     });
@@ -441,10 +462,35 @@ export class SignalingServer extends EventEmitter<SignalingServerEvents> {
   }
 
   private handleJoin(socket: WebSocket, msg: SignalMessage, remoteAddr: string): Peer | undefined {
-    const role: Role = msg.role === 'host' ? 'host' : 'viewer';
-    const name = (msg.name ?? '').trim() || (role === 'host' ? 'host' : 'viewer');
+    // VALIDATE/COERCE join fields BEFORE trimming/using them. `isSignalMessage`
+    // (core) only checks `type`, so an authenticated socket can put a non-string
+    // in `code`/`name`/`role` (e.g. `{type:'join',role:'viewer',code:123}`).
+    // Calling `.trim()` on a number throws, and that throw used to escape the WS
+    // `message` handler and crash the PROCESS. We now reject malformed shapes
+    // with a protocol error and coerce the benign ones, so a bad join frame is a
+    // normal error response — never a crash.
+    //
+    //  - `code` (and the legacy `room` alias): if present it MUST be a string;
+    //    a non-string is a protocol violation -> `invalid-join`. (Whether the
+    //    string is all-digits is enforced downstream alongside room lookup; here
+    //    we only guarantee `.trim()` is safe to call.)
+    //  - `name`: coerce a missing/non-string value to '' so the existing
+    //    `||` default ("host"/"viewer") still applies.
+    //  - `role`: any value other than the literal 'host' falls back to 'viewer'
+    //    (unchanged behavior); a non-string role can never be 'host', so it is
+    //    safely treated as a viewer.
+    const rawCode = msg.code ?? msg.room;
+    if (rawCode !== undefined && typeof rawCode !== 'string') {
+      this.sendError(socket, 'invalid-join');
+      return undefined;
+    }
 
-    let code = (msg.code ?? msg.room ?? '').trim();
+    const role: Role = msg.role === 'host' ? 'host' : 'viewer';
+    const rawName = msg.name;
+    const name =
+      (typeof rawName === 'string' ? rawName : '').trim() || (role === 'host' ? 'host' : 'viewer');
+
+    let code = (rawCode ?? '').trim();
 
     if (role === 'host') {
       // A host without a code starts a brand-new session; mint one.
