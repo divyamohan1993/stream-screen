@@ -26,6 +26,20 @@ const OPEN = 1;
 const BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000] as const;
 
 /**
+ * Negotiation frame types that can race the viewer's handler registration.
+ *
+ * On a fast LAN the signaling server can relay the host's `offer` to a freshly
+ * `joined` viewer BEFORE that viewer has built its {@link Peer} and registered
+ * an `offer` handler. With no buffer the first offer would be dropped and the
+ * viewer would hang in `waiting-for-host`. We hold a small, capped backlog for
+ * exactly these types and replay it the moment a handler appears.
+ */
+const BUFFERED_TYPES: ReadonlySet<string> = new Set(['offer', 'answer', 'ice']);
+
+/** Per-type cap on buffered, not-yet-handled negotiation frames. Oldest dropped beyond this. */
+const BUFFER_CAP = 8;
+
+/**
  * Resolve a `WebSocket` constructor that works in the current runtime.
  *
  * In a browser (or any runtime with a global `WebSocket`, including modern
@@ -64,6 +78,12 @@ export class SignalingClient {
   private readonly url: string;
   private ws: MinimalWebSocket | null = null;
   private readonly handlers = new Map<string, Set<SignalHandler>>();
+  /**
+   * Negotiation frames received before any handler for their type existed,
+   * keyed by type and kept in arrival order (capped at {@link BUFFER_CAP}).
+   * Replayed and cleared the first time {@link on} registers a matching handler.
+   */
+  private readonly pendingFrames = new Map<string, SignalMessage[]>();
   private lastJoin: SignalMessage | null = null;
   private outbox: string[] = [];
   private closedByUser = false;
@@ -133,6 +153,11 @@ export class SignalingClient {
 
       ws.onclose = () => {
         this.ws = null;
+        // The reconnected socket is a brand-new, unjoined peer that will replay
+        // `lastJoin` and renegotiate from scratch. Any frames buffered against
+        // the old session are stale, so discard them to avoid replaying them
+        // into the new negotiation.
+        this.pendingFrames.clear();
         if (!this.closedByUser) {
           this.scheduleReconnect();
         }
@@ -168,7 +193,20 @@ export class SignalingClient {
     }
     if (!msg || typeof msg.type !== 'string') return;
     const set = this.handlers.get(msg.type);
-    if (set) for (const cb of set) cb(msg);
+    if (set && set.size > 0) {
+      for (const cb of set) cb(msg);
+    } else if (BUFFERED_TYPES.has(msg.type)) {
+      // No handler yet for a negotiation frame: hold it (capped, oldest-dropped)
+      // so it can be replayed when the peer registers its handler. This is the
+      // fix for the offer/answer/ice vs. handler-registration race on fast LANs.
+      let q = this.pendingFrames.get(msg.type);
+      if (!q) {
+        q = [];
+        this.pendingFrames.set(msg.type, q);
+      }
+      q.push(msg);
+      if (q.length > BUFFER_CAP) q.shift();
+    }
     const wildcard = this.handlers.get('*');
     if (wildcard) for (const cb of wildcard) cb(msg);
   }
@@ -206,7 +244,14 @@ export class SignalingClient {
     this.outbox.push(raw);
   }
 
-  /** Subscribe to inbound messages of a given {@link SignalMessage.type} (or `'*'`). */
+  /**
+   * Subscribe to inbound messages of a given {@link SignalMessage.type} (or `'*'`).
+   *
+   * If negotiation frames of this type arrived before any handler existed, they
+   * are replayed to `cb` in arrival order at registration time, then the backlog
+   * is cleared. This guarantees a host `offer` that beats the viewer's handler
+   * setup is still delivered rather than dropped.
+   */
   on(type: string, cb: SignalHandler): void {
     let set = this.handlers.get(type);
     if (!set) {
@@ -214,6 +259,11 @@ export class SignalingClient {
       this.handlers.set(type, set);
     }
     set.add(cb);
+    const buffered = this.pendingFrames.get(type);
+    if (buffered && buffered.length > 0) {
+      this.pendingFrames.delete(type);
+      for (const m of buffered) cb(m);
+    }
   }
 
   /** Unsubscribe a handler previously registered with {@link on}. */
@@ -224,6 +274,7 @@ export class SignalingClient {
   /** Close the underlying WebSocket and stop reconnecting. */
   close(): void {
     this.closedByUser = true;
+    this.pendingFrames.clear();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

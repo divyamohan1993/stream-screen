@@ -376,12 +376,24 @@ export class ViewerSession {
           name: this.opts.name ?? 'web-viewer',
         });
       });
-      // Build + start the Peer ONLY AFTER the join ack so it is constructed with
-      // the SAME ICE config the server distributed to both peers (captured into
+      // Surface `waiting-for-host` BEFORE building/starting the peer. P2-1: on a
+      // fast LAN the host's `offer` can already be sitting buffered in the core
+      // SignalingClient (it buffers unhandled offer/answer/ice and REPLAYS them
+      // the instant a handler registers). `peer.start()` wires the offer handler,
+      // so that buffered offer is processed synchronously inside start() — which
+      // can drive the peer straight to `connected`/`authenticating`. Emitting
+      // `waiting-for-host` AFTER start() would then CLOBBER that more-advanced
+      // state back to waiting and leave the viewer stuck. So we set
+      // `waiting-for-host` first, then build+start; any immediate state the
+      // replayed offer produces lands afterward and sticks.
+      this.setState('waiting-for-host', 'Joined — waiting for host stream.');
+      // Build + start the Peer AFTER the join ack so it is constructed with the
+      // SAME ICE config the server distributed to both peers (captured into
       // `serverIceServers` during the handshake). The host does not emit its
-      // offer until it observes our `peer-joined` — which the server only routes
-      // AFTER acknowledging our join — so the peer's `offer` handler is wired in
-      // time. Local override > server list > LAN-only default.
+      // offer until it observes our `peer-joined` (routed only AFTER our join is
+      // acknowledged); a fast offer that still beats our handler is buffered by
+      // core and replayed when start() registers the peer's `offer` handler, so
+      // it is never dropped. Local override > server list > LAN-only default.
       const peer = this.buildPeer(signaling);
       await peer.start();
       // Only AFTER a confirmed join do we install the persistent signaling error
@@ -392,7 +404,6 @@ export class ViewerSession {
         if (this.closed) return;
         this.setState('error', m.message ?? 'Signaling error');
       });
-      this.setState('waiting-for-host', 'Joined — waiting for host stream.');
       this.startStatsLoop();
     } catch (err) {
       // Was this session ALREADY torn down before the failure surfaced? That is

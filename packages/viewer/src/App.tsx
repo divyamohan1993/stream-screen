@@ -162,6 +162,16 @@ export function App(): React.JSX.Element {
       sessionRef.current?.disconnect();
       sessionRef.current = null;
       setError(null);
+      // P2-2: clear the MEDIA + telemetry state from any prior session so a new
+      // (or reconnecting) connect never shows the PREVIOUS host's screen while the
+      // new session is still waiting / auth-gated. With a stale non-null `stream`,
+      // VideoStage would suppress its waiting overlay and render the old host's
+      // video — wired to the NEW session's inputs. Reset stream/stats/decision (and
+      // the latency sparkline) here so VideoStage shows the waiting overlay until
+      // the NEW session delivers its own stream.
+      setStream(null);
+      setStats(null);
+      setDecision(null);
       setChatMessages([]);
       setTransfers([]);
       setMonitors([]);
@@ -198,8 +208,20 @@ export function App(): React.JSX.Element {
             // On connect, ask the host for its monitor list.
             if (st === 'connected') session.requestMonitors();
           },
-          onStream: (s) => setStream(s),
-          onStats: handleStats,
+          // P2-2: GUARD the non-state media handlers against a SUPERSEDED session
+          // (same pattern as onState). If the user retried / picked another host,
+          // App constructed a newer session and overwrote sessionRef; a late
+          // onStream/onStats event from THIS now-stale session must be ignored so
+          // it can never overwrite the CURRENT session's media (e.g. paint the old
+          // host's stream over the new one, or feed stale stats into the dashboard).
+          onStream: (s) => {
+            if (sessionRef.current !== session) return;
+            setStream(s);
+          },
+          onStats: (s) => {
+            if (sessionRef.current !== session) return;
+            handleStats(s);
+          },
           onClipboard: (text) => {
             void stageRef.current?.capture?.applyClipboardFromHost(text);
           },
