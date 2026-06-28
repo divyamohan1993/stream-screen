@@ -258,6 +258,7 @@ describe('ViewerSession auth (consent + PIN)', () => {
   it('auth-result false -> denied state; true -> connected', async () => {
     const verifier = await makeVerifier(PIN, 1000);
     const nonceH = randomBytes(NONCE_BYTES);
+    const nonceH2 = randomBytes(NONCE_BYTES);
     const results: boolean[] = [];
     const session = await connectedSession({ onAuthResult: (ok) => results.push(ok) });
     const peer = FakePeer.current!;
@@ -269,11 +270,71 @@ describe('ViewerSession auth (consent + PIN)', () => {
     expect(results).toEqual([false]);
     expect(session.currentState).toBe('denied');
 
-    // Retry then succeed.
+    // P2-2: the host re-issues a FRESH challenge before a retry; only then does a
+    // resubmit produce a response. Retry then succeed.
+    peer.deliver(challengeFor(verifier, 'pin', nonceH2));
     await session.submitPin(PIN);
     peer.deliver({ t: 'auth-result', v: 1, ok: true });
     expect(results).toEqual([false, true]);
     expect(session.currentState).toBe('connected');
+  });
+
+  it('P2-2: after a denial the consumed challenge is dropped — a retry no-ops until a FRESH challenge re-arms, and the new proof binds the NEW nonce', async () => {
+    const verifier = await makeVerifier(PIN, 1000);
+    const nonceH1 = randomBytes(NONCE_BYTES);
+    const nonceH2 = randomBytes(NONCE_BYTES);
+    // Sanity: the two host nonces differ, so a proof can be attributed to one.
+    expect(toBase64(nonceH1)).not.toBe(toBase64(nonceH2));
+
+    let challenges = 0;
+    const session = await connectedSession({ onAuthRequired: () => challenges++ });
+    const peer = FakePeer.current!;
+
+    // First challenge + a (wrong-or-right, doesn't matter) submission, then DENY.
+    peer.deliver(challengeFor(verifier, 'pin', nonceH1));
+    await session.submitPin(PIN);
+    const firstCount = peer.sentControl.filter((m) => m.t === 'auth-response').length;
+    expect(firstCount).toBe(1);
+
+    peer.deliver({ t: 'auth-result', v: 1, ok: false });
+    expect(session.currentState).toBe('denied');
+
+    // The challenge nonce is consumed/deleted host-side. A retry WITHOUT a fresh
+    // challenge must be inert: no second auth-response is sent (never resubmit a
+    // consumed nonce).
+    await session.submitPin(PIN);
+    expect(peer.sentControl.filter((m) => m.t === 'auth-response').length).toBe(1);
+
+    // Host re-issues a FRESH challenge (new nonceH2). This re-arms the session
+    // and fires onAuthRequired again so the UI can re-enable Retry.
+    peer.deliver(challengeFor(verifier, 'pin', nonceH2));
+    expect(challenges).toBe(2);
+
+    await session.submitPin(PIN);
+    const responses = peer.sentControl.filter((m) => m.t === 'auth-response') as Extract<
+      ControlMessage,
+      { t: 'auth-response' }
+    >[];
+    expect(responses.length).toBe(2);
+
+    // The retry proof must verify against the FRESH nonce (nonceH2), and NOT the
+    // consumed one (nonceH1).
+    const retry = responses[1]!;
+    const okFresh = await verifyProofAgainst(verifier, fromBase64(retry.proof), {
+      domain: AUTH_DOMAIN,
+      nonceH: nonceH2,
+      nonceV: fromBase64(retry.nonceV),
+      channelBinding: CHANNEL_BINDING,
+    });
+    expect(okFresh).toBe(true);
+
+    const okStale = await verifyProofAgainst(verifier, fromBase64(retry.proof), {
+      domain: AUTH_DOMAIN,
+      nonceH: nonceH1,
+      nonceV: fromBase64(retry.nonceV),
+      channelBinding: CHANNEL_BINDING,
+    });
+    expect(okStale).toBe(false);
   });
 
   it('video is GATED until auth-result ok, then released', async () => {

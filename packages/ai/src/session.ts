@@ -17,7 +17,13 @@
  */
 
 import { deflateSync } from 'node:zlib';
-import { Peer, SignalingClient, isValidSessionCode } from '@stream-screen/core';
+import {
+  Peer,
+  SignalingClient,
+  isIceServerList,
+  isValidSessionCode,
+  parseIceServers,
+} from '@stream-screen/core';
 import type {
   AdaptiveStats,
   ControlMessage,
@@ -76,9 +82,21 @@ export interface HostEntry {
 export interface SessionSignaling {
   connect(): Promise<void>;
   join(p: { room?: string; code?: string; role: string; name?: string }): void;
-  on(type: string, cb: (m: { type: string; message?: string }) => void): void;
-  off(type: string, cb: (m: { type: string; message?: string }) => void): void;
+  on(type: string, cb: (m: SignalAck) => void): void;
+  off(type: string, cb: (m: SignalAck) => void): void;
   close(): void;
+}
+
+/**
+ * The subset of a signaling acknowledgement message the connect handshake reads.
+ * `iceServers` is the server-distributed STUN/TURN list carried on the `joined`
+ * ack (validated with core `isIceServerList`); it is optional and may be absent
+ * (LAN-only) or malformed (ignored).
+ */
+export interface SignalAck {
+  type: string;
+  message?: string;
+  iceServers?: unknown;
 }
 
 /**
@@ -278,6 +296,26 @@ export class RemoteDesktopSession {
   private rtcCtor: typeof RTCPeerConnection | null;
   private connectedCode: string | null = null;
 
+  /**
+   * The explicit ICE-server OVERRIDE for this session: the local
+   * {@link SessionOptions.iceServers} if supplied, else the operator's
+   * `STREAMSCREEN_ICE_SERVERS` env (parsed via core {@link parseIceServers}).
+   * When non-empty it wins over the server-distributed list — exactly the
+   * precedence host/viewer use. Empty (the default) means "no override", so the
+   * server-distributed list (or LAN-only `[]`) is used. Resolved once in the
+   * constructor; never mutated.
+   */
+  private readonly iceOverride: RTCIceServer[];
+  /**
+   * ICE servers distributed by the signaling server on the most recent `joined`
+   * ack (the server-distributed STUN/TURN list — see core {@link
+   * isIceServerList}). Captured during the join handshake and used to build the
+   * {@link Peer} so BOTH host and viewer negotiate against the SAME config,
+   * UNLESS {@link iceOverride} is set. `null` until a `joined` ack has been
+   * observed; an empty array means the server explicitly distributed none.
+   */
+  private serverIceServers: RTCIceServer[] | null = null;
+
   /** Pending resolvers awaiting the host's `monitors` reply (list_monitors). */
   private monitorWaiters: Array<(list: MonitorInfo[]) => void> = [];
   /** Most recent monitor list reported by the host, if any. */
@@ -314,6 +352,26 @@ export class RemoteDesktopSession {
       deriveSignalingHttpUrl(this.signalingUrl);
     this.token = opts.token ?? process.env.STREAMSCREEN_TOKEN ?? undefined;
     this.rtcCtor = opts.rtcPeerConnection ?? null;
+    // Resolve the explicit ICE override once: a local list wins; otherwise the
+    // operator's STREAMSCREEN_ICE_SERVERS env (parsed leniently — garbage -> []).
+    // Both shapes normalize to RTCIceServer[]; an empty result means "no override".
+    this.iceOverride =
+      opts.iceServers && opts.iceServers.length > 0
+        ? opts.iceServers
+        : parseIceServers(process.env.STREAMSCREEN_ICE_SERVERS);
+  }
+
+  /**
+   * The ICE servers this session will (or did) build its {@link Peer} with: the
+   * explicit override (local {@link SessionOptions.iceServers} or
+   * `STREAMSCREEN_ICE_SERVERS`) when non-empty, otherwise the server-distributed
+   * list from the `joined` ack, otherwise an empty array (LAN-only default) —
+   * exactly the precedence host and viewer use. Returns a defensive copy.
+   */
+  get effectiveIceServers(): RTCIceServer[] {
+    const chosen =
+      this.iceOverride.length > 0 ? this.iceOverride : (this.serverIceServers ?? []);
+    return chosen.map((s) => ({ ...s }));
   }
 
   /** Whether a connection is currently established. */
@@ -467,26 +525,19 @@ export class RemoteDesktopSession {
       : new SignalingClient(signalingUrl);
     await signaling.connect();
 
-    const peer = new Peer({
-      role: 'viewer',
-      signaling: signaling as unknown as SignalingClient,
-      iceServers: this.opts.iceServers,
-      rtcPeerConnection: ctor,
-    });
+    // Reset any stale server-distributed list from a previous connect so a join
+    // ack that carries no list leaves us at the LAN-only default (not the prior
+    // host's servers). The explicit override (iceOverride) is constructor-fixed.
+    this.serverIceServers = null;
 
-    peer.on('track', (track: unknown) => {
-      this.installFrameSink(track);
-    });
-    peer.onControl((m) => this.handleControl(m));
-
-    await peer.start();
-
-    // Send the join, then WAIT for the server's acknowledgement before reporting
-    // connected. The signaling server replies `joined` on success or `error`
-    // (e.g. message `no-such-session`) when the code names no live room. Without
-    // this handshake, connect() would resolve optimistically against an unjoined
-    // socket, so subsequent control calls would silently target nothing.
+    let peer: Peer | null = null;
     try {
+      // Send the join, then WAIT for the server's acknowledgement BEFORE building
+      // the Peer. The signaling server replies `joined` on success (carrying the
+      // server-distributed STUN/TURN list we capture into `serverIceServers`) or
+      // `error` (e.g. `no-such-session`) when the code names no live room. Without
+      // this handshake, connect() would resolve optimistically against an unjoined
+      // socket, so subsequent control calls would silently target nothing.
       await this.awaitJoinAck(signaling, code, () => {
         signaling.join({
           code,
@@ -494,11 +545,29 @@ export class RemoteDesktopSession {
           name: this.opts.viewerName ?? 'streamscreen-ai',
         });
       });
+
+      // Build + start the Peer ONLY AFTER the join ack so it negotiates against
+      // the SAME ICE config the server distributed to both peers: an explicit
+      // override (opts.iceServers / STREAMSCREEN_ICE_SERVERS) wins, else the
+      // server-distributed list, else LAN-only []. The host emits its offer only
+      // after observing our `peer-joined` — which the server routes only AFTER
+      // acknowledging our join — so the peer's `offer` handler is wired in time.
+      peer = new Peer({
+        role: 'viewer',
+        signaling: signaling as unknown as SignalingClient,
+        iceServers: this.effectiveIceServers,
+        rtcPeerConnection: ctor,
+      });
+      peer.on('track', (track: unknown) => {
+        this.installFrameSink(track);
+      });
+      peer.onControl((m) => this.handleControl(m));
+      await peer.start();
     } catch (err) {
       // Tear down the half-open connection so the session stays in a clean,
       // disconnected state (connectedCode is never set on failure).
       try {
-        peer.close();
+        peer?.close();
       } catch {
         /* best-effort */
       }
@@ -530,8 +599,17 @@ export class RemoteDesktopSession {
     const timeoutMs = this.opts.joinTimeoutMs ?? JOIN_ACK_TIMEOUT_MS;
     return new Promise<void>((resolve, reject) => {
       let settled = false;
-      const onJoined = (): void => finish();
-      const onError = (m: { type: string; message?: string }): void =>
+      const onJoined = (m: SignalAck): void => {
+        // Capture the server-distributed ICE list (if any) so the Peer is built
+        // to negotiate against the SAME STUN/TURN config as the host. Validate
+        // defensively with core isIceServerList: a malformed or absent field is
+        // ignored (leaves serverIceServers null -> LAN-only unless overridden).
+        if (isIceServerList(m.iceServers)) {
+          this.serverIceServers = m.iceServers.map((s) => ({ ...s }));
+        }
+        finish();
+      };
+      const onError = (m: SignalAck): void =>
         finish(new JoinRejectedError(m.message ?? 'signaling join rejected'));
       const finish = (err?: Error): void => {
         if (settled) return;

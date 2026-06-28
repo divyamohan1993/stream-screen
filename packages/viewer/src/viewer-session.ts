@@ -294,7 +294,9 @@ export class ViewerSession {
   get currentAuthChallenge(): AuthChallenge | null {
     const c = this.pendingChallenge;
     if (!c) return null;
-    return { mode: c.mode, needsPin: c.mode === 'pin' || c.mode === 'pin-and-prompt' };
+    // `mode` is optional on the wire and defaults to 'pin' for back-compat.
+    const mode = c.mode ?? 'pin';
+    return { mode, needsPin: mode === 'pin' || mode === 'pin-and-prompt' };
   }
 
   /**
@@ -845,12 +847,14 @@ export class ViewerSession {
     this.authRequired = true;
     this.authorized = false;
     this.pendingChallenge = m;
-    const needsPin = m.mode === 'pin' || m.mode === 'pin-and-prompt';
+    // `mode` is optional on the wire and defaults to 'pin' for back-compat.
+    const mode = m.mode ?? 'pin';
+    const needsPin = mode === 'pin' || mode === 'pin-and-prompt';
     // Hold the lifecycle at `authenticating` (the control channel only opens
     // after the peer connects, so we are typically already at `connected` here
     // in the gated sense; surface the gate explicitly).
     this.setState('authenticating');
-    this.handlers.onAuthRequired?.({ mode: m.mode, needsPin });
+    this.handlers.onAuthRequired?.({ mode, needsPin });
     if (!needsPin) {
       // Prompt-only: no secret to prove. Send a proof-less response so the host
       // can associate our display name; the human Accept drives the verdict.
@@ -867,8 +871,16 @@ export class ViewerSession {
   /**
    * Handle the host's `auth-result` verdict. On success ungate the session:
    * release any video that arrived while gated and advance to `connected`. On
-   * failure surface `denied`; the UI may call {@link submitPin} again once a
-   * fresh challenge arrives (or re-use the retained challenge).
+   * failure surface `denied`.
+   *
+   * P2-2: on a denial we DISCARD the pending challenge. Its nonce has been
+   * consumed by the response the host just rejected — the host deletes that
+   * nonce on a failed attempt, so resubmitting a proof against it would always
+   * fail. {@link submitPin} therefore no-ops (Retry is inert) until a FRESH
+   * `auth-challenge` (new nonce) arrives via {@link onAuthChallenge}, which
+   * re-arms the session. If the host instead locks the viewer out (no fresh
+   * challenge follows), the session simply stays `denied` with nothing to
+   * resubmit — exactly the locked-out state.
    */
   private onAuthResult(ok: boolean): void {
     if (this.closed) return;
@@ -884,9 +896,11 @@ export class ViewerSession {
         this.handlers.onStream?.(s);
       }
     } else {
-      // Access denied. Stay gated; keep the challenge so a retry can reuse the
-      // host's salt/nonce/binding without waiting for a new challenge frame.
+      // Access denied. Stay gated and DROP the consumed challenge so a stale
+      // nonce can never be resubmitted; a retry is only possible once the host
+      // sends a fresh `auth-challenge` (which re-arms `pendingChallenge`).
       this.authorized = false;
+      this.pendingChallenge = null;
       this.setState('denied', 'Access denied.');
     }
   }
@@ -903,7 +917,10 @@ export class ViewerSession {
    * so it matches the host's value without ever transiting signaling; a binding
    * mismatch (e.g. a re-terminated-DTLS MITM) yields a proof the host rejects.
    *
-   * No-op if there is no pending challenge or it is prompt-only.
+   * No-op if there is no pending challenge or it is prompt-only. After a denial
+   * the pending challenge is dropped (its nonce is consumed/deleted host-side),
+   * so this no-ops until a FRESH `auth-challenge` re-arms the session — Retry
+   * never resubmits a proof against a consumed nonce.
    */
   async submitPin(pin: string): Promise<void> {
     const challenge = this.pendingChallenge;
@@ -922,8 +939,8 @@ export class ViewerSession {
       nonceV,
       channelBinding,
     });
-    // The challenge has been consumed; a denial will resend a fresh one (or the
-    // UI may resubmit if the host reuses the same challenge).
+    // The challenge has been consumed; on a denial the host sends a FRESH
+    // challenge (new nonce) which re-arms us — we never resubmit this nonce.
     peer.sendControl({
       t: 'auth-response',
       v: 1,

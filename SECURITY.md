@@ -76,7 +76,11 @@ runs **peer-to-peer over the already-encrypted DTLS data channel**:
    when **that viewer's `control` data channel becomes open** (not at the
    signaling join, which fires before the channel exists) — the only moment an
    auth frame can actually be delivered, so the challenge is never silently
-   dropped.
+   dropped. In **`prompt`** mode the host also sends an `auth-challenge`
+   (`mode: 'prompt'`, no PIN material) **before** it waits for the operator's
+   Accept, so the viewer immediately shows the "waiting for host approval"
+   overlay instead of looking connected while media is withheld; a rejection
+   then surfaces as a declined connection rather than a silent denial.
 3. **Proof.** The viewer derives the same key from the PIN it was given and the
    salt, then computes
    `HMAC-SHA256(derivedKey, "streamscreen-auth-v1" || nonceH || nonceV || channelBinding)`
@@ -87,7 +91,12 @@ runs **peer-to-peer over the already-encrypted DTLS data channel**:
    whether the PIN, the proof, or consent was the problem.
 
 Because the proof binds a per-handshake host nonce, a captured proof cannot be
-replayed against a fresh challenge.
+replayed against a fresh challenge. The host nonce is **single-use**: on a wrong
+PIN it is consumed and dropped, and — provided the viewer is not now locked out
+— the host issues a **fresh `auth-challenge` (new nonce)** so the viewer can
+retry **without** reconnecting. The viewer discards the consumed challenge and
+only re-enables Retry once that fresh challenge arrives, so a proof is never
+recomputed against a spent nonce.
 
 ### Per-authorized media attach (no stream leak)
 

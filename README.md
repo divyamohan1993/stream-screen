@@ -424,6 +424,12 @@ STREAMSCREEN_ICE_SERVERS='[{"urls":"stun:stun.your-domain.example:3478"},
 Leaving `STREAMSCREEN_ICE_SERVERS` **unset (the default) keeps behavior exactly
 LAN-only** — no ICE servers, no third-party contact.
 
+The **AI/agent viewer** (`RemoteDesktopSession`) follows the **same precedence**:
+an explicit override (its `iceServers` option or its own `STREAMSCREEN_ICE_SERVERS`)
+wins; otherwise it uses the **server-distributed list captured from the `joined`
+ack**, so AI sessions traverse NAT identically to the browser viewer instead of
+falling back to LAN-only.
+
 #### Minimal self-hosted TURN (coturn)
 
 [coturn](https://github.com/coturn/coturn) is a free, open-source TURN/STUN

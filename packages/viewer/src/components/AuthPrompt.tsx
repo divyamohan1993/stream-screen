@@ -7,6 +7,16 @@ export interface AuthPromptProps {
   challenge: AuthChallenge;
   /** True once the host returned a denial; surfaces the error + retry. */
   denied: boolean;
+  /**
+   * True when the session holds a FRESH (unconsumed) challenge that a PIN can be
+   * submitted against. The session drops the challenge on a denial and only
+   * re-arms when the host sends a new `auth-challenge` (new nonce), so Retry is
+   * gated on this: after a wrong PIN the button stays disabled until a fresh
+   * challenge arrives. If the host locks the viewer out (no fresh challenge ever
+   * follows) this stays false and the denial reads as locked-out. Defaults to
+   * `true` for the first, never-yet-denied attempt.
+   */
+  armed: boolean;
   /** True while a submitted PIN is being derived/verified (proof in flight). */
   submitting: boolean;
   /**
@@ -35,6 +45,7 @@ export interface AuthPromptProps {
 export function AuthPrompt({
   challenge,
   denied,
+  armed,
   submitting,
   onSubmitPin,
   onCancel,
@@ -42,10 +53,12 @@ export function AuthPrompt({
   const [pin, setPin] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Focus the PIN field when it appears (and re-focus on a denial for retry).
+  // Focus the PIN field when it appears, and re-focus when a fresh challenge
+  // re-arms it for retry (the field is disabled while disarmed, so only focus
+  // once it can actually accept input).
   useEffect(() => {
-    if (challenge.needsPin) inputRef.current?.focus();
-  }, [challenge.needsPin, denied]);
+    if (challenge.needsPin && armed) inputRef.current?.focus();
+  }, [challenge.needsPin, armed, denied]);
 
   const submit = (e: React.FormEvent): void => {
     e.preventDefault();
@@ -58,17 +71,36 @@ export function AuthPrompt({
   };
 
   if (!challenge.needsPin) {
-    // Prompt-only: nothing for the viewer to enter; wait for the host operator.
+    // Prompt-only: nothing for the viewer to enter. Either we are waiting for the
+    // host operator to Accept, or they have declined (denial) — in prompt mode a
+    // denial is terminal (no PIN to retry), so we surface it and offer only a way
+    // out.
     return (
-      <div className="auth-prompt" role="dialog" aria-modal="true" aria-label="Awaiting host approval">
+      <div
+        className="auth-prompt"
+        role="dialog"
+        aria-modal="true"
+        aria-label={denied ? 'Connection declined' : 'Awaiting host approval'}
+      >
         <div className="auth-card">
-          <h2 className="auth-title">Waiting for host approval…</h2>
-          <p className="auth-desc" role="status" aria-live="polite">
-            The host must accept your connection on their computer.
-          </p>
+          {denied ? (
+            <>
+              <h2 className="auth-title">Connection declined</h2>
+              <p className="auth-error" role="alert">
+                The host declined your connection.
+              </p>
+            </>
+          ) : (
+            <>
+              <h2 className="auth-title">Waiting for host approval…</h2>
+              <p className="auth-desc" role="status" aria-live="polite">
+                The host must accept your connection on their computer.
+              </p>
+            </>
+          )}
           <div className="auth-actions">
             <button type="button" className="auth-cancel" onClick={onCancel}>
-              Cancel
+              {denied ? 'Close' : 'Cancel'}
             </button>
           </div>
         </div>
@@ -81,11 +113,16 @@ export function AuthPrompt({
       <form className="auth-card" onSubmit={submit}>
         <h2 className="auth-title">Enter access PIN</h2>
         <p className="auth-desc">This host is protected by a PIN. Ask the host operator for it.</p>
-        {denied && (
-          <p className="auth-error" role="alert">
-            Access denied. Check the PIN and try again.
-          </p>
-        )}
+        {denied &&
+          (armed ? (
+            <p className="auth-error" role="alert">
+              Incorrect PIN. Try again.
+            </p>
+          ) : (
+            <p className="auth-error" role="alert">
+              Access denied. The host has not re-issued a challenge.
+            </p>
+          ))}
         <label className="auth-field">
           <span className="sr-only">Access PIN</span>
           <input
@@ -97,14 +134,20 @@ export function AuthPrompt({
             onChange={(e) => setPin(e.target.value)}
             placeholder="PIN"
             aria-label="Access PIN"
-            disabled={submitting}
+            disabled={submitting || !armed}
           />
         </label>
         <div className="auth-actions">
           <button type="button" className="auth-cancel" onClick={onCancel} disabled={submitting}>
             Cancel
           </button>
-          <button type="submit" className="auth-submit" disabled={submitting || pin.length === 0}>
+          <button
+            type="submit"
+            className="auth-submit"
+            // Retry is inert until a FRESH challenge re-arms the session, so a
+            // proof is never computed against a consumed nonce.
+            disabled={submitting || !armed || pin.length === 0}
+          >
             {submitting ? 'Verifying…' : denied ? 'Retry' : 'Connect'}
           </button>
         </div>

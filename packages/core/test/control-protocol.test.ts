@@ -62,6 +62,61 @@ describe('isControlMessage', () => {
     expect(isControlMessage({ t: 'switch-monitor' })).toBe(false);
   });
 
+  it('accepts auth-challenge in pin / pin-and-prompt / prompt shapes', () => {
+    const pinFields = {
+      nonceH: 'bm9uY2U=',
+      salt: 'c2FsdA==',
+      iterations: 100_000,
+      channelBinding: 'YmluZGluZw==',
+    };
+    // PIN modes require the full proof material.
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, mode: 'pin', ...pinFields })).toBe(true);
+    expect(
+      isControlMessage({ t: 'auth-challenge', v: 1, mode: 'pin-and-prompt', ...pinFields }),
+    ).toBe(true);
+    // `mode` is optional and defaults to 'pin' for back-compat: a legacy
+    // challenge with no `mode` but full PIN fields is still accepted.
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, ...pinFields })).toBe(true);
+    // Prompt mode needs NO PIN fields — the challenge only flips the viewer into
+    // the "waiting for host approval" state.
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, mode: 'prompt' })).toBe(true);
+    // Prompt mode tolerates PIN fields if a sender still includes them.
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, mode: 'prompt', ...pinFields })).toBe(
+      true,
+    );
+    // A host re-sending a FRESH challenge for a retry is just another valid
+    // auth-challenge (new nonce, same PIN mode).
+    expect(
+      isControlMessage({ t: 'auth-challenge', v: 1, mode: 'pin', ...pinFields, nonceH: 'ZnJlc2g=' }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed auth-challenge messages', () => {
+    const pinFields = {
+      nonceH: 'bm9uY2U=',
+      salt: 'c2FsdA==',
+      iterations: 100_000,
+      channelBinding: 'YmluZGluZw==',
+    };
+    // Wrong protocol version.
+    expect(isControlMessage({ t: 'auth-challenge', v: 2, mode: 'pin', ...pinFields })).toBe(false);
+    // Unknown mode.
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, mode: 'nope', ...pinFields })).toBe(false);
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, mode: 42, ...pinFields })).toBe(false);
+    // PIN mode missing required proof material.
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, mode: 'pin' })).toBe(false);
+    const { nonceH: _omit, ...noNonce } = pinFields;
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, mode: 'pin', ...noNonce })).toBe(false);
+    // Default (no mode -> 'pin') also requires the PIN fields.
+    expect(isControlMessage({ t: 'auth-challenge', v: 1 })).toBe(false);
+    // Wrong-typed PIN fields are rejected even in pin mode.
+    expect(
+      isControlMessage({ t: 'auth-challenge', v: 1, mode: 'pin', ...pinFields, iterations: 'lots' }),
+    ).toBe(false);
+    // Prompt mode with a wrong-typed (present) PIN field is rejected.
+    expect(isControlMessage({ t: 'auth-challenge', v: 1, mode: 'prompt', nonceH: 5 })).toBe(false);
+  });
+
   it('accepts a valid latency telemetry message and rejects malformed ones', () => {
     expect(isControlMessage({ t: 'latency', rttMs: 25, playoutMs: 10 })).toBe(true);
     expect(isControlMessage({ t: 'latency', rttMs: 25, playoutMs: 10, fps: 30 })).toBe(true);

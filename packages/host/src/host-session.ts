@@ -754,16 +754,38 @@ export class HostSession {
       // Prompt-only: ask the host human. The channel binding still identifies the
       // transport for the consent record.
       const cb = peer.getChannelBinding(viewerId);
+      // P2-1: notify the viewer BEFORE running consent so it enters
+      // 'authenticating' and shows the "waiting for host approval" overlay.
+      // No PIN proof is expected in prompt mode, so the challenge carries no
+      // proof material (mode:'prompt' per the auth-challenge contract).
+      peer.sendControl({ t: 'auth-challenge', v: 1, mode: 'prompt' }, viewerId);
       void this.runConsentThenAuthorize(viewerId, { peerId: viewerId, name, channelBinding: cb });
       return;
     }
 
     // PIN modes: issue the challenge. verifier is guaranteed present here.
-    const record = this.verifier!;
+    this.sendPinChallenge(viewerId);
+  }
+
+  /**
+   * Issue (or RE-issue) a PIN auth-challenge to a viewer with a FRESH host nonce.
+   * Stores the new nonce as the viewer's pending challenge (replacing any prior
+   * one) and sends the challenge with the verifier's salt/iterations, the
+   * canonical channel binding, and the effective PIN challenge mode.
+   *
+   * Re-used by {@link beginAuth} (first challenge) and by the P2-2 retry path:
+   * after a failed-but-NOT-locked PIN attempt the host re-sends a fresh challenge
+   * so the viewer can retry WITHOUT reconnecting (the consumed nonce is replaced
+   * by a brand-new one).
+   */
+  private sendPinChallenge(viewerId: string): void {
+    const peer = this.peer;
+    if (!peer || !this.verifier) return;
+    const record = this.verifier;
+    const challengeMode = challengeModeOf(this.accessMode);
+    if (!challengeMode || challengeMode === 'prompt') return; // pin modes only
     const nonceH = randomBytes(NONCE_BYTES);
     this.pendingChallenges.set(viewerId, nonceH);
-    const challengeMode = challengeModeOf(this.accessMode);
-    if (!challengeMode) return; // unreachable for pin modes
     peer.sendControl(
       {
         t: 'auth-challenge',
@@ -828,10 +850,20 @@ export class HostSession {
     });
 
     if (!outcome.ok) {
-      // The host nonce is single-use: drop it so a retry must await a fresh
-      // challenge (issued only on a fresh join). Bump already happened in verify.
+      // The host nonce is single-use: drop it so the consumed nonce can never be
+      // replayed. Bump already happened in verify.
       this.pendingChallenges.delete(viewerId);
       this.denyViewer(viewerId);
+      // P2-2: if the viewer is NOT (now) locked out, re-issue a FRESH challenge
+      // (new nonceH) so it can retry without reconnecting. A locked key (reason
+      // 'locked', or a non-locked failure that just tripped the threshold ->
+      // retryAfterMs > 0) gets NO fresh challenge: the viewer shows locked/denied
+      // and must wait out the backoff. sendPinChallenge replaces the (deleted)
+      // pending nonce with a brand-new one.
+      const lockedOut = outcome.reason === 'locked' || outcome.retryAfterMs > 0;
+      if (!lockedOut) {
+        this.sendPinChallenge(viewerId);
+      }
       return;
     }
 

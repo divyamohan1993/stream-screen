@@ -402,8 +402,15 @@ describe('HostSession access gating', () => {
       const consent = new ConsentManager();
       const { session, inputs } = await startSession({ mode: 'prompt', consent });
       viewerJoins('viewer-1', 'Alice');
-      // No PIN challenge in prompt mode.
-      expect(peerBus.sent.some((s) => s.msg.t === 'auth-challenge')).toBe(false);
+      // P2-1: a prompt-mode auth-challenge (NO PIN proof material) is sent so the
+      // viewer enters 'authenticating' and shows the waiting overlay. No PIN
+      // challenge (with proof material) is ever issued in prompt mode.
+      const promptChallenges = peerBus.sent.filter(
+        (s) => s.to === 'viewer-1' && s.msg.t === 'auth-challenge',
+      );
+      expect(promptChallenges).toHaveLength(1);
+      expect((promptChallenges[0]!.msg as { mode?: string }).mode).toBe('prompt');
+      expect((promptChallenges[0]!.msg as { nonceH?: string }).nonceH).toBeUndefined();
       // A pending consent request is surfaced.
       await vi.waitFor(() => expect(consent.pending).toHaveLength(1));
       expect(peerBus.attachCount).toBe(0);

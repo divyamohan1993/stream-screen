@@ -129,6 +129,90 @@ describe('App auth gate (consent + PIN)', () => {
     expect(screen.queryByLabelText('Access PIN')).toBeNull();
   });
 
+  it('P2-1: prompt-mode challenge renders the waiting overlay with NO PIN field', async () => {
+    render(<App />);
+    await submitConnect('123456');
+    const session = sessions[0]!;
+
+    await act(async () => {
+      // The host sends a prompt-mode challenge BEFORE running consent, flipping
+      // the viewer into the waiting state (no PIN to enter).
+      session.onAuthRequired?.({ mode: 'prompt', needsPin: false });
+      session.onState?.('authenticating');
+    });
+
+    expect(screen.getByText('Waiting for host approval…')).toBeTruthy();
+    expect(screen.queryByLabelText('Access PIN')).toBeNull();
+    expect(screen.queryByText('Connect')).toBeNull();
+
+    // A prompt-mode denial is terminal (no PIN to retry): surface it.
+    await act(async () => {
+      session.onAuthResult?.(false);
+      session.onState?.('denied');
+    });
+    expect(screen.getByText('Connection declined')).toBeTruthy();
+    expect(screen.queryByLabelText('Access PIN')).toBeNull();
+  });
+
+  it('P2-2: after a wrong PIN the Retry button is DISABLED until a fresh challenge arrives, then re-enabled', async () => {
+    render(<App />);
+    await submitConnect('123456');
+    const session = sessions[0]!;
+
+    await act(async () => {
+      session.onAuthRequired?.({ mode: 'pin', needsPin: true });
+      session.onState?.('authenticating');
+    });
+
+    const pinInput = screen.getByLabelText('Access PIN') as HTMLInputElement;
+    fireEvent.change(pinInput, { target: { value: '000000' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Connect'));
+      await Promise.resolve();
+    });
+    expect(session.submitPin).toHaveBeenCalledTimes(1);
+
+    // Host rejects. The consumed challenge is dropped; Retry must be inert until
+    // a fresh challenge re-arms the gate.
+    await act(async () => {
+      session.onAuthResult?.(false);
+      session.onState?.('denied');
+    });
+    const retryDisabled = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement;
+    expect(retryDisabled.disabled).toBe(true);
+    // The PIN field is also disabled while disarmed (nothing to submit against).
+    expect((screen.getByLabelText('Access PIN') as HTMLInputElement).disabled).toBe(true);
+
+    // Clicking the disabled Retry submits nothing (proof never recomputed against
+    // the consumed nonce).
+    await act(async () => {
+      fireEvent.click(retryDisabled);
+      await Promise.resolve();
+    });
+    expect(session.submitPin).toHaveBeenCalledTimes(1);
+
+    // Host re-issues a FRESH challenge (new nonce) -> onAuthRequired fires again,
+    // re-arming the gate. Retry becomes active while the error persists.
+    await act(async () => {
+      session.onAuthRequired?.({ mode: 'pin', needsPin: true });
+      session.onState?.('authenticating');
+    });
+    expect(screen.getByRole('alert').textContent).toMatch(/Incorrect PIN/i);
+    const retryArmed = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement;
+    const armedInput = screen.getByLabelText('Access PIN') as HTMLInputElement;
+    expect(armedInput.disabled).toBe(false);
+    fireEvent.change(armedInput, { target: { value: '824193' } });
+    expect(retryArmed.disabled).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(retryArmed);
+      await Promise.resolve();
+    });
+    // The resubmit goes through now that a fresh challenge is armed.
+    expect(session.submitPin).toHaveBeenCalledTimes(2);
+    expect(session.submitPin).toHaveBeenLastCalledWith('824193');
+  });
+
   it('open mode: no challenge — no auth gate is ever shown', async () => {
     render(<App />);
     await submitConnect('123456');

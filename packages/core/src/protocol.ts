@@ -223,18 +223,43 @@ export type ControlMessage =
   | { t: 'latency'; rttMs: number; playoutMs: number; fps?: number }
   // ----- Connection-consent / access-PIN handshake (P2P over the encrypted
   // control channel; the signaling server never sees any of these fields). -----
-  // Host -> viewer: present the challenge. `salt`/`nonceH` are base64 binary;
-  // `channelBinding` is the canonical DTLS-fingerprint binding both peers derive
-  // (see Peer.getChannelBinding). `mode` tells the viewer whether a PIN proof is
-  // expected, a human Accept, or both.
+  // Host -> viewer: present the challenge. `mode` tells the viewer what proof is
+  // expected and is the single field that selects the variant shape:
+  //
+  //   - PIN modes ('pin' / 'pin-and-prompt'): the viewer must compute a PIN
+  //     proof, so `salt`/`nonceH` (base64 binary) + `iterations` + the canonical
+  //     DTLS-fingerprint `channelBinding` (see Peer.getChannelBinding) are ALL
+  //     required. The host may re-send a fresh auth-challenge with a NEW `nonceH`
+  //     to let a viewer retry after a failed-but-not-locked attempt (no new
+  //     message type is needed for a retry — it is just another auth-challenge).
+  //
+  //   - Prompt mode ('prompt'): NO PIN proof is expected. The challenge exists
+  //     only to flip the viewer into the "waiting for host approval" state while
+  //     the host runs its consent gate, so the PIN fields are OPTIONAL and the
+  //     host MAY omit them entirely.
+  //
+  // `mode` itself is OPTIONAL and defaults to 'pin' for backward compatibility
+  // with peers that predate the explicit field (legacy senders only ever ran PIN
+  // flows and always populated the PIN fields).
   | {
       t: 'auth-challenge';
       v: 1;
+      mode?: 'pin' | 'pin-and-prompt';
       nonceH: string;
       salt: string;
       iterations: number;
       channelBinding: string;
-      mode: 'pin' | 'pin-and-prompt' | 'prompt';
+    }
+  | {
+      t: 'auth-challenge';
+      v: 1;
+      mode: 'prompt';
+      // PIN proof material is not required in prompt mode; the host may still
+      // include it (older senders do), so it is permitted but optional.
+      nonceH?: string;
+      salt?: string;
+      iterations?: number;
+      channelBinding?: string;
     }
   // Viewer -> host: the response. `nonceV`/`proof` are base64 binary. `proof` is
   // the HMAC over (domain || nonceH || nonceV || channelBinding); omitted/empty
@@ -312,16 +337,32 @@ export function isControlMessage(v: unknown): v is ControlMessage {
       // Viewer -> host real-time telemetry: rttMs and playoutMs are required
       // finite numbers; fps is optional but must be a finite number if present.
       return isNum(o.rttMs) && isNum(o.playoutMs) && (o.fps === undefined || isNum(o.fps));
-    case 'auth-challenge':
+    case 'auth-challenge': {
+      if (o.v !== 1) return false;
+      // `mode` is optional and defaults to 'pin' for back-compat; if present it
+      // must be one of the known access modes.
+      if (o.mode !== undefined && (!isStr(o.mode) || !AUTH_MODES.has(o.mode))) return false;
+      const mode = o.mode === undefined ? 'pin' : o.mode;
+      if (mode === 'prompt') {
+        // Prompt mode carries no required PIN proof material — the challenge only
+        // tells the viewer to show the "waiting for host approval" state. Any PIN
+        // fields, if present, must still be well-typed (older senders include
+        // them); but they may be omitted entirely.
+        return (
+          (o.nonceH === undefined || isStr(o.nonceH)) &&
+          (o.salt === undefined || isStr(o.salt)) &&
+          (o.iterations === undefined || isNum(o.iterations)) &&
+          (o.channelBinding === undefined || isStr(o.channelBinding))
+        );
+      }
+      // PIN modes ('pin' / 'pin-and-prompt'): full proof material is required.
       return (
-        o.v === 1 &&
         isStr(o.nonceH) &&
         isStr(o.salt) &&
         isNum(o.iterations) &&
-        isStr(o.channelBinding) &&
-        isStr(o.mode) &&
-        AUTH_MODES.has(o.mode)
+        isStr(o.channelBinding)
       );
+    }
     case 'auth-response':
       return (
         o.v === 1 &&

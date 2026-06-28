@@ -85,9 +85,13 @@ export function App(): React.JSX.Element {
   // Connection consent / access PIN. `authChallenge` is set while the host's
   // auth handshake is pending (null in 'open' mode); `authDenied` surfaces a
   // reason-free denial with a retry; `authSubmitting` disables the field while a
-  // PIN proof is being derived/verified.
+  // PIN proof is being derived/verified. `authArmed` tracks whether the session
+  // currently holds a FRESH (unconsumed) challenge a PIN can be submitted
+  // against: a denial consumes/clears the challenge (so Retry must stay inert),
+  // and only a fresh `auth-challenge` (new nonce) re-arms it. See P2-2.
   const [authChallenge, setAuthChallenge] = useState<AuthChallenge | null>(null);
   const [authDenied, setAuthDenied] = useState(false);
+  const [authArmed, setAuthArmed] = useState(false);
   const [authSubmitting, setAuthSubmitting] = useState(false);
 
   const sessionRef = useRef<ViewerSession | null>(null);
@@ -165,6 +169,7 @@ export function App(): React.JSX.Element {
       setLatencyHistory([]);
       setAuthChallenge(null);
       setAuthDenied(false);
+      setAuthArmed(false);
       setAuthSubmitting(false);
       // Parse any advanced local STUN/TURN override the user typed into the
       // ConnectScreen. parseIceServers NEVER throws — garbage/empty → []. An
@@ -205,9 +210,12 @@ export function App(): React.JSX.Element {
           onFileReady: (data, meta) => downloadBytes(data, meta),
           onAuthRequired: (challenge) => {
             if (sessionRef.current !== session) return;
-            // A fresh challenge clears any prior denial and in-flight state.
+            // A fresh challenge (new nonce) re-arms the gate so a PIN can be
+            // (re)submitted. We KEEP any prior denial message so a retry after a
+            // wrong PIN reads "Incorrect PIN. Try again." with Retry now active;
+            // the first-ever challenge has no prior denial (cleared on connect).
             setAuthChallenge(challenge);
-            setAuthDenied(false);
+            setAuthArmed(true);
             setAuthSubmitting(false);
           },
           onAuthResult: (ok) => {
@@ -218,8 +226,12 @@ export function App(): React.JSX.Element {
               // advances to 'connected'.
               setAuthChallenge(null);
               setAuthDenied(false);
+              setAuthArmed(false);
             } else {
+              // Denied: the challenge's nonce is consumed/dropped. Disarm so Retry
+              // stays inert until the host re-issues a fresh challenge (P2-2).
               setAuthDenied(true);
+              setAuthArmed(false);
             }
           },
         },
@@ -250,6 +262,7 @@ export function App(): React.JSX.Element {
     setLatencyHistory([]);
     setAuthChallenge(null);
     setAuthDenied(false);
+    setAuthArmed(false);
     setAuthSubmitting(false);
   }, [recorder]);
 
@@ -445,6 +458,7 @@ export function App(): React.JSX.Element {
           <AuthPrompt
             challenge={authChallenge}
             denied={authDenied}
+            armed={authArmed}
             submitting={authSubmitting}
             onSubmitPin={submitPin}
             onCancel={disconnect}
