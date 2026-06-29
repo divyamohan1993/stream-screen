@@ -1,0 +1,114 @@
+name: Weekly Windows Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    # Run every Monday at 09:00 UTC. The push trigger makes the first run start
+    # as soon as this workflow is merged to the default branch.
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release-windows:
+    name: Build and release Windows executables
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changes since latest release
+        id: changes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $latestReleaseJson = gh release list --limit 1 --json tagName,isDraft,isPrerelease,publishedAt --jq '.[0] // empty'
+
+          if ([string]::IsNullOrWhiteSpace($latestReleaseJson)) {
+            "has_changes=true" >> $env:GITHUB_OUTPUT
+            "reason=No previous release exists." >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          $latestRelease = $latestReleaseJson | ConvertFrom-Json
+          $latestTag = $latestRelease.tagName
+          "latest_tag=$latestTag" >> $env:GITHUB_OUTPUT
+
+          git fetch --tags --force
+
+          $diff = git diff --quiet "$latestTag..HEAD"
+          if ($LASTEXITCODE -eq 0) {
+            "has_changes=false" >> $env:GITHUB_OUTPUT
+            "reason=No file changes since release $latestTag." >> $env:GITHUB_OUTPUT
+          } elseif ($LASTEXITCODE -eq 1) {
+            "has_changes=true" >> $env:GITHUB_OUTPUT
+            "reason=Files changed since release $latestTag." >> $env:GITHUB_OUTPUT
+          } else {
+            throw "git diff failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Stop when the latest release already matches this commit
+        if: steps.changes.outputs.has_changes != 'true'
+        shell: pwsh
+        run: Write-Host "${{ steps.changes.outputs.reason }} Keeping the previous release unchanged."
+
+      - name: Set up Node.js
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.changes.outputs.has_changes == 'true'
+        run: npm ci
+
+      - name: Build packages
+        if: steps.changes.outputs.has_changes == 'true'
+        run: npm run build
+
+      - name: Build Windows executables
+        if: steps.changes.outputs.has_changes == 'true'
+        run: npm -w @stream-screen/host run dist
+
+      - name: Prepare release metadata
+        if: steps.changes.outputs.has_changes == 'true'
+        id: release
+        shell: pwsh
+        run: |
+          $date = Get-Date -AsUTC -Format "yyyy.MM.dd-HHmm"
+          $tag = "windows-weekly-$date"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "name=StreamScreen Windows Weekly $date" >> $env:GITHUB_OUTPUT
+
+          $notes = @"
+          Automated weekly Windows build.
+
+          Change check: ${{ steps.changes.outputs.reason }}
+
+          Built from commit ${{ github.sha }}.
+          "@
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $notes | Out-File -FilePath $notesPath -Encoding utf8
+          "notes_path=$notesPath" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.name }}
+          body_path: ${{ steps.release.outputs.notes_path }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            packages/host/release/*.exe
