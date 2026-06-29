@@ -6,6 +6,12 @@ directories:
   output: release
   buildResources: build
 
+# npm workspaces hoist electron-builder's own app-builder-bin to the repository
+# root. Rebuilding production dependencies from this workspace removes that
+# helper while electron-builder is still running, causing app-builder.exe
+# ENOENT. Native input support is optional and already degrades gracefully.
+npmRebuild: false
+
 files:
   - dist/**/*
   - package.json
