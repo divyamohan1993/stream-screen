@@ -23,10 +23,10 @@
   "devDependencies": {
     "@stream-screen/core": "*",
     "@types/node": "^20",
-    "electron": "31.7.7",
-    "esbuild": "^0.21",
+    "electron": "39.8.5",
+    "esbuild": "^0.28",
     "electron-builder": "^25",
     "typescript": "^5.5",
-    "vitest": "^2"
+    "vitest": "^4"
   }
 }
