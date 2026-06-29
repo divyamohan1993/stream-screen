@@ -1,0 +1,58 @@
+name: Release (Windows host .exe)
+
+# Builds the Windows host artifacts (NSIS installer + portable .exe) via
+# electron-builder whenever a version tag like `v1.2.3` is pushed, then uploads
+# them as build artifacts and attaches them to a GitHub Release for that tag.
+#
+# How to cut a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# This produces the Windows .exe installers under packages/host/release/:
+#   - StreamScreen Host-<version>-x64.exe        (NSIS installer)
+#   - StreamScreen Host-<version>-portable.exe   (portable, no install)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-host:
+    name: Build Windows host installers
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Package Windows host (electron-builder --win nsis+portable)
+        run: npm -w @stream-screen/host run dist
+
+      - name: Upload installers as build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamscreen-host-windows
+          path: |
+            packages/host/release/*.exe
+          if-no-files-found: error
+
+      - name: Attach installers to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packages/host/release/*.exe
+          fail_on_unmatched_files: true

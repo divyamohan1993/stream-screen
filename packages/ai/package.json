@@ -1,0 +1,56 @@
+{
+  "name": "@stream-screen/ai",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "StreamScreen AI control layer — a Model Context Protocol (stdio) server plus a mirrored REST API that let AI agents drive a remote desktop (connect, screenshot, OCR, mouse, keyboard, stats). Always free, no time limits, no bitrate caps.",
+  "license": "MIT",
+  "author": "divyamohan1993 <divyamohan1993@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/divyamohan1993/stream-screen.git"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./mcp-server": {
+      "types": "./dist/mcp-server.d.ts",
+      "import": "./dist/mcp-server.js"
+    },
+    "./rest-api": {
+      "types": "./dist/rest-api.d.ts",
+      "import": "./dist/rest-api.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "bin": {
+    "streamscreen-ai": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@stream-screen/core": "*",
+    "express": "^5.1.0"
+  },
+  "optionalDependencies": {
+    "@roamhq/wrtc": "^0.10.0",
+    "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^20",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  }
+}

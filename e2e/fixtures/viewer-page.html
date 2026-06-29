@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>StreamScreen e2e — viewer</title>
+    <!-- Empty inline favicon: stops Chromium from auto-requesting /favicon.ico,
+         which the fixture server has no file for and answers with a 404 (noise). -->
+    <link rel="icon" href="data:," />
+    <style>
+      body { margin: 0; font-family: monospace; background: #000; color: #0ff; }
+      #status { padding: 8px; }
+      video { display: block; width: 640px; height: 480px; background: #000; }
+      h1 { margin: 0; padding: 8px; font-size: 16px; }
+      /* Visually hidden but available to assistive tech / keyboard focus. */
+      .skip-link {
+        position: absolute;
+        left: -9999px;
+        top: 0;
+        background: #0ff;
+        color: #000;
+        padding: 8px;
+        z-index: 1;
+      }
+      .skip-link:focus { left: 0; }
+    </style>
+  </head>
+  <body>
+    <a href="#main" class="skip-link">Skip to main content</a>
+    <main id="main">
+      <h1>StreamScreen e2e — viewer</h1>
+      <video id="remote" autoplay playsinline>
+        <!-- A live remote-desktop stream has no pre-authored captions; an empty
+             English captions track satisfies WCAG 1.2.2 without claiming captions
+             exist for the live content. -->
+        <track kind="captions" srclang="en" label="English" src="data:text/vtt;charset=utf-8,WEBVTT%0A%0A" />
+      </video>
+      <div id="status">viewer: booting</div>
+    </main>
+
+    <script type="module">
+      import {
+        Peer,
+        SignalingClient,
+        parseIceServers,
+        createSender,
+        createReceiver,
+        ReceiverRouter,
+        deriveKey,
+        computeProof,
+        randomBytes,
+        toBase64,
+        fromBase64,
+        AUTH_DOMAIN,
+      } from './core.bundle.js';
+
+      const params = new URLSearchParams(location.search);
+      const code = params.get('code') ?? '123456';
+      // The PIN the viewer presents. Only used to derive a proof over the
+      // encrypted control channel; the PIN itself never crosses the wire.
+      const viewerPin = params.get('pin') ?? '';
+      // Optional test label this viewer announces over the control channel (as a
+      // `chat` "label:<X>") once its channels are open, so the host fixture can
+      // map this connection's remoteId to a stable label and attach media to it
+      // specifically (P1-B per-connection isolation spec). Absent => no announce.
+      const viewerLabel = params.get('label') ?? '';
+      const wsUrl = `ws://${location.host}`;
+      // OPT-IN ICE servers ("connect from anywhere"). Absent => LAN-only,
+      // unchanged behavior. The compact/JSON string is parsed exactly as an
+      // operator-supplied STREAMSCREEN_ICE_SERVERS value would be; in production
+      // the signaling server distributes this list on the `joined` ack so both
+      // peers match. Here the spec supplies it per-peer to prove the plumbing.
+      const iceServers = parseIceServers(params.get('ice'));
+
+      const statusEl = document.getElementById('status');
+      const video = document.getElementById('remote');
+      // Muted by default so autoplay is allowed; the spec can unmute via setMuted.
+      video.muted = true;
+
+      const state = {
+        ready: false,
+        connectionState: 'new',
+        gotTrack: false,
+        gotAudioTrack: false,
+        dataChannelOpen: false,
+        chats: [],
+        monitors: [],
+        monitorSwitched: null,
+        // --- Auth (access mode) state. ---
+        // Whether an auth-challenge was received and which mode it carried.
+        authChallenged: false,
+        authMode: null,
+        // Final verdict from the host: null (pending) | true (ok) | false (denied).
+        authResult: null,
+      };
+
+      // The most recent remote MediaStream (used for recording / track checks).
+      let remoteStream = null;
+
+      const signaling = new SignalingClient(wsUrl);
+      const peer = new Peer({ role: 'viewer', signaling, iceServers });
+
+      // ---------------------------------------------------------------------
+      // Access-mode auth (connection consent + access PIN), viewer side.
+      //
+      // On an inbound auth-challenge the viewer derives its key from the PIN +
+      // the host's salt, then HMACs over (domain || nonceH || nonceV ||
+      // channelBinding) where channelBinding comes from peer.getChannelBinding()
+      // — the SAME canonical DTLS binding the host computes. The proof crosses
+      // ONLY the encrypted control data channel; the PIN never does, and the
+      // signaling server never sees any of these fields. For prompt-only mode
+      // there is no PIN, so an empty proof is sent and the host gates on consent.
+      // ---------------------------------------------------------------------
+      async function handleAuthChallenge(m, remoteId) {
+        // Ignore duplicate challenge resends (the host may resend until its first
+        // send lands on the just-opened control channel) — respond exactly once.
+        if (state.authChallenged) return;
+        state.authChallenged = true;
+        state.authMode = m.mode;
+        const nonceV = randomBytes(32);
+        const channelBinding = peer.getChannelBinding(remoteId);
+
+        let proofB64 = '';
+        if (m.mode === 'pin' || m.mode === 'pin-and-prompt') {
+          // Fail-closed: with no derivable binding we cannot bind the proof.
+          if (channelBinding) {
+            const key = await deriveKey(viewerPin, fromBase64(m.salt), m.iterations);
+            const proof = await computeProof(key, {
+              domain: AUTH_DOMAIN,
+              nonceH: fromBase64(m.nonceH),
+              nonceV,
+              channelBinding,
+            });
+            proofB64 = toBase64(proof);
+          }
+        }
+
+        // Record the exact secret material this viewer emitted on the DATA channel
+        // so the signaling-isolation spec can assert none crossed the WS relay.
+        window.__authSecrets = window.__authSecrets || {};
+        window.__authSecrets.pin = viewerPin;
+        window.__authSecrets.nonceV = toBase64(nonceV);
+        window.__authSecrets.proof = proofB64;
+        window.__authSecrets.channelBinding = channelBinding;
+
+        peer.sendControl(
+          {
+            t: 'auth-response',
+            v: 1,
+            nonceV: toBase64(nonceV),
+            proof: proofB64,
+            name: 'e2e-viewer',
+          },
+          remoteId,
+        );
+      }
+
+      // --- Inbound file reception (host -> viewer), the reverse direction. ---
+      // Mirrors the host page's receiver wiring: createReceiver does the
+      // framing/reassembly, and we finalize only once the sender has signalled
+      // file-complete AND every offered byte has arrived (the control-channel
+      // file-complete can race ahead of the trailing chunks on the file channel).
+      const receivedFiles = []; // { id, name, size, length, checksum }
+      const inboundTransfers = new Map(); // id -> { receiver, meta, size, completed, done }
+      // Demuxes inbound binary frames to the right receiver by embedded transfer
+      // id, so concurrent host->viewer transfers cannot cross-contaminate.
+      const inboundRouter = new ReceiverRouter();
+
+      // Sum every byte (mod 2^32) — the same cheap content checksum the host uses.
+      function fileChecksum(bytes) {
+        let sum = 0;
+        for (let i = 0; i < bytes.length; i++) {
+          sum = (sum + bytes[i]) >>> 0;
+        }
+        return sum;
+      }
+
+      function recordInboundFile(t) {
+        const data = t.receiver.finish();
+        receivedFiles.push({
+          id: t.meta.id,
+          name: t.meta.name,
+          size: t.meta.size,
+          length: data.byteLength,
+          checksum: fileChecksum(data),
+        });
+      }
+
+      function maybeFinishInbound(id) {
+        const t = inboundTransfers.get(id);
+        if (!t || t.done) return;
+        if (t.completed && t.receiver.received >= t.size) {
+          t.done = true;
+          recordInboundFile(t);
+          inboundTransfers.delete(id);
+          inboundRouter.unregister(id);
+        }
+      }
+
+      // --- Recording state (MediaRecorder over the received stream). ---
+      let recorder = null;
+      let recordedBytes = 0;
+      let recordedChunks = 0;
+      let recordedBlobs = []; // kept so we can prove the container is real WebM
+
+      // --- Test hooks the spec reads / calls. ---
+      window.__viewer = {
+        getState: () => ({
+          ...state,
+          chats: [...state.chats],
+          monitors: state.monitors.map((m) => ({ ...m })),
+        }),
+        getAuthState: () => ({
+          authChallenged: state.authChallenged,
+          authMode: state.authMode,
+          authResult: state.authResult,
+        }),
+        // The configured ICE list this viewer's peer is using (defensive copy
+        // from core). Empty array == LAN-only default. The ice-servers spec
+        // asserts this matches what was supplied so the plumbing is observable.
+        getIceServers: () => peer.getIceServers(),
+        getVideoSize: () => ({ width: video.videoWidth, height: video.videoHeight }),
+        isVideoPlaying: () => video.videoWidth > 0 && video.videoHeight > 0 && !video.paused,
+        // Decoded-frame counter for the receive side — strictly increases while
+        // live video keeps arriving and being decoded by this viewer.
+        getDecodedFrameCount: () => {
+          try {
+            const q = video.getVideoPlaybackQuality?.();
+            return q ? q.totalVideoFrames : 0;
+          } catch {
+            return 0;
+          }
+        },
+        getAudioTrackInfo: () => {
+          const tracks = remoteStream ? remoteStream.getAudioTracks() : [];
+          return {
+            count: tracks.length,
+            readyState: tracks[0] ? tracks[0].readyState : null,
+            enabled: tracks[0] ? tracks[0].enabled : null,
+          };
+        },
+        setMuted: (m) => {
+          video.muted = m;
+          const tracks = remoteStream ? remoteStream.getAudioTracks() : [];
+          for (const t of tracks) t.enabled = !m;
+        },
+        getStats: async () => {
+          try {
+            return await peer.getStats();
+          } catch (e) {
+            return { error: String(e) };
+          }
+        },
+        // Worst-case-aggregated interactive-latency telemetry (network RTT +
+        // receiver playout/jitter-buffer delay + fps) the viewer reports to the
+        // host. Derived from the real WebRTC stats via the core helper.
+        getLocalTelemetry: async () => {
+          try {
+            return await peer.getLocalTelemetry();
+          } catch (e) {
+            return { error: String(e) };
+          }
+        },
+        // Send a { t:'latency' } ControlMessage to the host over the real control
+        // channel. With no args, samples live local telemetry; otherwise sends the
+        // supplied values (lets a spec assert exact parsed receipt deterministically).
+        sendLatency: async (rttMs, playoutMs, fps) => {
+          let msg;
+          if (typeof rttMs === 'number') {
+            msg = { t: 'latency', rttMs, playoutMs: playoutMs ?? 0 };
+            if (typeof fps === 'number') msg.fps = fps;
+          } else {
+            const tel = await peer.getLocalTelemetry();
+            msg = { t: 'latency', rttMs: tel.rttMs, playoutMs: tel.playoutMs, fps: tel.fps };
+          }
+          peer.sendControl(msg);
+          return msg;
+        },
+        sendInput: (ev) => {
+          peer.sendInput(ev);
+        },
+        // --- Control: chat + monitors. ---
+        sendChat: (text) => {
+          peer.sendControl({ t: 'chat', text, ts: Date.now() });
+        },
+        getChats: () => [...state.chats],
+        requestMonitors: () => {
+          peer.sendControl({ t: 'request-monitors' });
+        },
+        getMonitors: () => state.monitors.map((m) => ({ ...m })),
+        switchMonitor: (id) => {
+          peer.sendControl({ t: 'switch-monitor', id });
+        },
+        getMonitorSwitched: () => state.monitorSwitched,
+        // --- File transfer (viewer -> host). ---
+        sendFile: async (id, name, mime, bytesArray) => {
+          const data = new Uint8Array(bytesArray);
+          const sender = createSender({
+            meta: { id, name, size: data.byteLength, mime },
+            data,
+            send: (m) => peer.sendControl(m),
+            sendChunk: (buf) => peer.sendFileChunk(buf),
+            drain: () => peer.drainFile(),
+          });
+          // Release the chunk stream as soon as the host's file-accept arrives.
+          peer.onControl((m) => {
+            if (m.t === 'file-accept' && m.id === id) sender.accept();
+            if ((m.t === 'file-reject' || m.t === 'file-error') && m.id === id) {
+              sender.abort(m.t);
+            }
+          });
+          await sender.start();
+          return true;
+        },
+        // --- Concurrent file transfer (viewer -> host), two files INTERLEAVED. ---
+        // Both senders are started concurrently over the SAME binary `file`
+        // channel, and we manually interleave their chunk streams (alternating one
+        // chunk from each) so the host must demux by the transfer id embedded in
+        // every frame. Resolves once both files have sent every chunk +
+        // file-complete. Proves no cross-contamination on the wire.
+        sendFilesInterleaved: async (files) => {
+          // files: [{ id, name, mime, bytes }, ...]
+          const senders = files.map((f) => {
+            const data = new Uint8Array(f.bytes);
+            const queue = []; // framed ArrayBuffers, in seq order
+            const sender = createSender({
+              meta: { id: f.id, name: f.name, size: data.byteLength, mime: f.mime },
+              data,
+              send: (m) => peer.sendControl(m),
+              // Buffer frames instead of sending immediately so we control the
+              // interleave order below.
+              sendChunk: (buf) => {
+                queue.push(buf);
+              },
+            });
+            peer.onControl((m) => {
+              if (m.t === 'file-accept' && m.id === f.id) sender.accept();
+              if ((m.t === 'file-reject' || m.t === 'file-error') && m.id === f.id) {
+                sender.abort(m.t);
+              }
+            });
+            return { sender, queue, started: false };
+          });
+
+          // Kick all senders: each emits its offer, awaits accept, then drains its
+          // chunks into its own queue and finally sends file-complete (control).
+          const startPromises = senders.map((s) => s.sender.start());
+
+          // Interleave the buffered chunks round-robin across senders, draining the
+          // shared file channel between sends, until every queue is empty AND every
+          // sender.start() has resolved (so file-complete has gone out for each).
+          let allStarted = false;
+          Promise.all(startPromises).then(() => {
+            allStarted = true;
+          });
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          for (;;) {
+            let sentAny = false;
+            for (const s of senders) {
+              if (s.queue.length > 0) {
+                await peer.drainFile();
+                await peer.sendFileChunk(s.queue.shift());
+                sentAny = true;
+              }
+            }
+            const drained = senders.every((s) => s.queue.length === 0);
+            if (drained && allStarted) break;
+            if (!sentAny) await sleep(1); // wait for accept / next chunk to enqueue
+          }
+          await Promise.all(startPromises);
+          return true;
+        },
+        // --- Inbound files (host -> viewer). ---
+        getReceivedFiles: () => receivedFiles.map((f) => ({ ...f })),
+        getReceivedFile: (id) => {
+          const f = receivedFiles.find((x) => x.id === id);
+          return f ? { ...f } : null;
+        },
+        // --- Recording (MediaRecorder of the incoming stream). ---
+        startRecording: () => {
+          if (!remoteStream) return false;
+          recordedBytes = 0;
+          recordedChunks = 0;
+          recordedBlobs = [];
+          // Record video only — robust across builds regardless of audio track.
+          const opts = {};
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported?.('video/webm')) {
+            opts.mimeType = 'video/webm';
+          }
+          recorder = new MediaRecorder(remoteStream, opts);
+          recorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) {
+              recordedBytes += e.data.size;
+              recordedChunks += 1;
+              recordedBlobs.push(e.data);
+            }
+          };
+          recorder.start(100); // emit a blob every 100ms
+          return true;
+        },
+        stopRecording: () =>
+          new Promise((resolve) => {
+            if (!recorder) {
+              resolve({ bytes: 0, chunks: 0, head: [] });
+              return;
+            }
+            recorder.onstop = async () => {
+              // Assemble the full recording into one Blob and read its first 4
+              // bytes through arrayBuffer() so the spec can assert the EBML magic
+              // (0x1A 0x45 0xDF 0xA3) — i.e. a real, decodable WebM container.
+              const mime = recorder.mimeType || 'video/webm';
+              const blob = new Blob(recordedBlobs, { type: mime });
+              let head = [];
+              try {
+                const ab = await blob.slice(0, 4).arrayBuffer();
+                head = Array.from(new Uint8Array(ab));
+              } catch {
+                head = [];
+              }
+              resolve({ bytes: recordedBytes, chunks: recordedChunks, head });
+            };
+            recorder.stop();
+          }),
+      };
+
+      peer.on('state', (s) => {
+        state.connectionState = s;
+        statusEl.textContent = `viewer: ${s}`;
+      });
+
+      peer.on('track', (_track, stream) => {
+        state.gotTrack = true;
+        if (stream) {
+          remoteStream = stream;
+        } else {
+          remoteStream = remoteStream ?? new MediaStream();
+          remoteStream.addTrack(_track);
+        }
+        if (remoteStream.getAudioTracks().length > 0) state.gotAudioTrack = true;
+        video.srcObject = remoteStream;
+        video.play().catch(() => {});
+      });
+
+      let labelAnnounced = false;
+      function announceLabel() {
+        if (labelAnnounced || !viewerLabel) return;
+        labelAnnounced = true;
+        // The control channel is open here, so this send actually lands. The host
+        // records remoteId -> label and can then attachStreamTo this connection.
+        peer.sendControl({ t: 'chat', text: `label:${viewerLabel}`, ts: Date.now() });
+      }
+      peer.on('datachannel', (ch) => {
+        const markOpen = () => {
+          state.dataChannelOpen = true;
+          // Announce our label once the control channel is open.
+          if (ch.label === 'control') announceLabel();
+        };
+        if (ch.readyState === 'open') markOpen();
+        ch.addEventListener?.('open', markOpen);
+        ch.onopen = markOpen;
+      });
+
+      peer.onControl((m, remoteId) => {
+        switch (m.t) {
+          case 'auth-challenge':
+            void handleAuthChallenge(m, remoteId);
+            break;
+          case 'auth-result':
+            state.authResult = m.ok;
+            break;
+          case 'chat':
+            state.chats.push(m);
+            break;
+          case 'monitors':
+            state.monitors = m.list;
+            break;
+          case 'monitor-switched':
+            state.monitorSwitched = m.id;
+            break;
+          case 'file-offer': {
+            const meta = { id: m.id, name: m.name, size: m.size, mime: m.mime };
+            const receiver = createReceiver({ meta });
+            inboundTransfers.set(m.id, {
+              receiver,
+              meta,
+              size: m.size,
+              completed: false,
+              done: false,
+            });
+            inboundRouter.register(m.id, receiver);
+            // Auto-accept: release the host's chunk stream.
+            peer.sendControl({ t: 'file-accept', id: m.id });
+            break;
+          }
+          case 'file-complete': {
+            const t = inboundTransfers.get(m.id);
+            if (t) {
+              t.completed = true;
+              maybeFinishInbound(m.id);
+            }
+            break;
+          }
+          case 'file-error':
+          case 'file-reject':
+            inboundTransfers.delete(m.id);
+            inboundRouter.unregister(m.id);
+            break;
+          default:
+            break;
+        }
+      });
+
+      // Route each inbound binary chunk to its receiver by the embedded transfer
+      // id, then re-check completion of that exact transfer in case its final
+      // chunk lands after file-complete. Concurrent transfers stay separate.
+      peer.onFileChunk((buf) => {
+        const receiver = inboundRouter.handleChunk(buf);
+        if (!receiver) return; // unknown id (e.g. already finalized) — dropped
+        maybeFinishInbound(receiver.meta.id);
+      });
+
+      (async () => {
+        await signaling.connect();
+        await peer.start();
+        signaling.join({ code, role: 'viewer', name: 'e2e-viewer' });
+        state.ready = true;
+        statusEl.textContent = 'viewer: joined';
+      })().catch((err) => {
+        statusEl.textContent = `viewer: error ${String(err)}`;
+        window.__viewerError = String(err);
+      });
+    </script>
+  </body>
+</html>

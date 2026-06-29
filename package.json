@@ -1,0 +1,32 @@
+{
+  "name": "stream-screen",
+  "private": true,
+  "version": "0.1.0",
+  "description": "StreamScreen — self-hosted, LAN-first, always-free, unlimited-time peer-to-peer remote desktop for Windows over WebRTC.",
+  "license": "MIT",
+  "author": "divyamohan1993 <divyamohan1993@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/divyamohan1993/stream-screen.git"
+  },
+  "workspaces": [
+    "packages/*",
+    "e2e"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -b && npm -w @stream-screen/viewer run typecheck",
+    "typecheck": "tsc -b && npm -w @stream-screen/viewer run typecheck",
+    "test": "npm run test --workspaces --if-present",
+    "dev:signaling": "npm -w @stream-screen/signaling run dev",
+    "e2e": "npm -w @stream-screen/e2e test",
+    "verify": "npm run build && npm test && npm run e2e"
+  },
+  "devDependencies": {
+    "typescript": "^5.5",
+    "vitest": "^2",
+    "@types/node": "^20"
+  }
+}

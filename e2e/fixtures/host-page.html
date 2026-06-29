@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>StreamScreen e2e — host</title>
+    <!-- Empty inline favicon: stops Chromium from auto-requesting /favicon.ico,
+         which the fixture server has no file for and answers with a 404 (noise). -->
+    <link rel="icon" href="data:," />
+    <style>
+      body { margin: 0; font-family: monospace; background: #111; color: #0f0; }
+      #lastInput { padding: 8px; white-space: pre; }
+      canvas { display: block; }
+      h1 { margin: 0; padding: 8px; font-size: 16px; }
+      /* Visually hidden but available to assistive tech / keyboard focus. */
+      .skip-link {
+        position: absolute;
+        left: -9999px;
+        top: 0;
+        background: #0f0;
+        color: #111;
+        padding: 8px;
+        z-index: 1;
+      }
+      .skip-link:focus { left: 0; }
+    </style>
+  </head>
+  <body>
+    <a href="#main" class="skip-link">Skip to main content</a>
+    <main id="main">
+      <h1>StreamScreen e2e — host</h1>
+      <canvas id="screen" width="640" height="480"></canvas>
+      <div id="status">host: booting</div>
+      <div id="frame">frame: 0</div>
+      <div id="lastInput">lastInput: none</div>
+    </main>
+
+    <script type="module">
+      import {
+        Peer,
+        SignalingClient,
+        parseIceServers,
+        AdaptiveController,
+        createReceiver,
+        createSender,
+        ReceiverRouter,
+        makeVerifier,
+        verifyProofAgainst,
+        randomBytes,
+        toBase64,
+        fromBase64,
+        AUTH_DOMAIN,
+      } from './core.bundle.js';
+
+      // Capture every outbound RTCRtpSender the Peer creates via addTrack so the
+      // specs can read the LIVE sender's getParameters().encodings off the real
+      // RTCRtpSender (the Peer wrapper intentionally doesn't expose its pc). This
+      // is an e2e-only observation hook; it does not change Peer behavior.
+      const capturedSenders = new Set();
+      (() => {
+        const origAddTrack = RTCPeerConnection.prototype.addTrack;
+        RTCPeerConnection.prototype.addTrack = function (...args) {
+          const sender = origAddTrack.apply(this, args);
+          try {
+            if (sender && args[0] && args[0].kind === 'video') capturedSenders.add(sender);
+          } catch {
+            /* ignore */
+          }
+          return sender;
+        };
+      })();
+      function videoSenderParams() {
+        for (const sender of capturedSenders) {
+          try {
+            const p = sender.getParameters();
+            const enc = (p.encodings && p.encodings[0]) || {};
+            return {
+              maxBitrate: enc.maxBitrate ?? null,
+              maxFramerate: enc.maxFramerate ?? null,
+              scaleResolutionDownBy: enc.scaleResolutionDownBy ?? null,
+              degradationPreference: p.degradationPreference ?? null,
+            };
+          } catch {
+            /* try the next captured sender */
+          }
+        }
+        return null;
+      }
+
+      const params = new URLSearchParams(location.search);
+      const code = params.get('code') ?? '123456';
+      // --- Access mode (security parity) ----------------------------------
+      // 'open' (default) preserves the legacy code-gated-only behavior: the host
+      // attaches its stream immediately and NEVER prompts/PINs. Any other mode
+      // gates the outbound media behind the connection-consent / access-PIN
+      // handshake that runs P2P over the encrypted control data channel.
+      const accessMode = params.get('mode') ?? 'open';
+      // PIN the host is configured with (only used to build the verifier; the PIN
+      // itself never leaves this page and is never sent on the wire).
+      const hostPin = params.get('pin') ?? '';
+      // Consent decision for prompt modes: 'accept' | 'reject' | 'timeout'.
+      // 'timeout' means the host never responds, exercising the fail-closed path.
+      const consent = params.get('consent') ?? 'accept';
+      // OPT-IN ICE servers ("connect from anywhere"). Absent => LAN-only,
+      // unchanged behavior. Parsed exactly as the signaling server would parse
+      // an operator's STREAMSCREEN_ICE_SERVERS value before distributing it on
+      // the `joined` ack so both peers negotiate against the same STUN/TURN set.
+      const iceServers = parseIceServers(params.get('ice'));
+      // When `audio=1`, the host mixes a synthetic loopback/system-audio track
+      // (oscillator -> MediaStreamDestination) into the captured stream so the
+      // viewer can prove system-audio streaming over WebRTC.
+      const withAudio = params.get('audio') === '1';
+      const wsUrl = `ws://${location.host}`;
+
+      const statusEl = document.getElementById('status');
+      const frameEl = document.getElementById('frame');
+      const lastInputEl = document.getElementById('lastInput');
+      const canvas = document.getElementById('screen');
+      const ctx = canvas.getContext('2d');
+
+      // --- Animated "screen": a moving gradient block + a frame counter. ---
+      let frame = 0;
+      function draw() {
+        frame += 1;
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.fillStyle = '#202830';
+        ctx.fillRect(0, 0, w, h);
+        const x = (frame * 4) % (w - 80);
+        ctx.fillStyle = `hsl(${(frame * 3) % 360}, 80%, 55%)`;
+        ctx.fillRect(x, h / 2 - 40, 80, 80);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '28px monospace';
+        ctx.fillText(`FRAME ${frame}`, 16, 40);
+        frameEl.textContent = `frame: ${frame}`;
+        requestAnimationFrame(draw);
+      }
+      requestAnimationFrame(draw);
+
+      // captureStream stands in for desktopCapturer on the real host.
+      const stream = canvas.captureStream(30);
+
+      // Optionally attach a synthetic system-audio track. We use a Web Audio
+      // oscillator routed into a MediaStreamDestination — the audio analogue of
+      // the canvas captureStream — so there is a real, "live" audio track to
+      // negotiate over the peer connection.
+      if (withAudio) {
+        try {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          const audioCtx = new AC();
+          const osc = audioCtx.createOscillator();
+          osc.type = 'sine';
+          osc.frequency.value = 440;
+          const dest = audioCtx.createMediaStreamDestination();
+          osc.connect(dest);
+          osc.start();
+          for (const at of dest.stream.getAudioTracks()) stream.addTrack(at);
+          // Keep refs alive so GC doesn't stop the track mid-test.
+          window.__hostAudio = { audioCtx, osc, dest };
+        } catch (e) {
+          window.__hostError = `audio setup: ${String(e)}`;
+        }
+      }
+
+      // --- Multi-monitor: a fixed enumeration the viewer can list/switch. ---
+      // Each "monitor" is just a different canvas the host can swap the outbound
+      // video track to via replaceVideoTrack (no renegotiation).
+      const monitors = [
+        { id: 'mon-0', name: 'Display 1', primary: true, width: 640, height: 480 },
+        { id: 'mon-1', name: 'Display 2', primary: false, width: 640, height: 480 },
+      ];
+      let activeMonitor = 'mon-0';
+
+      // --- Test hooks the spec reads. ---
+      const state = {
+        ready: false,
+        connectionState: 'new',
+        dataChannelOpen: false,
+        receivedInputs: [],
+        lastInput: null,
+        adaptiveDecisions: [],
+        chats: [],
+        activeMonitor,
+        receivedFiles: [],
+        // Real-time interactive-latency telemetry reported by the viewer over the
+        // control channel ({ t:'latency' } ControlMessage). The closed-loop /
+        // latency-feedback specs read this to prove receipt of parsed values.
+        receivedLatency: [],
+        // --- Auth (access mode) state, per remote viewer id. ---
+        accessMode,
+        // remoteId -> 'pending' | 'ok' | 'denied'. Only populated in non-open modes.
+        authByPeer: {},
+        // Count of inbound auth-response frames seen (proof attempts).
+        authAttempts: 0,
+        // Whether this host has attached its outbound media yet (gated by auth in
+        // non-open modes; immediate in open mode).
+        streamAttached: false,
+      };
+
+      // When false, the 1Hz background adaptiveTick is suspended so a spec can
+      // deterministically drive the real pipeline (feed its own AdaptiveController
+      // a stats sequence and applyDecision on the live sender) without the
+      // background tick racing in and overwriting the sender's encodings between
+      // the applyDecision and the assertion. Defaults to on (normal operation).
+      let autoAdaptiveEnabled = true;
+
+      // Sum every byte (mod 2^32) — a cheap content checksum the spec compares
+      // against the same computation on the sending side.
+      function checksum(bytes) {
+        let sum = 0;
+        for (let i = 0; i < bytes.length; i++) {
+          sum = (sum + bytes[i]) >>> 0;
+        }
+        return sum;
+      }
+
+      // --- P1-B: per-connection media isolation (attachStreamTo) ----------
+      // In 'isolate' mode the host NEVER calls the session-wide attachStream();
+      // instead the spec attaches the stream to EXACTLY ONE viewer (by the label
+      // that viewer announced over the control channel) via peer.attachStreamTo,
+      // proving the stream reaches only that connection and is NOT replayed onto
+      // the other viewer's connection nor auto-attached to a later one.
+      const labelToRemote = new Map(); // 'A' -> remoteId (announced via chat)
+      const attachedRemotes = new Set();
+      // --- P1-A: per-connection control-channel readiness (onControlOpen) ---
+      // Record the remoteId each time a viewer's control channel reaches 'open'.
+      // The spec asserts this fires once PER connection (not once for the session).
+      const controlOpenEvents = [];
+
+      window.__host = {
+        getFrame: () => frame,
+        // P1-A observation: the remoteIds whose control channel has opened, in
+        // order, one entry per connection. Proves onControlOpen is per-viewer.
+        getControlOpenEvents: () => [...controlOpenEvents],
+        // The labels viewers have announced (so the spec can wait until both
+        // viewers are known before choosing which one to attach media to).
+        getKnownViewerLabels: () => [...labelToRemote.keys()],
+        // P1-B action: attach the host stream to ONLY the viewer that announced
+        // `label`, via the per-connection primitive. Returns false if that label
+        // is not yet known. Idempotent per remoteId (attach a viewer once).
+        attachStreamToLabel: async (label) => {
+          const remoteId = labelToRemote.get(label);
+          if (!remoteId) return false;
+          if (attachedRemotes.has(remoteId)) return true;
+          attachedRemotes.add(remoteId);
+          await peer.attachStreamTo(remoteId, stream);
+          state.streamAttached = true;
+          return true;
+        },
+        getState: () => ({
+          ...state,
+          receivedInputs: [...state.receivedInputs],
+          chats: [...state.chats],
+          receivedFiles: state.receivedFiles.map((f) => ({ ...f })),
+        }),
+        getReceivedInputs: () => [...state.receivedInputs],
+        getLastInput: () => state.lastInput,
+        getChats: () => [...state.chats],
+        getActiveMonitor: () => activeMonitor,
+        getReceivedFiles: () => state.receivedFiles.map((f) => ({ ...f })),
+        getReceivedLatency: () => state.receivedLatency.map((l) => ({ ...l })),
+        // The configured ICE list this host's peer is using (defensive copy from
+        // core). Empty array == LAN-only default. The ice-servers spec asserts
+        // this so the opt-in plumbing is observable on the host side too.
+        getIceServers: () => peer.getIceServers(),
+        // --- Auth (access mode) observation surface for the auth/consent specs. ---
+        getAuthState: () => ({
+          accessMode: state.accessMode,
+          authByPeer: { ...state.authByPeer },
+          authAttempts: state.authAttempts,
+          streamAttached: state.streamAttached,
+        }),
+        sendChat: (text) => {
+          peer.sendControl({ t: 'chat', text, ts: Date.now() });
+        },
+        // Suspend/resume the background 1Hz adaptive tick so a spec can drive the
+        // real pipeline deterministically without interference.
+        setAutoAdaptive: (enabled) => {
+          autoAdaptiveEnabled = !!enabled;
+        },
+        // Read the LIVE outbound video sender's first encoding parameters straight
+        // off the real RTCRtpSender — this is the end-to-end proof surface for the
+        // closed loop: the adaptive decision must land here.
+        getVideoSenderParams: () => videoSenderParams(),
+        // Drive the REAL adaptive pipeline: feed a fresh AdaptiveController the
+        // given AdaptiveStats sequence and applyDecision(decision) onto the live
+        // connection for each tick, returning the decisions plus the sender's
+        // encodings read immediately after the final applyDecision. Proves the
+        // closed loop reaches the real sender end-to-end.
+        driveAdaptive: async (statsSeq) => {
+          const ctrl = new AdaptiveController();
+          const decisions = [];
+          for (const s of statsSeq) {
+            const decision = ctrl.update(s);
+            decisions.push(decision);
+            await peer.applyDecision(decision);
+          }
+          return { decisions, params: videoSenderParams() };
+        },
+        // --- File transfer (host -> viewer), the reverse direction. ---
+        // Streams `bytesArray` to the viewer using the core createSender over the
+        // real control + file data channels: a `file-offer`, the viewer's
+        // `file-accept`, the binary chunks, then `file-complete`. Resolves once
+        // every chunk has been handed off.
+        sendFileToViewer: async (id, name, mime, bytesArray) => {
+          const data = new Uint8Array(bytesArray);
+          const sender = createSender({
+            meta: { id, name, size: data.byteLength, mime },
+            data,
+            send: (m) => peer.sendControl(m),
+            sendChunk: (buf) => peer.sendFileChunk(buf),
+            drain: () => peer.drainFile(),
+          });
+          // Release the chunk stream once the viewer's file-accept arrives.
+          peer.onControl((m) => {
+            if (m.t === 'file-accept' && m.id === id) sender.accept();
+            if ((m.t === 'file-reject' || m.t === 'file-error') && m.id === id) {
+              sender.abort(m.t);
+            }
+          });
+          await sender.start();
+          return true;
+        },
+      };
+
+      const signaling = new SignalingClient(wsUrl);
+      const peer = new Peer({ role: 'host', signaling, iceServers });
+      const adaptive = new AdaptiveController();
+
+      // ---------------------------------------------------------------------
+      // Access-mode auth (connection consent + access PIN).
+      //
+      // Runs entirely over the encrypted `control` data channel using the real
+      // @stream-screen/core crypto helpers and peer.getChannelBinding(). The
+      // signaling server only ever relays SDP/ICE — it never sees the PIN, the
+      // verifier, the nonces or the proof. In non-open modes the host withholds
+      // its outbound media until a viewer both proves the PIN (pin / pin-and-
+      // prompt) AND/OR the host operator consents (prompt / pin-and-prompt).
+      // ---------------------------------------------------------------------
+      const needsPin = accessMode === 'pin' || accessMode === 'pin-and-prompt';
+      const needsPrompt = accessMode === 'prompt' || accessMode === 'pin-and-prompt';
+
+      // Per-handshake state keyed by remote viewer id.
+      const authSessions = new Map(); // remoteId -> { nonceH, verifier, settled }
+
+      // The host persists ONLY a PBKDF2 verifier (salt + derived key), never the
+      // PIN. Built once at startup for the configured PIN.
+      let hostVerifier = null;
+      async function ensureVerifier() {
+        if (!needsPin) return null;
+        if (!hostVerifier) hostVerifier = await makeVerifier(hostPin);
+        return hostVerifier;
+      }
+
+      // The host operator's consent decision for prompt modes. Resolves to a
+      // boolean; 'timeout' never resolves (the spec asserts fail-closed via its
+      // own deadline). This stands in for a real Accept/Reject UI.
+      function getConsent() {
+        if (!needsPrompt) return Promise.resolve(true);
+        if (consent === 'accept') return Promise.resolve(true);
+        if (consent === 'reject') return Promise.resolve(false);
+        // 'timeout': never resolve — the viewer/host both fail-closed on deadline.
+        return new Promise(() => {});
+      }
+
+      // Attach the outbound media exactly once (idempotent). In open mode this is
+      // called at startup; in auth modes only after a viewer is authorized.
+      function attachStreamOnce() {
+        if (state.streamAttached) return;
+        peer.attachStream(stream);
+        state.streamAttached = true;
+      }
+
+      // Send the auth-challenge to a freshly-connected viewer once both the DTLS
+      // channel binding is derivable (SDP set on both peers) AND the control
+      // channel is open. The host CREATES the data channels, so — unlike the
+      // viewer — it never receives an `ondatachannel`/open event through the Peer
+      // API; instead we issue the challenge when the connection reaches a live
+      // state and retry on a short interval until sendControl actually lands (it
+      // is a no-op while the control channel is still opening). The viewer's
+      // arriving auth-response stops the retries.
+      async function sendChallenge(remoteId) {
+        if (accessMode === 'open' || accessMode === 'isolate') return;
+        if (authSessions.has(remoteId)) return; // one challenge per viewer
+        const verifier = await ensureVerifier();
+        const channelBinding = peer.getChannelBinding(remoteId);
+        // Fail-closed: don't issue a bindable challenge until the binding exists.
+        if (!channelBinding) return;
+        const nonceH = randomBytes(32);
+        const challenge = {
+          t: 'auth-challenge',
+          v: 1,
+          nonceH: toBase64(nonceH),
+          // For pin modes the viewer derives its key from this salt; in prompt-
+          // only mode there is no PIN, but we still send the salt/iterations
+          // fields (the viewer ignores them) to keep one challenge shape.
+          salt: verifier ? verifier.salt : toBase64(new Uint8Array(16)),
+          iterations: verifier ? verifier.iterations : 0,
+          channelBinding,
+          mode: accessMode,
+        };
+        authSessions.set(remoteId, { nonceH, verifier, settled: false, challenge });
+        state.authByPeer[remoteId] = 'pending';
+        // Record the exact secret material this host emitted on the DATA channel so
+        // the signaling-isolation spec can assert none of it ever crossed the WS.
+        window.__authSecrets = window.__authSecrets || {};
+        window.__authSecrets.pin = hostPin;
+        window.__authSecrets.salt = verifier ? verifier.salt : null;
+        window.__authSecrets.verifierKey = verifier ? verifier.key : null;
+        window.__authSecrets.nonceH = toBase64(nonceH);
+        window.__authSecrets.channelBinding = channelBinding;
+        peer.sendControl(challenge, remoteId);
+      }
+
+      // Handle a viewer's auth-response: verify the PIN proof (if required) and
+      // the operator consent (if required), then send a REASON-FREE verdict.
+      async function handleAuthResponse(m, remoteId) {
+        const sess = authSessions.get(remoteId);
+        if (!sess || sess.settled) return;
+        // Mark that the viewer has answered so the challenge-resend loop stops even
+        // when the verdict is withheld (e.g. consent 'timeout' fail-closed path).
+        sess.answered = true;
+        state.authAttempts += 1;
+
+        let ok = true;
+
+        // PIN proof check (constant-time, fail-closed) over the SAME bound inputs.
+        if (needsPin) {
+          const channelBinding = peer.getChannelBinding(remoteId);
+          // Fail-closed if the binding is unavailable/ambiguous.
+          if (!channelBinding) {
+            ok = false;
+          } else {
+            let proof;
+            try {
+              proof = fromBase64(m.proof);
+            } catch {
+              proof = new Uint8Array(0);
+            }
+            const parts = {
+              domain: AUTH_DOMAIN,
+              nonceH: sess.nonceH,
+              nonceV: fromBase64(m.nonceV),
+              channelBinding,
+            };
+            ok = await verifyProofAgainst(sess.verifier, proof, parts);
+          }
+        }
+
+        // Operator consent check (prompt / pin-and-prompt). Only consulted if the
+        // PIN gate (when present) already passed — but we evaluate consent
+        // regardless so a 'timeout' never resolves and the verdict is withheld
+        // (fail-closed end to end).
+        if (ok && needsPrompt) {
+          ok = await getConsent();
+        }
+
+        sess.settled = true;
+        state.authByPeer[remoteId] = ok ? 'ok' : 'denied';
+        peer.sendControl({ t: 'auth-result', v: 1, ok }, remoteId);
+        if (ok) attachStreamOnce();
+      }
+
+      // File reception, keyed by transfer id. We use the core createReceiver for
+      // the framing/reassembly but gate completion on byte completeness rather
+      // than blindly finishing on `file-complete`: the control-channel
+      // `file-complete` can race ahead of the trailing binary chunks on the
+      // separate `file` channel, so we only finalize once every offered byte has
+      // arrived (whether that happens on the last chunk or on file-complete).
+      //
+      // Inbound binary frames are demultiplexed by their EMBEDDED transfer id via
+      // a ReceiverRouter, so several concurrent transfers can interleave their
+      // chunks over the single `file` channel without cross-contamination.
+      const transfers = new Map(); // id -> { receiver, meta, size, completed, done }
+      const router = new ReceiverRouter();
+
+      function recordFile(receiver, meta) {
+        const data = receiver.finish();
+        state.receivedFiles.push({
+          id: meta.id,
+          name: meta.name,
+          size: meta.size,
+          length: data.byteLength,
+          checksum: checksum(data),
+        });
+      }
+
+      function maybeFinish(id) {
+        const t = transfers.get(id);
+        if (!t || t.done) return;
+        // Finalize when the sender has signalled completion AND all bytes are in.
+        if (t.completed && t.receiver.received >= t.size) {
+          t.done = true;
+          recordFile(t.receiver, t.meta);
+          transfers.delete(id);
+          router.unregister(id);
+        }
+      }
+
+      peer.on('state', (s) => {
+        state.connectionState = s;
+        statusEl.textContent = `host: ${s}`;
+      });
+      peer.on('datachannel', (ch) => {
+        const markOpen = () => {
+          state.dataChannelOpen = true;
+        };
+        if (ch.readyState === 'open') markOpen();
+        ch.addEventListener?.('open', markOpen);
+        ch.onopen = markOpen;
+      });
+
+      // Auth challenge driver. The host created the data channels, so it gets no
+      // `ondatachannel`/open event through the Peer API. When a viewer's
+      // connection reaches a live state, we (re)try issuing the challenge on a
+      // short interval until it actually lands on the now-open control channel
+      // (with a derivable channel binding). The viewer's auth-response settles the
+      // session and stops the retries.
+      const challengeTimers = new Map(); // remoteId -> interval id
+      peer.on('state', (s, remoteId) => {
+        // 'isolate' runs no auth handshake — it exercises ONLY per-connection
+        // media attach (P1-B) and onControlOpen (P1-A), driven by the spec.
+        if (accessMode === 'open' || accessMode === 'isolate' || !remoteId) return;
+        if (s === 'connected' || s === 'completed') {
+          if (challengeTimers.has(remoteId)) return;
+          // Track whether the viewer has answered at least once so we stop
+          // resending the challenge (the first send can be dropped while the
+          // control channel is still opening — sendControl is a no-op until open).
+          const tick = () => {
+            const sess = authSessions.get(remoteId);
+            if (!sess) {
+              // First attempt: build + send the challenge.
+              void sendChallenge(remoteId);
+              return;
+            }
+            // Stop once the host has produced a verdict (settled) OR the viewer
+            // has answered (authAttempts captured for this peer). Until then,
+            // resend the SAME challenge so a drop during channel-open recovers.
+            if (sess.settled || sess.answered) {
+              clearInterval(challengeTimers.get(remoteId));
+              challengeTimers.delete(remoteId);
+              return;
+            }
+            peer.sendControl(sess.challenge, remoteId);
+          };
+          tick();
+          challengeTimers.set(remoteId, setInterval(tick, 150));
+        }
+      });
+
+      peer.onInput((ev) => {
+        state.receivedInputs.push(ev);
+        state.lastInput = ev;
+        lastInputEl.textContent = `lastInput: ${JSON.stringify(ev)}`;
+        if (ev.t === 'm-move' || ev.t === 'm-down' || ev.t === 'm-up') {
+          ctx.strokeStyle = '#ff0';
+          ctx.beginPath();
+          ctx.arc(ev.x * canvas.width, ev.y * canvas.height, 10, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      });
+
+      // Control channel: chat, monitor enumeration/switching, file routing.
+      peer.onControl((m, remoteId) => {
+        switch (m.t) {
+          case 'auth-response':
+            void handleAuthResponse(m, remoteId);
+            break;
+          case 'file-offer': {
+            const meta = { id: m.id, name: m.name, size: m.size, mime: m.mime };
+            const receiver = createReceiver({ meta });
+            transfers.set(m.id, {
+              receiver,
+              meta,
+              size: m.size,
+              completed: false,
+              done: false,
+            });
+            // Register with the router so its embedded-id frames get demuxed here.
+            router.register(m.id, receiver);
+            // Auto-accept: release the sender's chunk stream.
+            peer.sendControl({ t: 'file-accept', id: m.id });
+            break;
+          }
+          case 'file-complete': {
+            const t = transfers.get(m.id);
+            if (t) {
+              t.completed = true;
+              maybeFinish(m.id);
+            }
+            break;
+          }
+          case 'file-error':
+          case 'file-reject':
+            transfers.delete(m.id);
+            router.unregister(m.id);
+            break;
+          case 'chat':
+            state.chats.push(m);
+            // P1-B: a viewer announces its test label as `label:<X>` so the spec
+            // can attach media to a specific viewer's connection by label.
+            if (typeof m.text === 'string' && m.text.startsWith('label:') && remoteId) {
+              labelToRemote.set(m.text.slice('label:'.length), remoteId);
+            }
+            break;
+          case 'latency':
+            // Viewer-reported real-time telemetry: record the parsed values so the
+            // latency-feedback / closed-loop specs can assert receipt over the
+            // real control channel.
+            state.receivedLatency.push({
+              rttMs: m.rttMs,
+              playoutMs: m.playoutMs,
+              fps: m.fps,
+            });
+            break;
+          case 'request-monitors':
+            peer.sendControl({ t: 'monitors', list: monitors });
+            break;
+          case 'switch-monitor': {
+            // Build a fresh outbound video track from a new canvas and swap it
+            // in place, then ack with monitor-switched.
+            const mon = monitors.find((x) => x.id === m.id);
+            if (mon) {
+              const c2 = document.createElement('canvas');
+              c2.width = mon.width;
+              c2.height = mon.height;
+              const x2 = c2.getContext('2d');
+              let f2 = 0;
+              const tick2 = () => {
+                f2 += 1;
+                x2.fillStyle = mon.primary ? '#103040' : '#401030';
+                x2.fillRect(0, 0, c2.width, c2.height);
+                x2.fillStyle = '#fff';
+                x2.font = '24px monospace';
+                x2.fillText(`${mon.name} #${f2}`, 16, 40);
+                if (activeMonitor === mon.id) requestAnimationFrame(tick2);
+              };
+              const s2 = c2.captureStream(30);
+              const vtrack = s2.getVideoTracks()[0];
+              activeMonitor = mon.id;
+              state.activeMonitor = mon.id;
+              requestAnimationFrame(tick2);
+              void peer.replaceVideoTrack(vtrack).then(() => {
+                peer.sendControl({ t: 'monitor-switched', id: mon.id });
+              });
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      });
+
+      // Route each binary file chunk to its receiver by the transfer id embedded
+      // in the frame (ReceiverRouter demuxes), then re-check completion of that
+      // exact transfer in case its final chunk lands after `file-complete`.
+      // Interleaved chunks from concurrent transfers are kept fully separate.
+      peer.onFileChunk((buf) => {
+        const receiver = router.handleChunk(buf);
+        if (!receiver) return; // unknown id (e.g. already finalized) — dropped
+        maybeFinish(receiver.meta.id);
+      });
+
+      async function adaptiveTick() {
+        if (!autoAdaptiveEnabled) return;
+        try {
+          const stats = await peer.getStats();
+          const decision = adaptive.update(stats);
+          state.adaptiveDecisions.push(decision);
+          await peer.applyDecision(decision);
+        } catch {
+          /* ignore until the connection is up */
+        }
+      }
+      setInterval(adaptiveTick, 500);
+
+      // P1-A: record per-connection control-channel readiness. onControlOpen
+      // fires once per viewer the moment ITS control channel opens (and replays
+      // already-open channels to a late subscriber). The isolation spec asserts
+      // this fires once per connection, proving the signal is per-viewer.
+      peer.onControlOpen((remoteId) => {
+        controlOpenEvents.push(remoteId);
+      });
+
+      (async () => {
+        await signaling.connect();
+        await peer.start();
+        // OPEN mode (default): attach immediately — preserves legacy behavior so
+        // every existing spec keeps passing unchanged. 'isolate' mode NEVER
+        // session-wide-attaches: the spec drives per-viewer attachStreamTo to
+        // prove no media leaks to the other connection (P1-B). In any auth mode
+        // the media is withheld until a viewer is authorized (handleAuthResponse).
+        if (accessMode === 'open') {
+          attachStreamOnce();
+        } else if (accessMode === 'isolate') {
+          /* no session-wide attach; spec calls attachStreamToLabel per viewer */
+        } else if (needsPin) {
+          // Pre-build the verifier so the first challenge isn't delayed by the
+          // 600k-iteration KDF mid-handshake.
+          await ensureVerifier();
+        }
+        signaling.join({ code, role: 'host', name: 'e2e-host' });
+        state.ready = true;
+        statusEl.textContent = 'host: joined';
+      })().catch((err) => {
+        statusEl.textContent = `host: error ${String(err)}`;
+        window.__hostError = String(err);
+      });
+    </script>
+  </body>
+</html>

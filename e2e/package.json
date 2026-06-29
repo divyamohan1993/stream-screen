@@ -1,0 +1,23 @@
+{
+  "name": "@stream-screen/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "StreamScreen end-to-end tests: two headless Chromium peers running a real WebRTC session over the signaling server, plus an in-page exercise of the adaptive engine. Always free, no time limits.",
+  "scripts": {
+    "bundle": "node scripts/bundle-core.mjs",
+    "pretest": "npm run bundle",
+    "test": "playwright test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@stream-screen/core": "*",
+    "@stream-screen/signaling": "*"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.47.2",
+    "@types/node": "^20",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.5"
+  }
+}
