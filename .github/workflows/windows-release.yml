@@ -44,15 +44,17 @@ jobs:
 
           "latest_tag=$latestTag" >> $env:GITHUB_OUTPUT
 
-          $diff = git diff --quiet "$latestTag..HEAD"
-          if ($LASTEXITCODE -eq 0) {
+          $changedFiles = @(git diff --name-only "$latestTag..HEAD")
+          if ($LASTEXITCODE -ne 0) {
+            throw "git diff failed with exit code $LASTEXITCODE"
+          }
+
+          if ($changedFiles.Count -eq 0) {
             "has_changes=false" >> $env:GITHUB_OUTPUT
             "reason=No file changes since release $latestTag." >> $env:GITHUB_OUTPUT
-          } elseif ($LASTEXITCODE -eq 1) {
-            "has_changes=true" >> $env:GITHUB_OUTPUT
-            "reason=Files changed since release $latestTag." >> $env:GITHUB_OUTPUT
           } else {
-            throw "git diff failed with exit code $LASTEXITCODE"
+            "has_changes=true" >> $env:GITHUB_OUTPUT
+            "reason=$($changedFiles.Count) file(s) changed since release $latestTag." >> $env:GITHUB_OUTPUT
           }
 
       - name: Stop when the latest release already matches this commit
