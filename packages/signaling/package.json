@@ -35,10 +35,10 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@types/node": "^20",
+    "@types/node": "^24.13.2",
     "@types/ws": "^8.5.12",
     "tsx": "^4.19.0",
-    "typescript": "^5.5",
-    "vitest": "^2"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
   }
 }

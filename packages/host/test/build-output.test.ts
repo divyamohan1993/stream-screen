@@ -83,6 +83,12 @@ describe('host build output consistency (P1 regression)', () => {
     expect(dev.esbuild, 'esbuild must be a devDependency').toBeTruthy();
   });
 
+  it('rebuilds the host before producing release artifacts', () => {
+    const scripts = pkg.scripts as Record<string, string>;
+    expect(scripts.dist).toContain('npm run build');
+    expect(scripts.dist).toContain('electron-builder');
+  });
+
   it('ships a bundle script that produces a CJS preload and a browser renderer', () => {
     const scriptPath = join(pkgRoot, 'scripts', 'bundle.mjs');
     expect(existsSync(scriptPath)).toBe(true);

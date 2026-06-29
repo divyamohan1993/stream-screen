@@ -30,6 +30,6 @@
   },
   "devDependencies": {
     "@types/ws": "^8.5.12",
-    "vitest": "^2.1.0"
+    "vitest": "^4.1.9"
   }
 }

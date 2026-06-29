@@ -14,7 +14,7 @@
     "e2e"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "scripts": {
     "build": "tsc -b && npm -w @stream-screen/viewer run typecheck",
@@ -25,8 +25,8 @@
     "verify": "npm run build && npm test && npm run e2e"
   },
   "devDependencies": {
-    "typescript": "^5.5",
-    "vitest": "^2",
-    "@types/node": "^20"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9",
+    "@types/node": "^24.13.2"
   }
 }
