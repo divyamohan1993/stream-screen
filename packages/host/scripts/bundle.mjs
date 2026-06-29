@@ -36,6 +36,21 @@ const pkgRoot = join(__dirname, '..');
 const src = join(pkgRoot, 'src');
 const dist = join(pkgRoot, 'dist');
 
+// Bundle the main process so @stream-screen/core is build-time-only. Keep the
+// Electron runtime and optional native input module external; Electron provides
+// the former, while the latter may be absent and is handled gracefully.
+await build({
+  entryPoints: [join(src, 'main.ts')],
+  outfile: join(dist, 'main.js'),
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  target: 'node20',
+  sourcemap: false,
+  external: ['electron', '@nut-tree-fork/nut-js'],
+  logLevel: 'info',
+});
+
 // Bundle the renderer: a browser ES module with every dependency inlined so no
 // bare specifier survives for the file:// loader to choke on.
 await build({
@@ -65,4 +80,4 @@ await build({
   logLevel: 'info',
 });
 
-console.log('bundle: wrote dist/renderer/renderer.js (esm) and dist/preload.js (cjs)');
+console.log('bundle: wrote dist/main.js (esm), dist/renderer/renderer.js (esm), and dist/preload.js (cjs)');

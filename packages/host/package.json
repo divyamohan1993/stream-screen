@@ -17,13 +17,11 @@
     "test": "vitest run",
     "dist": "electron-builder --win"
   },
-  "dependencies": {
-    "@stream-screen/core": "*"
-  },
   "optionalDependencies": {
     "@nut-tree-fork/nut-js": "^4"
   },
   "devDependencies": {
+    "@stream-screen/core": "*",
     "@types/node": "^20",
     "electron": "31.7.7",
     "esbuild": "^0.21",

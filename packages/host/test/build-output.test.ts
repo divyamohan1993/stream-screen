@@ -135,6 +135,20 @@ describe('host build output consistency (P1 regression)', () => {
     expect(renderer).not.toMatch(/from\s+["']\.\.\/host-session/);
   }, 120_000);
 
+  it('produces a bundled main process with NO unresolved workspace import', () => {
+    execFileSync('npm', ['run', 'build'], {
+      cwd: pkgRoot,
+      stdio: 'pipe',
+      env: { ...process.env, ELECTRON_SKIP_BINARY_DOWNLOAD: '1' },
+    });
+    const mainPath = join(pkgRoot, 'dist', 'main.js');
+    expect(existsSync(mainPath)).toBe(true);
+    const main = readFileSync(mainPath, 'utf8');
+    expect(main).not.toMatch(/from\s+["']@stream-screen\//);
+    expect(main).not.toMatch(/require\(\s*["']@stream-screen\//);
+    expect(main).toMatch(/from\s+["']electron["']/);
+  }, 120_000);
+
   it('produces a sandbox-safe CJS preload with deps inlined (only electron external)', () => {
     execFileSync('npm', ['run', 'build'], {
       cwd: pkgRoot,
