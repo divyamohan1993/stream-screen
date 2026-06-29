@@ -15,7 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "electron .",
     "test": "vitest run",
-    "dist": "electron-builder --win"
+    "dist": "electron-builder --win --publish never"
   },
   "optionalDependencies": {
     "@nut-tree-fork/nut-js": "^4"
