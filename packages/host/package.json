@@ -25,10 +25,10 @@
   },
   "devDependencies": {
     "@types/node": "^20",
-    "electron": "^31",
-    "esbuild": "^0.21",
-    "electron-builder": "^25",
+    "electron": "^39",
+    "esbuild": "^0.28",
+    "electron-builder": "^26",
     "typescript": "^5.5",
-    "vitest": "^2"
+    "vitest": "^4"
   }
 }
