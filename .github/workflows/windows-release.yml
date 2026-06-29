@@ -27,24 +27,22 @@ jobs:
       - name: Check for changes since latest release
         id: changes
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $latestReleaseJson = gh release list --limit 1 --json tagName,isDraft,isPrerelease,publishedAt --jq '.[0] // empty'
+          git fetch --tags --force
+          if ($LASTEXITCODE -ne 0) {
+            throw "git fetch --tags failed with exit code $LASTEXITCODE"
+          }
 
-          if ([string]::IsNullOrWhiteSpace($latestReleaseJson)) {
+          $latestTag = git tag --list "windows-weekly-*" --sort=-creatordate | Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($latestTag)) {
             "has_changes=true" >> $env:GITHUB_OUTPUT
             "reason=No previous release exists." >> $env:GITHUB_OUTPUT
             exit 0
           }
 
-          $latestRelease = $latestReleaseJson | ConvertFrom-Json
-          $latestTag = $latestRelease.tagName
           "latest_tag=$latestTag" >> $env:GITHUB_OUTPUT
-
-          git fetch --tags --force
 
           $diff = git diff --quiet "$latestTag..HEAD"
           if ($LASTEXITCODE -eq 0) {
